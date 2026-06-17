@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    name: Build (iOS) + boundary check
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build for generic iOS
+        run: >
+          xcodebuild build
+          -scheme PGPonyCore
+          -destination 'generic/platform=iOS'
+
+      # Tests run on a simulator. Adjust the device name to one the runner's Xcode has
+      # (list with: xcrun simctl list devicetypes). Kept separate from the build above
+      # so a simulator-naming mismatch can't mask a genuine build failure.
+      - name: Test on iOS Simulator
+        run: >
+          xcodebuild test
+          -scheme PGPonyCore
+          -destination 'platform=iOS Simulator,name=iPhone 16,OS=latest'
+
+      - name: Verify no app/platform imports leaked into the core
+        run: |
+          if grep -rlnE 'import (UIKit|AppKit|SwiftUI|SwiftData|Combine|ObjectivePGP)' Sources/; then
+            echo "LEAK: an app/platform import is present in core sources"; exit 1
+          else
+            echo "CLEAN: core sources are free of app/UI/3rd-party imports"
+          fi
+      - name: Verify no stray print() (debug must go through pgpDebugLog)
+        run: |
+          if grep -rnP '(?<![A-Za-z0-9._])print\(' Sources/ | grep -v 'Swift.print(message())'; then
+            echo "A bare print() is present — route debug through pgpDebugLog or remove it"; exit 1
+          else
+            echo "CLEAN: no bare print() in core sources"
+          fi
