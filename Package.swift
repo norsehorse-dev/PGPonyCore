@@ -9,7 +9,7 @@ let package = Package(
         // iOS-only for now: the card transport uses CoreNFC. A future macOS target
         // would introduce an `OpenPGPCardTransport` seam (NFC on iOS, PC/SC via
         // CryptoTokenKit on macOS) — see README "Roadmap".
-        .iOS("17.6") // string form (not .v17=17.0): matches the app floor; a core file uses a 17.x-only API
+        .iOS("17.6") // string form (not .v17=17.0): matches the PGPony app deployment floor
     ],
     products: [
         .library(name: "PGPonyCore", targets: ["PGPonyCore"])
