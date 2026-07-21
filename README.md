@@ -15,18 +15,29 @@ app code, just the core.
 
 ## What's in here
 
-A self-contained OpenPGP implementation with **no third-party dependencies** — system
-frameworks only (Foundation, CryptoKit, CommonCrypto, Security, CoreNFC, zlib).
+This tree is the **PGPony 8.0.0** core.
+
+A self-contained OpenPGP implementation with **no third-party Swift dependencies** —
+system frameworks only (Foundation, CryptoKit, CommonCrypto, Security, CoreNFC, zlib)
+plus one pinned, vendored C library: [liboqs](https://github.com/open-quantum-safe/liboqs)
+(ML-KEM only), shipped as `Vendor/liboqs.xcframework` so the package builds out of the
+box and auditors see the exact binary the app links.
 
 | Area | Files |
 |---|---|
 | **Packet** | OpenPGP packet builder + parser (RFC 9580 / v6, partial body lengths, SEIPD v1/v2) |
-| **Primitives** | AEAD/OCB, AES key-wrap (RFC 3394), Argon2 (S2K), Cv25519 ECDH, Ed25519 keygen |
+| **Primitives** | AEAD/OCB, AES key-wrap (RFC 3394), Argon2 + classic S2K, Cv25519 ECDH, Ed25519 keygen, Keccak/KMAC |
+| **PQC** | ML-KEM via the vendored liboqs + composite-KEM packet handling (OpenPGP PQC draft) |
+| **LibrePGP** | LibrePGP (v5) encrypt / decrypt / combiner for GnuPG interop |
 | **KeyGen** | v6 key generation (RFC 9580) |
+| **KeyOps** | software key-expiration editing — fresh self-certs/bindings, gpg-verifiable |
 | **Card** | OpenPGP smartcard protocol — APDU command layer, PSO:CDS/DECIPHER, PIN, on-card GEN (CoreNFC transport) |
 | **Symmetric** | passphrase-only (`gpg -c`) encrypt/decrypt |
+| **Backup** | backup-code generation (the passphrase behind the encrypted keyring backup) |
+| **MIME** | PGP/MIME message parser + builder |
 | **Pass** | pure parser for `pass` (password-store) entries |
-| **Network** | keyserver + WKD clients |
+| **Network** | keyserver + WKD clients (+ proxy-aware session factory) |
+| **Diagnostics** | v6 interop self-diagnostic |
 
 ## What's deliberately *not* here
 

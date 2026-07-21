@@ -24,11 +24,10 @@ import Security
 // extension target, so the same armorer + setting is available everywhere
 // armor is produced without any project membership surgery.
 //
-// The host app supplies the toggle + custom string via
-// `ArmorComment.settingsProvider` (assigned at launch). PGPony backs that with
-// the App Group UserDefaults suite (group.com.pgpony.shared) so the setting
-// survives restarts and is shared with the share extension; the core itself
-// keeps no storage and defaults to ON + `defaultComment`.
+// Persistence is via the App Group UserDefaults suite (KeychainService
+// .sharedDefaults → group.com.pgpony.shared), so the toggle + custom string
+// survive an app restart AND are shared with the share extension. The
+// SwiftUI Settings screen binds @AppStorage to the same suite + keys.
 //
 // SCOPE: this affects message-style armored output only (encrypt, sign,
 // encrypt-and-sign). Exported public/secret keys are produced by
@@ -100,24 +99,14 @@ enum ArmorComment {
     /// Injectable hook for the host app to supply the user's Comment-header
     /// preference (toggle + text). The core keeps no app storage of its own, so
     /// a host that wants a persisted/@AppStorage-backed toggle assigns this once
-    /// at launch, e.g.:
-    ///
-    ///     ArmorComment.settingsProvider = {
-    ///         let d = KeychainService.sharedDefaults
-    ///         let include = d.object(forKey: ArmorComment.includeKey) as? Bool ?? true
-    ///         let text = d.string(forKey: ArmorComment.textKey) ?? ArmorComment.defaultComment
-    ///         return (include, text)
-    ///     }
-    ///
-    /// The default reproduces PGPony's first-launch behavior: comment ON with
-    /// `defaultComment`. Returning (false, _) writes no header.
+    /// at launch, e.g. from its App Group defaults suite. The default reproduces
+    /// PGPony's first-launch behavior: comment ON with `defaultComment`.
+    /// Returning (false, _) writes no header.
     static var settingsProvider: () -> (include: Bool, raw: String) = {
         (true, defaultComment)
     }
 
-    /// The validated Comment value to embed, resolved live from
-    /// `settingsProvider`. nil means "write no Comment header". Reads are
-    /// synchronous, so the crypto/armor path can call this directly.
+    /// The validated Comment value to embed. nil means "write no Comment header".
     static var current: String? {
         let (include, raw) = settingsProvider()
         return validate(include: include, raw: raw)
@@ -130,6 +119,45 @@ enum ArmorComment {
     static func headerBlock() -> String {
         if let c = current, !c.isEmpty { return "Comment: \(c)\n" }
         return ""
+    }
+
+    /// v7.1.x — SEPARATE toggle for embedding the Comment in EXPORTED PUBLIC KEYS
+    /// (copy / share / save-as-file). Independent of the message toggle above;
+    /// reuses the same comment text. Default ON.
+    static let pubkeyIncludeKey = "armor_comment_pubkey_include"
+
+    /// Injectable hook for the host app's public-key-export Comment preference
+    /// (separate toggle, shared text). Default mirrors first launch: ON with
+    /// `defaultComment`.
+    static var pubkeySettingsProvider: () -> (include: Bool, raw: String) = {
+        (true, defaultComment)
+    }
+
+    /// The Comment value for public-key exports, or nil for none. Honors the
+    /// separate pubkey toggle (default ON) and the shared comment text.
+    static func pubkeyComment() -> String? {
+        let (include, raw) = pubkeySettingsProvider()
+        guard include else { return nil }
+        let s = sanitize(raw)
+        return s.isEmpty ? nil : s
+    }
+
+    /// Splice a "Comment: <value>" line into an armored PUBLIC KEY's header, right
+    /// after the BEGIN line, when the pubkey toggle is on. ONLY the armor header
+    /// is touched — the base64 key body (UID + key material) is never modified,
+    /// so this cannot corrupt the key and stays GnuPG-clean. Returns the input
+    /// unchanged when no comment should be written or the BEGIN line isn't found.
+    static func withPublicKeyComment(_ armored: String) -> String {
+        guard let comment = pubkeyComment() else { return armored }
+        let begin = "-----BEGIN PGP PUBLIC KEY BLOCK-----"
+        guard let beginRange = armored.range(of: begin),
+              let newline = armored[beginRange.upperBound...].firstIndex(of: "\n") else {
+            return armored
+        }
+        let insertAt = armored.index(after: newline)
+        var result = armored
+        result.insert(contentsOf: "Comment: \(comment)\n", at: insertAt)
+        return result
     }
 }
 
@@ -146,7 +174,7 @@ enum PacketBuilderError: LocalizedError {
         case .encryptionFailed(let msg): return "Packet encryption failed: \(msg)"
         case .invalidKeyData(let msg): return "Invalid key data: \(msg)"
         case .sessionKeyGenerationFailed: return "Failed to generate random session key"
-        case .signingFailed(let msg): return "Signing failed: \(msg)"
+        case .signingFailed(let msg): return String(localized: "Signing failed: \(msg)")
         }
     }
 }
@@ -616,6 +644,77 @@ class OpenPGPPacketBuilder {
         return buildNewFormatPacket(tag: 1, body: Data(body))
     }
 
+    // MARK: - Composite (RFC 9980, algorithm 35) Encrypt
+
+    /// A recipient's RFC 9980 ML-KEM-768 + X25519 composite encryption subkey,
+    /// parsed from its v6 public-subkey packet.
+    struct CompositeRecipient {
+        let subkeyFingerprint: [UInt8]  // 32-byte v6 fingerprint of the subkey
+        let x25519Public: [UInt8]       // 32-byte X25519 public
+        let mlkemPublic: [UInt8]        // 1184-byte ML-KEM-768 public
+    }
+
+    /// Encrypt to a single RFC 9980 composite recipient (algorithm 35). Emits a
+    /// v6 PKESK (algo 35) followed by a SEIPDv2 (AES-256-OCB) packet — the exact
+    /// inverse of OpenPGPPacketParser's composite decrypt path, and the wire
+    /// format Sequoia (sq) produces and consumes.
+    static func buildCompositeEncryptedMessage(
+        plaintext: Data,
+        recipient: CompositeRecipient,
+        signingInfo: Ed25519SigningInfo? = nil,
+        filename: String? = nil,
+        armor: Bool = true
+    ) throws -> Data {
+        guard recipient.subkeyFingerprint.count == 32 else {
+            throw PacketBuilderError.invalidKeyData("composite PKESK needs a 32-byte fingerprint")
+        }
+
+        // AES-256 session key (the v6 ecosystem rejects AES-128 there by policy).
+        var sessionKey = [UInt8](repeating: 0, count: 32)
+        guard SecRandomCopyBytes(kSecRandomDefault, 32, &sessionKey) == errSecSuccess else {
+            throw PacketBuilderError.sessionKeyGenerationFailed
+        }
+
+        // Composite KEM → 32-octet KEK, then RFC 3394 key-wrap the session key.
+        let enc = try CompositeKEMService.encapsulate(
+            mlkemPublicKey: Data(recipient.mlkemPublic),
+            ecdhPublicKey: Data(recipient.x25519Public)
+        )
+        let wrapped = try AESKeyWrap.wrap(plaintext: sessionKey, kek: Array(enc.kek))  // 40 octets
+
+        // v6 PKESK, algorithm 35: fingerprint header, then algorithm-specific
+        // ecdhCipherText(32) ‖ mlkemCipherText(1088) ‖ len(1) ‖ wrappedSessionKey.
+        var body: [UInt8] = []
+        body.append(6)                                        // PKESK version 6
+        body.append(33)                                       // size of (keyVersion + fingerprint)
+        body.append(6)                                        // target key version
+        body.append(contentsOf: recipient.subkeyFingerprint)  // 32-byte v6 fingerprint
+        body.append(35)                                       // public-key algorithm: ML-KEM-768 + X25519
+        body.append(contentsOf: Array(enc.ecdhCipherText))    // V (32)
+        body.append(contentsOf: Array(enc.mlkemCipherText))   // ML-KEM ciphertext (1088)
+        body.append(UInt8(wrapped.count))                     // size of wrapped session key (40)
+        body.append(contentsOf: wrapped)                      // wrapped session key
+        let pkesk = buildNewFormatPacket(tag: 1, body: Data(body))
+
+        let seipd2 = try buildSEIPDv2Packet(
+            plaintext: Array(plaintext),
+            sessionKey: sessionKey,
+            cipherAlgorithmID: 9,          // AES-256
+            signingInfo: signingInfo,
+            filename: filename
+        )
+
+        var message = Data()
+        message.append(pkesk)
+        message.append(seipd2)
+
+        if armor {
+            let armored = armorMessage(message)
+            return armored.data(using: .utf8) ?? message
+        }
+        return message
+    }
+
     /// RFC 9580 §5.13.2 — SEIPDv2 (tag 18, version 2) with AES-OCB.
     /// Inverse of OpenPGPPacketParser.decryptSEIPDv2, using the identical HKDF so
     /// the two sides derive byte-for-byte the same key and nonce.
@@ -790,7 +889,7 @@ class OpenPGPPacketBuilder {
     /// Build a v3 One-Pass Signature packet.
     /// This tells the recipient "a signature follows the literal data."
     /// RFC 4880 §5.4
-    private static func buildOnePassSignaturePacket(keyID: [UInt8], pubkeyAlgo: UInt8 = 22) -> [UInt8] {
+    static func buildOnePassSignaturePacket(keyID: [UInt8], pubkeyAlgo: UInt8 = 22) -> [UInt8] {
         var body: [UInt8] = []
 
         body.append(3)            // Version 3
@@ -824,7 +923,7 @@ class OpenPGPPacketBuilder {
     /// Build a v4 binary document signature (type 0x00) using Ed25519.
     /// Signs the raw literal data body (not the packet wrapper).
     /// RFC 4880 §5.2.1
-    private static func buildBinarySignaturePacket(
+    static func buildBinarySignaturePacket(
         signingKey: Curve25519.Signing.PrivateKey,
         keyID: [UInt8],
         fingerprint: [UInt8],

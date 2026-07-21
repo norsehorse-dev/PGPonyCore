@@ -1,0 +1,5 @@
+module COQS {
+    header "oqs/oqs.h"
+    header "oqs/sha3.h"
+    export *
+}

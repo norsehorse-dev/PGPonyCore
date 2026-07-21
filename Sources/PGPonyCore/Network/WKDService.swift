@@ -67,14 +67,14 @@ final class WKDService {
 
     static let shared = WKDService()
 
-    private let session: URLSession
+    private init() {}
 
-    private init() {
-        let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 8     // WKD should be fast — short timeout to fall back quickly
-        config.timeoutIntervalForResource = 15
-        config.requestCachePolicy = .reloadIgnoringLocalCacheData  // never cache key lookups
-        self.session = URLSession(configuration: config)
+    /// Fresh session per lookup so current proxy settings apply. WKD is short
+    /// (fast fall-back) and must never cache. Crucially, WKD hits arbitrary
+    /// third-party domains, so we do NOT force TLS 1.3 — some legitimate WKD
+    /// hosts are still TLS 1.2 only, and forcing 1.3 would break them.
+    private var session: URLSession {
+        HTTPSessionFactory.makeSession(requestTimeout: 8, resourceTimeout: 15, noCache: true)
     }
 
     // =========================================================================

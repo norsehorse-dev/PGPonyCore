@@ -24,11 +24,11 @@ enum ECDHError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .keyAgreementFailed(let msg): return "ECDH key agreement failed: \(msg)"
-        case .kdfFailed: return "ECDH KDF failed"
-        case .sessionKeyWrapFailed(let msg): return "Session key wrap failed: \(msg)"
-        case .sessionKeyUnwrapFailed(let msg): return "Session key unwrap failed: \(msg)"
-        case .invalidPublicKey: return "Invalid Cv25519 public key"
+        case .keyAgreementFailed(let msg): return String(localized: "ECDH key agreement failed: \(msg)")
+        case .kdfFailed: return String(localized: "ECDH KDF failed")
+        case .sessionKeyWrapFailed(let msg): return String(localized: "Session key wrap failed: \(msg)")
+        case .sessionKeyUnwrapFailed(let msg): return String(localized: "Session key unwrap failed: \(msg)")
+        case .invalidPublicKey: return String(localized: "Invalid Cv25519 public key")
         case .invalidEphemeralKey: return "Invalid ephemeral key data"
         case .invalidWrappedData: return "Invalid wrapped session key data"
         case .unsupportedAlgorithm(let id): return "Unsupported symmetric algorithm ID: \(id)"

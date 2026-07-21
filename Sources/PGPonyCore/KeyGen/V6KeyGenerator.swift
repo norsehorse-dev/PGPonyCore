@@ -58,6 +58,7 @@ class V6KeyGenerator {
     // Algorithm IDs (RFC 9580)
     private static let algoEd25519: UInt8 = 27   // v6 native Ed25519
     private static let algoX25519: UInt8 = 25    // v6 native X25519
+    private static let algoMLKEM768X25519: UInt8 = 35   // RFC 9980 ML-KEM-768 + X25519 composite
 
     private static let hashSHA512: UInt8 = 10
     private static let saltLenSHA512 = 32
@@ -68,7 +69,8 @@ class V6KeyGenerator {
         name: String,
         email: String,
         passphrase: String?,
-        expirationInterval: TimeInterval?
+        expirationInterval: TimeInterval?,
+        pqcEncryption: Bool = false
     ) throws -> V6KeyGeneratorResult {
 
         let genStart = Date()
@@ -98,10 +100,29 @@ class V6KeyGenerator {
         let signSubPub  = Array(signSubkey.publicKey.rawRepresentation)
         let signSubPriv = Array(signSubkey.rawRepresentation)
 
-        // Generate X25519 encryption subkey
+        // Generate the encryption subkey. Classical: X25519 (algorithm 25).
+        // PQC (RFC 9980): an ML-KEM-768 + X25519 composite (algorithm 35) — the
+        // 32-byte X25519 public leads, followed by the 1184-byte ML-KEM public;
+        // the secret material is the 32-byte X25519 scalar followed by the 64-byte
+        // ML-KEM seed (d‖z), which is what the composite decrypt path expects.
         let encryptionKey = Curve25519.KeyAgreement.PrivateKey()
         let encryptionPub  = Array(encryptionKey.publicKey.rawRepresentation)
         let encryptionPriv = Array(encryptionKey.rawRepresentation)
+
+        let encAlgorithm: UInt8
+        let encKeyMaterial: [UInt8]
+        let encRawPrivate: [UInt8]
+        if pqcEncryption {
+            let mlkemSeed = try secureRandomBytes(64)                       // d‖z
+            let (mlkemPub, _) = try MLKEMService.generateKeyPair(seed: Data(mlkemSeed))
+            encAlgorithm  = algoMLKEM768X25519
+            encKeyMaterial = encryptionPub + Array(mlkemPub)                // 32 + 1184 = 1216
+            encRawPrivate  = encryptionPriv + mlkemSeed                     // 32 + 64 = 96
+        } else {
+            encAlgorithm  = algoX25519
+            encKeyMaterial = encryptionPub
+            encRawPrivate  = encryptionPriv
+        }
 
         // Build v6 primary public-key packet body
         let primaryPubBody = buildV6PublicKeyBody(
@@ -174,11 +195,11 @@ class V6KeyGenerator {
             embeddedBackSignature: signSubBackSig
         )
 
-        // Subkey 2: v6 X25519 encryption subkey
+        // Subkey 2: v6 encryption subkey — X25519 (algo 25) or ML-KEM+X25519 (algo 35)
         let subkeyPubBody = buildV6PublicKeyBody(
             creationTime: creationTime,
-            algorithm: algoX25519,
-            keyMaterial: encryptionPub
+            algorithm: encAlgorithm,
+            keyMaterial: encKeyMaterial
         )
 
         // Subkey binding signature (type 0x18) — encrypt flags 0x0C (no back-sig)
@@ -223,7 +244,7 @@ class V6KeyGenerator {
         )
         let subkeySecretBody = try buildV6SecretKeyBody(
             publicBody: subkeyPubBody,
-            rawPrivateKey: encryptionPriv,
+            rawPrivateKey: encRawPrivate,
             lock: lock,
             packetTagID: 0xC7
         )

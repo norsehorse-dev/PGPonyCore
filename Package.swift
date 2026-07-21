@@ -15,14 +15,27 @@ let package = Package(
         .library(name: "PGPonyCore", targets: ["PGPonyCore"])
     ],
     targets: [
+        // Pinned liboqs build (ML-KEM) — the PQC sources import its COQS module.
+        // Vendored so the package builds out of the box and auditors see the
+        // exact binary the app links.
+        .binaryTarget(
+            name: "liboqs",
+            path: "Vendor/liboqs.xcframework"
+        ),
         .target(
             name: "PGPonyCore",
+            dependencies: ["liboqs"],
             path: "Sources/PGPonyCore"
         ),
         .testTarget(
             name: "PGPonyCoreTests",
             dependencies: ["PGPonyCore"],
-            path: "Tests/PGPonyCoreTests"
+            path: "Tests/PGPonyCoreTests",
+            resources: [
+                // Lands as <bundle>/mime/*.eml, matching the tests' lookup
+                // (url(forResource:withExtension:subdirectory: "mime")).
+                .copy("Resources/mime")
+            ]
         )
     ]
 )

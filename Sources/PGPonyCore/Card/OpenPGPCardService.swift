@@ -152,14 +152,14 @@ enum OpenPGPCardError: LocalizedError {
         case .notISO7816:
             return "That tag isn't an OpenPGP smart card."
         case .appletNotFound:
-            return "No OpenPGP application was found on the card."
+            return String(localized: "No OpenPGP application was found on the card.")
         case .unexpectedStatus(let sw1, let sw2):
             return String(format: "The card returned an unexpected status (0x%02X%02X).", sw1, sw2)
         case .pinBlocked:
             return "This PIN is blocked. Unblock it with your admin PIN (PW3) before continuing."
         case .wrongPIN(let n):
-            if let n { return "Incorrect PIN. \(n) attempt\(n == 1 ? "" : "s") remaining." }
-            return "Incorrect PIN."
+            if let n { return String(localized: "Incorrect PIN. \(n) attempts remaining.") }
+            return String(localized: "Incorrect PIN.")
         case .malformedResponse:
             return "The card's response could not be understood."
         case .sessionClosed:
@@ -1002,5 +1002,169 @@ enum BERTLV {
             i += length
         }
         return nil
+    }
+}
+
+// MARK: - v7.1.0: Card user-PIN cache (Dong's request)
+
+/// Opt-in, in-memory cache for the OpenPGP card *user* PIN (PW1), so a user doing
+/// several card operations in one session isn't re-prompted every time.
+///
+/// Security posture (deliberately conservative):
+/// - Default mode is `.never` → no caching at all, identical to prior behavior.
+///   Caching only happens if the user explicitly opts in via Settings.
+/// - The PIN lives ONLY in memory. It is never written to disk, UserDefaults, or
+///   the Keychain. Only the cache *mode* (an enum) is persisted.
+/// - The cache is wiped on: expiry, manual clear, and whenever a verify rejects
+///   the PIN (so a stale PIN can't silently burn PW1 attempts). It is NOT wiped
+///   on app backgrounding — the chosen duration is the sole time boundary.
+/// - Only the user PIN (PW1) is ever cached. The admin PIN (PW3) is never cached.
+final class CardPINCache {
+    static let shared = CardPINCache()
+
+    enum Mode: String, CaseIterable {
+        case never            // ask every time (default)
+        case oneMinute
+        case fiveMinutes
+        case fifteenMinutes
+        case untilCleared     // until manual clear (or a wrong-PIN clear)
+
+        /// Seconds of validity, or nil for "until manually cleared", or 0 for never.
+        var seconds: TimeInterval? {
+            switch self {
+            case .never:          return 0
+            case .oneMinute:      return 60
+            case .fiveMinutes:    return 300
+            case .fifteenMinutes: return 900
+            case .untilCleared:   return nil
+            }
+        }
+
+        var label: String {
+            switch self {
+            case .never:          return String(localized: "Ask every time")
+            case .oneMinute:      return String(localized: "1 minute")
+            case .fiveMinutes:    return String(localized: "5 minutes")
+            case .fifteenMinutes: return String(localized: "15 minutes")
+            case .untilCleared:   return String(localized: "Until I clear it")
+            }
+        }
+    }
+
+    private static let modeKey = "pgpony_pin_cache_mode"
+
+    static var mode: Mode {
+        get { Mode(rawValue: UserDefaults.standard.string(forKey: modeKey) ?? "") ?? .never }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: modeKey) }
+    }
+
+    private var pin: String?
+    private var expiry: Date?
+    private let queue = DispatchQueue(label: "app.pgpony.pincache")
+
+    private init() {
+        // v7.1.x (Dong): the PIN cache is bounded by the chosen duration, a
+        // wrong-PIN clear, and the manual "Clear Remembered PIN" action — NOT by
+        // app backgrounding. Backgrounding used to wipe it here, which defeated
+        // the Mail -> PGPony flow (opening the share sheet backgrounds the app and
+        // cleared the PIN before it could be used). The didEnterBackground
+        // observer was removed so the chosen duration is the sole time boundary.
+        // PW1 only, held in memory only, gone on app termination.
+    }
+
+    /// Live, read-only snapshot for the Settings countdown. Never mutates the
+    /// cache (expiry is still enforced on read in `cachedPIN()`).
+    enum CacheState: Equatable {
+        case off                                // mode is "Ask every time"
+        case empty                              // caching on, nothing held right now
+        case untilCleared                       // held, no time limit
+        case counting(remaining: TimeInterval)  // held, clears in `remaining` seconds
+    }
+
+    func state() -> CacheState {
+        queue.sync {
+            guard Self.mode != .never else { return .off }
+            guard pin != nil else { return .empty }
+            if let expiry {
+                let remaining = expiry.timeIntervalSinceNow
+                if remaining <= 0 { return .empty }
+                return .counting(remaining: remaining)
+            }
+            return .untilCleared
+        }
+    }
+
+    /// The cached user PIN if caching is enabled and the entry is still valid,
+    /// otherwise nil. Expired entries are dropped on read.
+    func cachedPIN() -> String? {
+        queue.sync {
+            guard Self.mode != .never, let pin else { return nil }
+            if let expiry, Date() >= expiry {
+                self.pin = nil
+                self.expiry = nil
+                return nil
+            }
+            return pin
+        }
+    }
+
+    /// Store the user PIN after a *successful* verify. No-op when caching is off.
+    func store(_ pin: String) {
+        queue.sync {
+            let mode = Self.mode
+            guard mode != .never else { return }
+            self.pin = pin
+            if let secs = mode.seconds, secs > 0 {
+                self.expiry = Date().addingTimeInterval(secs)
+            } else {
+                self.expiry = nil   // untilCleared
+            }
+        }
+    }
+
+    /// Wipe the cached PIN immediately.
+    func clear() {
+        queue.sync {
+            self.pin = nil
+            self.expiry = nil
+        }
+    }
+
+    /// v7.1.1 (Dong) — change the cache duration AND immediately re-apply it to a
+    /// PIN that is already held, so switching (e.g.) "1 minute" -> "Until I clear
+    /// it" takes effect on the CURRENT PIN right away instead of waiting for the
+    /// next decrypt to call store().
+    ///
+    /// Before this, `mode` only wrote UserDefaults; the held PIN's `expiry` was
+    /// recomputed solely inside store(), so a changed duration didn't apply until
+    /// the next successful verify. Settings binds its picker to this method now
+    /// instead of the bare `mode` setter.
+    ///
+    /// Re-application rules:
+    ///   - a timed mode  -> expiry = now + the new duration
+    ///   - untilCleared  -> expiry = nil (held, no time limit)
+    ///   - never         -> purge the held PIN (caching is off; a held secret
+    ///                      shouldn't silently linger or revive on a later switch
+    ///                      back to a timed mode without a fresh verify)
+    /// If no PIN is currently held, this only persists the mode; the next store()
+    /// applies it normally.
+    func setMode(_ newMode: Mode) {
+        queue.sync {
+            Self.mode = newMode
+            guard pin != nil else { return }
+            switch newMode {
+            case .never:
+                self.pin = nil
+                self.expiry = nil
+            case .untilCleared:
+                self.expiry = nil
+            default:
+                if let secs = newMode.seconds, secs > 0 {
+                    self.expiry = Date().addingTimeInterval(secs)
+                } else {
+                    self.expiry = nil
+                }
+            }
+        }
     }
 }

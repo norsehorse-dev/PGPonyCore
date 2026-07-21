@@ -32,9 +32,13 @@ class Ed25519KeyGenerator {
     // Cv25519 curve OID: 1.3.6.1.4.1.3029.1.5.1
     private static let cv25519OID: [UInt8] = [0x2B, 0x06, 0x01, 0x04, 0x01, 0x97, 0x55, 0x01, 0x05, 0x01]
     
+    // X25519 native curve OID: 1.3.101.110 (used by the v5 Kyber composite subkey)
+    private static let x25519NativeOID: [UInt8] = [0x2B, 0x65, 0x6E]
+
     // Algorithm IDs
     private static let eddsaAlgorithm: UInt8 = 22   // EdDSA
     private static let ecdhAlgorithm: UInt8 = 18     // ECDH
+    private static let kyberAlgorithm: UInt8 = 8     // LibrePGP ML-KEM-768 + X25519 (GnuPG "Kyber")
     
     // S2K constants
     private static let s2kSaltLength = 8
@@ -46,6 +50,49 @@ class Ed25519KeyGenerator {
     // GnuPG default coded count = 0x60 → decoded = (16 + (0 & 15)) << ((0x60 >> 4) + 6)
     // = 16 << 12 = 65536 bytes
     private static let s2kCodedCount: UInt8 = 0x60
+
+    // MARK: - 7.1.1 Canonical Cv25519 Scalar Encoding
+
+    /// Apply the RFC 7748 clamping pattern to a little-endian X25519 scalar:
+    /// clear the low three bits of byte 0, clear the top bit and set the
+    /// second-highest bit of byte 31. CryptoKit clamps internally on use but
+    /// does NOT clamp `rawRepresentation`, and gpg-agent verifies Q == d·G
+    /// against the UNclamped wire value — so the clamped form must be what
+    /// gets serialized. Idempotent.
+    static func clampCv25519LE(_ scalar: [UInt8]) -> [UInt8] {
+        guard scalar.count == 32 else { return scalar }
+        var s = scalar
+        s[0] &= 248
+        s[31] &= 127
+        s[31] |= 64
+        return s
+    }
+
+    /// The single source of truth for what a Cv25519 secret scalar looks
+    /// like on the OpenPGP wire: clamp the CryptoKit little-endian bytes,
+    /// then reverse to the big-endian order RFC 9580 MPIs require. Clamping
+    /// guarantees the top bit of the most significant byte (LE byte 31) is
+    /// clear and the next bit is set, so the canonical scalar is always
+    /// exactly 255 bits / 32 bytes with no leading-zero stripping needed.
+    static func canonicalCv25519WireScalar(_ privateKeyLE: [UInt8]) -> [UInt8] {
+        return clampCv25519LE(privateKeyLE).reversed()
+    }
+
+    /// Encode big-endian integer bytes as an OpenPGP MPI: strip leading zero
+    /// bytes, compute the bit length from the FIRST REMAINING byte, and
+    /// prefix the 2-byte big-endian bit count. The header always agrees with
+    /// the physical byte count that follows it — the pre-7.1.1 generator
+    /// computed the bit count against the little-endian buffer but appended
+    /// all 32 bytes, which desynchronized the two for ~1 in 32 keys.
+    static func canonicalMPI(_ bigEndianBytes: [UInt8]) -> [UInt8] {
+        var bytes = bigEndianBytes
+        while bytes.count > 1 && bytes.first == 0 {
+            bytes.removeFirst()
+        }
+        if bytes == [0] { return [0, 0] }
+        let bits = UInt16(bytes.count * 8 - Int(bytes[0].leadingZeroBitCount))
+        return bits.bigEndianBytes + bytes
+    }
     
     // MARK: - Generate
     
@@ -53,20 +100,39 @@ class Ed25519KeyGenerator {
         name: String,
         email: String,
         passphrase: String?,
-        expirationInterval: TimeInterval?
+        expirationInterval: TimeInterval?,
+        pqcEncryption: Bool = false
     ) throws -> Ed25519KeyGeneratorResult {
-        
+
         let creationTime = UInt32(Date().timeIntervalSince1970)
-        
+
         // Generate Ed25519 signing key (primary)
         let signingKey = Curve25519.Signing.PrivateKey()
         let signingPublicBytes = Array(signingKey.publicKey.rawRepresentation)
         let signingPrivateBytes = Array(signingKey.rawRepresentation)
-        
-        // Generate Cv25519 encryption subkey
+
+        // Generate X25519 encryption subkey. Classical LibrePGP keys wrap it as a
+        // Cv25519 ECDH subkey (algorithm 18); the PQC variant pairs it with an
+        // ML-KEM-768 keypair inside a v5 Kyber subkey (algorithm 8), the GnuPG
+        // LibrePGP post-quantum encryption subkey.
         let encryptionKey = Curve25519.KeyAgreement.PrivateKey()
         let encryptionPublicBytes = Array(encryptionKey.publicKey.rawRepresentation)
         let encryptionPrivateBytes = Array(encryptionKey.rawRepresentation)
+
+        // For the PQC variant: a fresh ML-KEM-768 keypair, stored as its 64-octet
+        // seed (d‖z) alongside the raw X25519 secret.
+        var mlkemSeed: [UInt8] = []
+        var mlkemPublic: [UInt8] = []
+        if pqcEncryption {
+            var seed = [UInt8](repeating: 0, count: 64)
+            guard SecRandomCopyBytes(kSecRandomDefault, 64, &seed) == errSecSuccess else {
+                throw NSError(domain: "PGPony.Ed25519KeyGen", code: 3,
+                              userInfo: [NSLocalizedDescriptionKey: "Random generation failed"])
+            }
+            let (pub, _) = try MLKEMService.generateKeyPair(seed: Data(seed))
+            mlkemSeed = seed
+            mlkemPublic = Array(pub)
+        }
         
         // Build primary public key packet body
         let primaryPubBody = buildEdDSAPublicKeyBody(
@@ -92,19 +158,23 @@ class Ed25519KeyGenerator {
             keyID: keyID
         )
         
-        // Build encryption subkey packet body
-        let subkeyPubBody = buildECDHPublicKeyBody(
-            creationTime: creationTime,
-            publicKey: encryptionPublicBytes
-        )
-        
-        // Build subkey binding signature
+        // Build encryption subkey packet body — Cv25519 (v4) or Kyber (v5).
+        let subkeyPubBody = pqcEncryption
+            ? buildKyberPublicKeyBody(creationTime: creationTime,
+                                      x25519Public: encryptionPublicBytes,
+                                      mlkemPublic: mlkemPublic)
+            : buildECDHPublicKeyBody(creationTime: creationTime,
+                                     publicKey: encryptionPublicBytes)
+
+        // Build subkey binding signature. A v5 subkey is hashed with the 0x9A/
+        // 4-octet-length framing (vs 0x99/2-octet for v4) — see buildSubkeyBindingHashData.
         let subkeyBindingSig = try buildSubkeyBindingSignature(
             signingKey: signingKey,
             primaryKeyBody: primaryPubBody,
             subkeyBody: subkeyPubBody,
             creationTime: creationTime,
-            keyID: keyID
+            keyID: keyID,
+            subkeyIsV5: pqcEncryption
         )
         
         // Assemble transferable public key
@@ -122,11 +192,14 @@ class Ed25519KeyGenerator {
             passphrase: passphrase
         )
         
-        let subkeySecretBody = buildECDHSecretKeyBody(
-            publicBody: subkeyPubBody,
-            privateKey: encryptionPrivateBytes,
-            passphrase: passphrase
-        )
+        let subkeySecretBody = pqcEncryption
+            ? buildKyberSecretKeyBody(publicBody: subkeyPubBody,
+                                      x25519Private: encryptionPrivateBytes,
+                                      mlkemSeed: mlkemSeed,
+                                      passphrase: passphrase)
+            : buildECDHSecretKeyBody(publicBody: subkeyPubBody,
+                                     privateKey: encryptionPrivateBytes,
+                                     passphrase: passphrase)
         
         // Assemble transferable secret key
         var secretKeyPackets = Data()
@@ -196,10 +269,94 @@ class Ed25519KeyGenerator {
         body.append(0x01)  // Reserved (always 1)
         body.append(8)     // SHA256
         body.append(7)     // AES128
-        
+
         return body
     }
-    
+
+    // MARK: - v5 Kyber (ML-KEM-768 + X25519) subkey — LibrePGP algorithm 8
+
+    /// Build a v5 public-key packet body for the GnuPG LibrePGP Kyber composite
+    /// (algorithm 8). Byte layout matches GnuPG 2.5.x exactly:
+    ///   ver(1)=5 | ctime(4) | algo(1)=8 | keyMatLen(4 BE)
+    ///     | OID(len(1)=3 ‖ 2b 65 6e)                       — X25519 native
+    ///     | ecc point SOS(bit-len(2)=0x0107 ‖ 0x40 ‖ X25519 public(32))
+    ///     | mlkemLen(4 BE)=1184 ‖ ML-KEM-768 public(1184)
+    static func buildKyberPublicKeyBody(creationTime: UInt32,
+                                        x25519Public: [UInt8],
+                                        mlkemPublic: [UInt8]) -> [UInt8] {
+        var keyMat: [UInt8] = []
+        keyMat.append(UInt8(x25519NativeOID.count))       // 0x03
+        keyMat.append(contentsOf: x25519NativeOID)        // 2b 65 6e
+        // X25519 KEM point: 0x40 native-point prefix + 32 octets, as a fixed
+        // 263-bit SOS (the 0x40 top byte pins the bit length at 263).
+        keyMat.append(0x01); keyMat.append(0x07)          // bit length 263
+        keyMat.append(0x40)
+        keyMat.append(contentsOf: x25519Public)
+        // ML-KEM-768 public key: 4-octet length prefix.
+        let n = UInt32(mlkemPublic.count)
+        keyMat.append(contentsOf: n.bigEndianBytes)
+        keyMat.append(contentsOf: mlkemPublic)
+
+        var body: [UInt8] = []
+        body.append(5)                                    // version 5
+        body.append(contentsOf: creationTime.bigEndianBytes)
+        body.append(kyberAlgorithm)                       // 8
+        body.append(contentsOf: UInt32(keyMat.count).bigEndianBytes)   // v5 key-material length
+        body.append(contentsOf: keyMat)
+        return body
+    }
+
+    /// Build the matching v5 unprotected secret-key packet body. A v5 secret key
+    /// carries a 4-octet count of the secret material after the S2K-usage octet.
+    /// The composite secret is the raw 32-octet X25519 scalar (CryptoKit's little-
+    /// endian rawRepresentation, fed straight back to Curve25519 on decap) followed
+    /// by the 64-octet ML-KEM seed (d‖z).
+    static func buildKyberSecretKeyBody(publicBody: [UInt8],
+                                        x25519Private: [UInt8],
+                                        mlkemSeed: [UInt8],
+                                        passphrase: String? = nil) -> [UInt8] {
+        var body = publicBody
+        let secret = x25519Private + mlkemSeed            // 32 + 64 = 96
+
+        guard let passphrase = passphrase, !passphrase.isEmpty else {
+            body.append(0)                                    // S2K usage 0 (unprotected)
+            body.append(contentsOf: UInt32(secret.count).bigEndianBytes)   // v5 secret-material count
+            body.append(contentsOf: secret)
+            return body
+        }
+
+        // S2K-CFB protected (usage 254) — same scheme PGPony uses for the v4
+        // primary (AES-128, Iterated+Salted S2K over SHA-256, SHA-1 checksum).
+        body.append(254)                                  // S2K usage: SHA-1 checksum
+        // v5 secret keys require a 1-octet count of the protection material
+        // (cipher + S2K specifier + IV) right after the usage octet — GnuPG
+        // rejects a v5 key without it ("unknown S2K" on import). For our fixed
+        // scheme: 1 (cipher) + 11 (type+hash+salt8+count) + 16 (IV) = 28.
+        body.append(28)                                   // v5 protection-material length
+        body.append(s2kCipherAES128)                      // AES-128
+        body.append(s2kIteratedSalted)                    // S2K type 3
+        body.append(s2kHashSHA256)                        // SHA-256
+        var salt = [UInt8](repeating: 0, count: s2kSaltLength)
+        _ = SecRandomCopyBytes(kSecRandomDefault, s2kSaltLength, &salt)
+        body.append(contentsOf: salt)
+        body.append(s2kCodedCount)                        // 0x60 -> 65536 iterations
+        var iv = [UInt8](repeating: 0, count: aes128BlockSize)
+        _ = SecRandomCopyBytes(kSecRandomDefault, aes128BlockSize, &iv)
+        body.append(contentsOf: iv)
+
+        let derivedKey = deriveS2KKey(passphrase: passphrase, salt: salt,
+                                      codedCount: s2kCodedCount, keySize: aes128KeySize)
+        var plaintext = secret
+        var sha1 = [UInt8](repeating: 0, count: Int(CC_SHA1_DIGEST_LENGTH))
+        CC_SHA1(secret, CC_LONG(secret.count), &sha1)
+        plaintext.append(contentsOf: sha1)                // 96 + 20 = 116
+        let ciphertext = aesCFBEncrypt(plaintext: plaintext, key: derivedKey, iv: iv)
+
+        body.append(contentsOf: UInt32(ciphertext.count).bigEndianBytes)  // encrypted length (116)
+        body.append(contentsOf: ciphertext)
+        return body
+    }
+
     // MARK: - Secret Key Bodies
     
     private static func buildEdDSASecretKeyBody(
@@ -219,13 +376,14 @@ class Ed25519KeyGenerator {
             // Unprotected
             body.append(0)  // S2K usage: 0 = not encrypted
             
-            // Secret key MPI
-            let dBits = UInt16(privateKey.count * 8 - countLeadingZeroBits(privateKey))
-            body.append(contentsOf: dBits.bigEndianBytes)
-            body.append(contentsOf: privateKey)
+            // Secret key MPI — 7.1.1: canonicalMPI keeps the bit-length
+            // header in agreement with the physical byte count (an Ed25519
+            // seed starts with 0x00 for ~1 in 256 keys, and strict parsers
+            // read exactly ceil(bits / 8) bytes).
+            let mpiData: [UInt8] = canonicalMPI(privateKey)
+            body.append(contentsOf: mpiData)
             
             // Two-octet checksum of all secret MPI bytes (MPI length + MPI data)
-            let mpiData: [UInt8] = dBits.bigEndianBytes + privateKey
             let checksum = mpiData.reduce(UInt16(0)) { ($0 &+ UInt16($1)) }
             body.append(contentsOf: checksum.bigEndianBytes)
         }
@@ -240,23 +398,34 @@ class Ed25519KeyGenerator {
     ) -> [UInt8] {
         var body = publicBody
         
+        // 7.1.1 ROOT-CAUSE FIX. `privateKey` arrives as CryptoKit's
+        // little-endian `rawRepresentation`, but RFC 9580 MPIs are
+        // big-endian. The pre-7.1.1 generator wrote the LE bytes straight
+        // into the packet, which GnuPG rejected ("lower 3 bits of the
+        // secret key are not cleared") and BouncyCastle read as a garbage
+        // scalar ("checksum failed" on protected import). Clamp + reverse
+        // ONCE here so both the protected and unprotected branches
+        // serialize the same canonical big-endian scalar that every other
+        // OpenPGP implementation writes.
+        let wireScalar = canonicalCv25519WireScalar(privateKey)
+        
         if let passphrase = passphrase, !passphrase.isEmpty {
             // S2K-protected secret key
             body.append(contentsOf: buildS2KProtectedSecretMPI(
-                privateKey: privateKey,
+                privateKey: wireScalar,
                 passphrase: passphrase
             ))
         } else {
             // Unprotected
             body.append(0)  // S2K usage: 0 = not encrypted
             
-            // Secret key MPI
-            let dBits = UInt16(privateKey.count * 8 - countLeadingZeroBits(privateKey))
-            body.append(contentsOf: dBits.bigEndianBytes)
-            body.append(contentsOf: privateKey)
+            // Secret key MPI — canonical big-endian scalar, header always
+            // consistent with the physical bytes (clamping pins the scalar
+            // at exactly 255 bits, so no stripping actually occurs here).
+            let mpiData: [UInt8] = canonicalMPI(wireScalar)
+            body.append(contentsOf: mpiData)
             
             // Two-octet checksum of all secret MPI bytes
-            let mpiData: [UInt8] = dBits.bigEndianBytes + privateKey
             let checksum = mpiData.reduce(UInt16(0)) { ($0 &+ UInt16($1)) }
             body.append(contentsOf: checksum.bigEndianBytes)
         }
@@ -267,8 +436,13 @@ class Ed25519KeyGenerator {
     // MARK: - S2K Passphrase Protection
     
     /// Build S2K-protected secret key material per RFC 4880 §3.7.1.3
-    /// Uses Iterated+Salted S2K (type 3) with SHA256 and AES-128 CFB
-    private static func buildS2KProtectedSecretMPI(
+    /// Uses Iterated+Salted S2K (type 3) with SHA256 and AES-128 CFB.
+    ///
+    /// 7.1.1: internal (was private) so PGPService's export path can rewrap
+    /// a legacy-LE protected scalar with the exact same S2K writer the
+    /// generator uses — export bytes match generation bytes by construction.
+    /// `privateKey` must already be in canonical big-endian wire order.
+    static func buildS2KProtectedSecretMPI(
         privateKey: [UInt8],
         passphrase: String
     ) -> [UInt8] {
@@ -300,11 +474,12 @@ class Ed25519KeyGenerator {
             keySize: aes128KeySize
         )
         
-        // Build plaintext: MPI data + SHA-1 hash of MPI data
-        var plaintext: [UInt8] = []
-        let dBits = UInt16(privateKey.count * 8 - countLeadingZeroBits(privateKey))
-        plaintext.append(contentsOf: dBits.bigEndianBytes)
-        plaintext.append(contentsOf: privateKey)
+        // Build plaintext: MPI data + SHA-1 hash of MPI data.
+        // 7.1.1: canonicalMPI keeps the bit-length header consistent with
+        // the physical bytes (the pre-7.1.1 code measured the bit count on
+        // whatever buffer arrived — little-endian for Cv25519 — and then
+        // appended all 32 bytes regardless).
+        var plaintext: [UInt8] = canonicalMPI(privateKey)
         
         // SHA-1 checksum of plaintext (for S2K usage byte 254)
         var sha1Hash = [UInt8](repeating: 0, count: Int(CC_SHA1_DIGEST_LENGTH))
@@ -510,13 +685,13 @@ class Ed25519KeyGenerator {
         let rBytes = Array(sigBytes[0..<32])
         let sBytes = Array(sigBytes[32..<64])
         
-        let rBits = UInt16(rBytes.count * 8 - countLeadingZeroBits(rBytes))
-        sigBody.append(contentsOf: rBits.bigEndianBytes)
-        sigBody.append(contentsOf: rBytes)
-        
-        let sBits = UInt16(sBytes.count * 8 - countLeadingZeroBits(sBytes))
-        sigBody.append(contentsOf: sBits.bigEndianBytes)
-        sigBody.append(contentsOf: sBytes)
+        // Canonical MPI: strip leading zero octets so the 2-byte bit length
+        // agrees with the octet count. An EdDSA R or S has a leading 0x00 for
+        // ~1/256 of signatures; the previous encoder wrote the full 32 octets
+        // under a shorter bit length, yielding an over-long MPI that GnuPG and
+        // Sequoia read as a corrupt, unverifiable signature.
+        sigBody.append(contentsOf: canonicalMPI(rBytes))
+        sigBody.append(contentsOf: canonicalMPI(sBytes))
         
         return sigBody
     }
@@ -527,7 +702,8 @@ class Ed25519KeyGenerator {
         primaryKeyBody: [UInt8],
         subkeyBody: [UInt8],
         creationTime: UInt32,
-        keyID: [UInt8]
+        keyID: [UInt8],
+        subkeyIsV5: Bool = false
     ) throws -> [UInt8] {
         
         var hashedSubpackets = Data()
@@ -546,12 +722,13 @@ class Ed25519KeyGenerator {
             primaryKeyBody: primaryKeyBody,
             subkeyBody: subkeyBody,
             signatureType: 0x18,
-            hashedSubpackets: Array(hashedSubpackets)
+            hashedSubpackets: Array(hashedSubpackets),
+            subkeyIsV5: subkeyIsV5
         )
-        
+
         let digest = SHA256.hash(data: hashData)
         let digestBytes = Array(digest)
-        
+
         // OpenPGP EdDSA: sign the SHA-256 digest, not the raw data
         let signature = try signingKey.signature(for: Data(digestBytes))
         let sigBytes = Array(signature)
@@ -576,13 +753,13 @@ class Ed25519KeyGenerator {
         let rBytes = Array(sigBytes[0..<32])
         let sBytes = Array(sigBytes[32..<64])
         
-        let rBits = UInt16(rBytes.count * 8 - countLeadingZeroBits(rBytes))
-        sigBody.append(contentsOf: rBits.bigEndianBytes)
-        sigBody.append(contentsOf: rBytes)
-        
-        let sBits = UInt16(sBytes.count * 8 - countLeadingZeroBits(sBytes))
-        sigBody.append(contentsOf: sBits.bigEndianBytes)
-        sigBody.append(contentsOf: sBytes)
+        // Canonical MPI: strip leading zero octets so the 2-byte bit length
+        // agrees with the octet count. An EdDSA R or S has a leading 0x00 for
+        // ~1/256 of signatures; the previous encoder wrote the full 32 octets
+        // under a shorter bit length, yielding an over-long MPI that GnuPG and
+        // Sequoia read as a corrupt, unverifiable signature.
+        sigBody.append(contentsOf: canonicalMPI(rBytes))
+        sigBody.append(contentsOf: canonicalMPI(sBytes))
         
         return sigBody
     }
@@ -624,22 +801,32 @@ class Ed25519KeyGenerator {
         primaryKeyBody: [UInt8],
         subkeyBody: [UInt8],
         signatureType: UInt8,
-        hashedSubpackets: [UInt8]
+        hashedSubpackets: [UInt8],
+        subkeyIsV5: Bool = false
     ) -> Data {
         var data = Data()
-        
-        // Primary key
+
+        // Primary key: v4 framing (0x99 + 2-octet length).
         let keyLen = UInt16(primaryKeyBody.count)
         data.append(0x99)
         data.append(contentsOf: keyLen.bigEndianBytes)
         data.append(contentsOf: primaryKeyBody)
-        
-        // Subkey
-        let subLen = UInt16(subkeyBody.count)
-        data.append(0x99)
-        data.append(contentsOf: subLen.bigEndianBytes)
-        data.append(contentsOf: subkeyBody)
-        
+
+        // Subkey: v4 uses 0x99 + 2-octet length; a v5 (Kyber) subkey uses
+        // 0x9A + 4-octet length (verified against GnuPG's binding-signature
+        // hash quick-check on a real LibrePGP PQC key).
+        if subkeyIsV5 {
+            let subLen = UInt32(subkeyBody.count)
+            data.append(0x9A)
+            data.append(contentsOf: subLen.bigEndianBytes)
+            data.append(contentsOf: subkeyBody)
+        } else {
+            let subLen = UInt16(subkeyBody.count)
+            data.append(0x99)
+            data.append(contentsOf: subLen.bigEndianBytes)
+            data.append(contentsOf: subkeyBody)
+        }
+
         // Signature trailer
         data.append(contentsOf: buildSignatureTrailer(
             signatureType: signatureType,
@@ -991,12 +1178,11 @@ class Ed25519KeyGenerator {
 
         let rBytes = Array(sigBytes[0..<32])
         let sBytes = Array(sigBytes[32..<64])
-        let rBits = UInt16(rBytes.count * 8 - countLeadingZeroBits(rBytes))
-        sigBody.append(contentsOf: rBits.bigEndianBytes)
-        sigBody.append(contentsOf: rBytes)
-        let sBits = UInt16(sBytes.count * 8 - countLeadingZeroBits(sBytes))
-        sigBody.append(contentsOf: sBits.bigEndianBytes)
-        sigBody.append(contentsOf: sBytes)
+        // Canonical MPI so the bit length agrees with the octet count (see note
+        // in buildSubkeyBindingSignature — a leading-zero R/S was serialized as
+        // an over-long, unverifiable MPI).
+        sigBody.append(contentsOf: canonicalMPI(rBytes))
+        sigBody.append(contentsOf: canonicalMPI(sBytes))
         return sigBody
     }
 

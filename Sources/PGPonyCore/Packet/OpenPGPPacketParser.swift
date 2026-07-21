@@ -32,8 +32,8 @@ enum PacketParserError: LocalizedError {
         case .invalidPacket(let msg): return "Invalid OpenPGP packet: \(msg)"
         case .noPKESKFound: return "No Public-Key Encrypted Session Key packet found"
         case .noSEIPDFound: return "No encrypted data packet found"
-        case .noMatchingKey: return "No matching decryption key found"
-        case .decryptionFailed(let msg): return "Decryption failed: \(msg)"
+        case .noMatchingKey: return String(localized: "No matching decryption key found")
+        case .decryptionFailed(let msg): return String(localized: "Decryption failed: \(msg)")
         case .mdcVerificationFailed: return "Message integrity check failed (MDC mismatch)"
         case .unsupportedPacketVersion(let v): return "Unsupported packet version: \(v)"
         case .unsupportedAlgorithm(let a): return "Unsupported algorithm: \(a)"
@@ -55,6 +55,12 @@ struct ParsedPKESK {
     let keyFingerprint: [UInt8]  // V6 only: full fingerprint from PKESK; empty for v3
     let keyVersion: UInt8        // V6 only: key version byte; 0 for v3
     let rsaCipher: [UInt8]       // RSA (algo 1) v3 PKESK: the m^e mod n cryptogram; empty otherwise
+    // v8.0.0 Phase F: composite ML-KEM-768+X25519 (algo 35). For that algorithm
+    // ephemeralPublicKey holds the 32-byte X25519 ciphertext (V), this holds the
+    // 1088-byte ML-KEM ciphertext, and wrappedSessionKey holds the AES-wrapped
+    // session key (C). Empty for every other algorithm. Defaulted so existing
+    // ParsedPKESK(...) call sites are unaffected.
+    var mlkemCipherText: [UInt8] = []
 }
 
 struct ParsedSEIPD {
@@ -163,7 +169,8 @@ class OpenPGPPacketParser {
     /// list without recursing.
     static func decryptMessageReturningInnerPackets(
         messageData: Data,
-        decryptionKeys: [Cv25519DecryptionKey]
+        decryptionKeys: [Cv25519DecryptionKey],
+        compositeKeys: [CompositeKEMPacket.DecryptionKey] = []
     ) throws -> DecryptedMessageContents {
         // Mirrors decryptMessage's pipeline but captures the inner packet
         // stream before literal-data extraction. Kept as a parallel function
@@ -236,6 +243,14 @@ class OpenPGPPacketParser {
                 }
             }
 
+            // V6 PKESK with algo 35 (ML-KEM-768 + X25519) — composite PQC path
+            if pkesk.version == 6 && pkesk.algorithm == 35 {
+                if let sk = CompositeKEMPacket.trySessionKey(pkesk: pkesk, keys: compositeKeys) {
+                    sessionAlgorithmID = seipd.cipherAlgorithm != 0 ? seipd.cipherAlgorithm : 9
+                    sessionKey = sk
+                }
+            }
+
             if sessionKey != nil { break }
         }
 
@@ -275,7 +290,8 @@ class OpenPGPPacketParser {
     /// transparently handled).
     static func decryptMessage(
         messageData: Data,
-        decryptionKeys: [Cv25519DecryptionKey]
+        decryptionKeys: [Cv25519DecryptionKey],
+        compositeKeys: [CompositeKEMPacket.DecryptionKey] = []
     ) throws -> Data {
 
         // 1. Parse all packets
@@ -368,6 +384,16 @@ class OpenPGPPacketParser {
                             continue
                         }
                     }
+                }
+            }
+
+            // V6 PKESK with algo 35 (ML-KEM-768 + X25519) — composite PQC path
+            if pkesk.version == 6 && pkesk.algorithm == 35 {
+                pgpDebugLog("DEBUG Parser: PKESK v6 ML-KEM+X25519 targets key ID = \(pkesk.keyID.map { String(format: "%02x", $0) }.joined())")
+                if let sk = CompositeKEMPacket.trySessionKey(pkesk: pkesk, keys: compositeKeys) {
+                    // V6 PKESK: the session-key cipher comes from the SEIPD v2 header.
+                    sessionAlgorithmID = seipd.cipherAlgorithm != 0 ? seipd.cipherAlgorithm : 9
+                    sessionKey = sk
                 }
             }
 
@@ -691,6 +717,138 @@ class OpenPGPPacketParser {
         )
     }
 
+    /// Replace any Compressed Data (tag 8) packet with its decompressed inner
+    /// packets, recursively. Needed for signature (tag 2) introspection on
+    /// messages whose signed content is compressed — e.g. ObjectivePGP-encrypted
+    /// RSA messages wrap OnePassSig + Literal + Signature inside a Compressed
+    /// packet, so a top-level tag-2 search would otherwise report "unsigned".
+    static func flattenCompressedPackets(_ packets: [ParsedPacket]) -> [ParsedPacket] {
+        var result: [ParsedPacket] = []
+        for packet in packets {
+            if packet.tag == 8, !packet.body.isEmpty {
+                let algo = packet.body[0]
+                let compressed = Array(packet.body[1...])
+                let decompressed: [UInt8]?
+                switch algo {
+                case 0: decompressed = compressed
+                case 1: decompressed = try? zlibDecompress(compressed, rawDeflate: true)
+                case 2: decompressed = try? zlibDecompress(compressed, rawDeflate: false)
+                default: decompressed = nil
+                }
+                if let dec = decompressed, let inner = try? parsePackets(data: dec) {
+                    result.append(contentsOf: flattenCompressedPackets(inner))
+                    continue
+                }
+            }
+            result.append(packet)
+        }
+        return result
+    }
+
+    /// Decrypt a message whose session key is already known (used by the
+    /// LibrePGP path, which recovers the session key via its own KEM). Finds the
+    /// SEIPD/AEAD packet, decrypts it with `sessionKey`, and returns the inner
+    /// packet stream (compression handled transparently).
+    static func decryptMessageWithSessionKey(
+        messageData: Data,
+        sessionKey: [UInt8],
+        cipherAlgorithmID: UInt8
+    ) throws -> DecryptedMessageContents {
+        let packets = try parsePackets(data: Array(messageData))
+        var seipd: ParsedSEIPD?
+        for packet in packets {
+            switch packet.tag {
+            case 18: seipd = try parseSEIPD(body: packet.body)
+            case 20: seipd = try parseAEADEncryptedData(body: packet.body)
+            default: continue
+            }
+        }
+        guard let s = seipd else { throw PacketParserError.noSEIPDFound }
+
+        let plaintext: [UInt8]
+        if s.version == 2 {
+            plaintext = try decryptSEIPDv2(seipd: s, sessionKey: sessionKey)
+        } else if s.version == 100 {
+            plaintext = try decryptAEADTag20(seipd: s, sessionKey: sessionKey)
+        } else {
+            plaintext = try decryptSEIPD(
+                encryptedData: s.encryptedData,
+                sessionKey: sessionKey,
+                algorithmID: cipherAlgorithmID)
+        }
+
+        let innerPackets = try parsePackets(data: plaintext)
+        let literalData = (try? extractLiteralData(from: innerPackets)) ?? nil
+        return DecryptedMessageContents(
+            literalData: literalData ?? Data(plaintext),
+            innerPackets: innerPackets)
+    }
+
+    /// Software (in-app key) RSA decrypt → literal data plus the inner packet
+    /// stream, so an embedded signature can be verified host-side for the banner.
+    /// Synchronous sibling of `decryptMessageOnCardRSAReturningInnerPackets`: the
+    /// `decryptCryptogram` closure performs the RSA private-key operation in
+    /// software (no card / NFC), returning the UNPADDED session-key block
+    /// (algorithm ‖ session key ‖ 2-byte checksum).
+    static func decryptMessageRSASoftwareReturningInnerPackets(
+        messageData: Data,
+        recipientKeyID: [UInt8],
+        decryptCryptogram: (_ cryptogram: [UInt8]) throws -> [UInt8]
+    ) throws -> DecryptedMessageContents {
+        let packets = try parsePackets(data: Array(messageData))
+        var pkeskPackets: [ParsedPKESK] = []
+        var seipdPacket: ParsedSEIPD?
+        for packet in packets {
+            switch packet.tag {
+            case 1:
+                if let pkesk = try? parsePKESK(body: packet.body) { pkeskPackets.append(pkesk) }
+            case 18:
+                seipdPacket = try parseSEIPD(body: packet.body)
+            case 20:
+                seipdPacket = try parseAEADEncryptedData(body: packet.body)
+            default:
+                continue
+            }
+        }
+        guard !pkeskPackets.isEmpty else { throw PacketParserError.noPKESKFound }
+        guard let seipd = seipdPacket else { throw PacketParserError.noSEIPDFound }
+
+        var sessionAlgorithmID: UInt8?
+        var sessionKey: [UInt8]?
+        var firstError: Error?
+        for pkesk in pkeskPackets {
+            // RSA software keys are v4: v3 PKESK, public-key algo 1.
+            guard pkesk.version == 3, pkesk.algorithm == 1 else { continue }
+            guard pkesk.keyID == recipientKeyID
+                  || pkesk.keyID == [UInt8](repeating: 0, count: 8) else { continue }
+            let block: [UInt8]
+            do { block = try decryptCryptogram(pkesk.rsaCipher) }
+            catch { if firstError == nil { firstError = error }; continue }
+            do {
+                let result = try parseCardSessionKeyBlock(block)
+                sessionAlgorithmID = result.algorithmID
+                sessionKey = result.sessionKey
+                break
+            } catch { continue }
+        }
+        guard let algID = sessionAlgorithmID, let sKey = sessionKey else {
+            throw firstError ?? PacketParserError.noMatchingKey
+        }
+        let plaintext: [UInt8]
+        if seipd.version == 2 {
+            plaintext = try decryptSEIPDv2(seipd: seipd, sessionKey: sKey)
+        } else if seipd.version == 100 {
+            plaintext = try decryptAEADTag20(seipd: seipd, sessionKey: sKey)
+        } else {
+            plaintext = try decryptSEIPD(encryptedData: seipd.encryptedData, sessionKey: sKey, algorithmID: algID)
+        }
+        // Flatten any Compressed packet so the tag-2 signature (ObjectivePGP
+        // compresses the signed content) is visible to introspection.
+        let innerPackets = flattenCompressedPackets(try parsePackets(data: plaintext))
+        let literalData = (try? extractLiteralData(from: innerPackets)) ?? nil
+        return DecryptedMessageContents(literalData: literalData ?? Data(), innerPackets: innerPackets)
+    }
+
     /// List the recipient key IDs (PKESK, tag 1) in a message, so the UI can tell
     /// whether an encrypted message is addressed to a known card key before
     /// prompting for a PIN + tap. All-zero IDs are wildcard ("hidden recipient").
@@ -884,7 +1042,7 @@ class OpenPGPPacketParser {
 
     // MARK: - PKESK Parsing
 
-    private static func parsePKESK(body: [UInt8]) throws -> ParsedPKESK {
+    static func parsePKESK(body: [UInt8]) throws -> ParsedPKESK {
         var off = 0
 
         guard body.count > 3 else {
@@ -1018,6 +1176,7 @@ class OpenPGPPacketParser {
 
         let ephemeralKey: [UInt8]
         let wrappedKey: [UInt8]
+        var mlkemCipherText: [UInt8] = []
 
         if algorithm == 25 {
             // X25519: 32-byte ephemeral key, then a 1-octet size of the wrapped
@@ -1031,6 +1190,22 @@ class OpenPGPPacketParser {
                 throw PacketParserError.invalidPacket("PKESK v6 X25519: wrapped key truncated")
             }
             wrappedKey = Array(body[off..<(off + wrapSize)]); off += wrapSize
+        } else if algorithm == 35 {
+            // v8.0.0 Phase F: composite ML-KEM-768+X25519 (RFC 9980 §4.3.2).
+            // Algorithm-specific fields, in order:
+            //   ecdhCipherText (32) || mlkemCipherText (1088) || len(1) || C
+            // where C is the AES-256-wrapped session key. (symAlgId is only
+            // present for a v3 PKESK, never here.)
+            guard off + 32 + 1088 < body.count else {
+                throw PacketParserError.invalidPacket("PKESK v6 ML-KEM+X25519: ciphertext truncated")
+            }
+            ephemeralKey = Array(body[off..<(off + 32)]); off += 32           // V
+            mlkemCipherText = Array(body[off..<(off + 1088)]); off += 1088    // ML-KEM ct
+            let wrapSize = Int(body[off]); off += 1
+            guard off + wrapSize <= body.count else {
+                throw PacketParserError.invalidPacket("PKESK v6 ML-KEM+X25519: wrapped key truncated")
+            }
+            wrappedKey = Array(body[off..<(off + wrapSize)]); off += wrapSize // C
         } else {
             ephemeralKey = []
             wrappedKey = off < body.count ? Array(body[off...]) : []
@@ -1046,7 +1221,8 @@ class OpenPGPPacketParser {
             wrappedSessionKey: wrappedKey,
             keyFingerprint: fingerprint,
             keyVersion: keyVersion,
-            rsaCipher: []
+            rsaCipher: [],
+            mlkemCipherText: mlkemCipherText
         )
     }
 

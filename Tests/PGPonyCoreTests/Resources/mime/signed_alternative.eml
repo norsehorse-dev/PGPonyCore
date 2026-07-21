@@ -1,0 +1,25 @@
+Content-Type: multipart/signed; micalg="pgp-sha512";
+ protocol="application/pgp-signature"; boundary="SIGNone1"
+
+--SIGNone1
+Content-Type: multipart/alternative; boundary="ALTone1"
+
+--ALTone1
+Content-Type: text/plain; charset=UTF-8
+
+Signed hello.
+Line two.
+--ALTone1
+Content-Type: text/html; charset=UTF-8
+
+<html><body>Signed hello.</body></html>
+--ALTone1--
+--SIGNone1
+Content-Type: application/pgp-signature; name="signature.asc"
+
+-----BEGIN PGP SIGNATURE-----
+
+wnUEARYKAB0WIQTtESTtESTtESTtESTtESTtESTtESTtAAoJEAAAAAAAAAAAfakeSIG==
+=AbCd
+-----END PGP SIGNATURE-----
+--SIGNone1--
