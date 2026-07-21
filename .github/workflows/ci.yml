@@ -17,14 +17,16 @@ jobs:
           -scheme PGPonyCore
           -destination 'generic/platform=iOS'
 
-      # Tests run on a simulator. Adjust the device name to one the runner's Xcode has
-      # (list with: xcrun simctl list devicetypes). Kept separate from the build above
-      # so a simulator-naming mismatch can't mask a genuine build failure.
+      # Tests run on a simulator. Don't hardcode a device model — each Xcode ships a
+      # different set of iPhone simulators (Xcode 26 has iPhone 17, not iPhone 16), so
+      # pick the first available iPhone simulator at runtime. Kept separate from the
+      # build so a simulator mismatch can't mask a genuine build failure.
       - name: Test on iOS Simulator
-        run: >
-          xcodebuild test
-          -scheme PGPonyCore
-          -destination 'platform=iOS Simulator,name=iPhone 16,OS=latest'
+        run: |
+          set -euo pipefail
+          UDID=$(xcrun simctl list devices available -j | python3 -c "import json,sys; ds=json.load(sys.stdin)['devices']; c=[d['udid'] for r,l in ds.items() if 'iOS' in r for d in l if d.get('isAvailable') and d['name'].startswith('iPhone')]; print(c[0] if c else ''); sys.exit(0 if c else 1)")
+          echo "Selected iOS simulator: $UDID"
+          xcodebuild test -scheme PGPonyCore -destination "id=$UDID"
 
       - name: Verify no app/platform imports leaked into the core
         run: |
@@ -33,9 +35,10 @@ jobs:
           else
             echo "CLEAN: core sources are free of app/UI/3rd-party imports"
           fi
+
       - name: Verify no stray print() (debug must go through pgpDebugLog)
         run: |
-          if grep -rnP '(?<![A-Za-z0-9._])print\(' Sources/ | grep -v 'Swift.print(message())'; then
+          if grep -rnE '(^|[^A-Za-z0-9._])print\(' Sources/ | grep -v 'Swift.print(message())'; then
             echo "A bare print() is present — route debug through pgpDebugLog or remove it"; exit 1
           else
             echo "CLEAN: no bare print() in core sources"
