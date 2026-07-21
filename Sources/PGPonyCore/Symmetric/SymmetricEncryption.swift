@@ -329,19 +329,3 @@ enum SymmetricEncryption {
         }
     }
 }
-
-// MARK: - PGPService entry points (unchanged API for the UI)
-
-extension PGPService {
-    func encryptSymmetric(plaintext: Data, passphrase: String, filename: String? = nil) throws -> String {
-        try SymmetricEncryption.encryptArmored(
-            plaintext: Array(plaintext),
-            passphrase: passphrase,
-            filename: filename
-        )
-    }
-
-    func decryptSymmetric(armoredMessage: String, passphrase: String) throws -> Data {
-        Data(try SymmetricEncryption.decryptArmored(armored: armoredMessage, passphrase: passphrase))
-    }
-}
