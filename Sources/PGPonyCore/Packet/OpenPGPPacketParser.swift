@@ -2836,3 +2836,17 @@ class OpenPGPPacketParser {
         return r + s
     }
 }
+
+// MARK: - Test hooks (internal; reachable via @testable import)
+
+extension OpenPGPPacketParser {
+    /// Decrypt a raw tag-20 (LibrePGP OCB) packet *body* with a known session key.
+    /// Parses the AEAD framing, then runs the chunked OCB decryptor. Exposed at
+    /// internal access so PGPonyCoreTests can round-trip LibrePGPEncryptService
+    /// .buildTag20OCB output. Same-file extension, so the private helpers below
+    /// remain private to production callers.
+    static func decryptTag20AEAD(packetBody: [UInt8], sessionKey: [UInt8]) throws -> [UInt8] {
+        let seipd = try parseAEADEncryptedData(body: packetBody)
+        return try decryptAEADTag20(seipd: seipd, sessionKey: sessionKey)
+    }
+}
