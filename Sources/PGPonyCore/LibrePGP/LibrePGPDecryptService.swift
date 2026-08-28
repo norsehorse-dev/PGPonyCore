@@ -41,13 +41,27 @@ enum LibrePGPDecryptService {
         }
     }
 
-    /// Decryption material extracted from a v5 Kyber (algorithm 8) secret subkey.
+    /// Decryption material extracted from a v5 Kyber (algorithm 8) secret
+    /// subkey. v8.2.0 §1 (K2a): `suite` (from the key's curve OID) selects
+    /// ky768_cv25519 or ky1024_cv448; ECC fields are at the curve's length.
     struct DecryptionKey {
         let keyID: [UInt8]          // leading 8 octets of the v5 fingerprint
         let v5Fingerprint: [UInt8]  // 32 octets
-        let eccPublic: [UInt8]      // recipient X25519 public (R)
-        let eccSecret: [UInt8]      // raw 32-octet X25519 scalar
+        let eccPublic: [UInt8]      // recipient ECC public (R): 32 or 56
+        let eccSecret: [UInt8]      // raw ECC scalar: 32 or 56
         let mlkemSeed: [UInt8]      // 64-octet ML-KEM seed (d‖z)
+        let suite: LibrePGPSuite
+
+        init(keyID: [UInt8], v5Fingerprint: [UInt8], eccPublic: [UInt8],
+             eccSecret: [UInt8], mlkemSeed: [UInt8],
+             suite: LibrePGPSuite = .ky768_cv25519) {
+            self.keyID = keyID
+            self.v5Fingerprint = v5Fingerprint
+            self.eccPublic = eccPublic
+            self.eccSecret = eccSecret
+            self.mlkemSeed = mlkemSeed
+            self.suite = suite
+        }
     }
 
     // MARK: - Public API
@@ -105,14 +119,18 @@ enum LibrePGPDecryptService {
         guard matStart + keyMatLen <= body.count else { return nil }
 
         var p = matStart
-        let oidLen = Int(body[p]); p += 1 + oidLen      // skip curve OID
+        // v8.2.0 §1 (K2a): the curve OID is what tells a 768 key from a 1024
+        // key at algo 8; derive the suite from it instead of skipping it.
+        let oidLen = Int(body[p]); p += 1
+        guard p + oidLen <= matStart + keyMatLen else { return nil }
+        guard let suite = LibrePGPSuite.fromOidTail(Array(body[p..<(p + oidLen)])) else { return nil }
+        p += oidLen
         guard p + 2 <= matStart + keyMatLen else { return nil }
         let ptBits = Int(body[p]) << 8 | Int(body[p+1]); p += 2
         let ptBytes = (ptBits + 7) / 8
-        guard p + ptBytes <= matStart + keyMatLen else { return nil }
-        var eccPoint = Array(body[p..<(p + ptBytes)])
-        if eccPoint.first == 0x40 { eccPoint.removeFirst() }
-        guard eccPoint.count == 32 else { return nil }
+        guard p + ptBytes <= matStart + keyMatLen, ptBytes >= 1,
+              ptBytes <= suite.eccKeyBytes + 1 else { return nil }
+        let eccPoint = suite.normalizePoint(Array(body[p..<(p + ptBytes)]))
 
         o = matStart + keyMatLen
         let publicBody = Array(body[0..<o])
@@ -127,12 +145,13 @@ enum LibrePGPDecryptService {
         guard o < body.count else { return nil }
         let usage = body[o]; o += 1
 
+        let secretLen = suite.secretBytes               // 96 @768, 120 @1024
         let secret: [UInt8]
         if usage == 0 {
             guard o + 4 <= body.count else { return nil }
             let count = Int(body[o]) << 24 | Int(body[o+1]) << 16 | Int(body[o+2]) << 8 | Int(body[o+3])
             o += 4
-            guard count == 96, o + count <= body.count else { return nil }
+            guard count == secretLen, o + count <= body.count else { return nil }
             secret = Array(body[o..<(o + count)])
         } else if usage == 254 || usage == 255 {
             guard let pass = passphrase, !pass.isEmpty else { throw Failure.passphraseRequired }
@@ -164,17 +183,17 @@ enum LibrePGPDecryptService {
             let key = s2kDeriveKeySHA256(passphrase: pass, salt: salt, codedCount: codedCount, keySize: 16)
             let decrypted = aesCFBDecrypt(ciphertext: encrypted, key: key, iv: iv)
             if usage == 254 {
-                guard decrypted.count == 96 + 20 else { throw Failure.invalidPassphrase }
-                let material = Array(decrypted[0..<96])
+                guard decrypted.count == secretLen + 20 else { throw Failure.invalidPassphrase }
+                let material = Array(decrypted[0..<secretLen])
                 var sha1 = [UInt8](repeating: 0, count: Int(CC_SHA1_DIGEST_LENGTH))
                 CC_SHA1(material, CC_LONG(material.count), &sha1)
-                guard Array(decrypted[96..<116]) == sha1 else { throw Failure.invalidPassphrase }
+                guard Array(decrypted[secretLen..<(secretLen + 20)]) == sha1 else { throw Failure.invalidPassphrase }
                 secret = material
             } else {
-                guard decrypted.count == 96 + 2 else { throw Failure.invalidPassphrase }
-                let material = Array(decrypted[0..<96])
+                guard decrypted.count == secretLen + 2 else { throw Failure.invalidPassphrase }
+                let material = Array(decrypted[0..<secretLen])
                 let sum = material.reduce(UInt16(0)) { $0 &+ UInt16($1) }
-                let stored = UInt16(decrypted[96]) << 8 | UInt16(decrypted[97])
+                let stored = UInt16(decrypted[secretLen]) << 8 | UInt16(decrypted[secretLen + 1])
                 guard sum == stored else { throw Failure.invalidPassphrase }
                 secret = material
             }
@@ -186,8 +205,9 @@ enum LibrePGPDecryptService {
             keyID: Array(v5fp.prefix(8)),
             v5Fingerprint: v5fp,
             eccPublic: eccPoint,
-            eccSecret: Array(secret[0..<32]),
-            mlkemSeed: Array(secret[32..<96]))
+            eccSecret: Array(secret[0..<suite.eccKeyBytes]),
+            mlkemSeed: Array(secret[suite.eccKeyBytes..<secretLen]),
+            suite: suite)
     }
 
     // MARK: - PKESK parsing + KEM decapsulation
@@ -234,29 +254,46 @@ enum LibrePGPDecryptService {
     }
 
     private static func recoverSessionKey(pkesk: PKESK, key: DecryptionKey) throws -> [UInt8] {
-        // X25519: raw shared secret X = X25519(r, V).
-        let priv: Curve25519.KeyAgreement.PrivateKey
-        do { priv = try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: Data(key.eccSecret)) }
-        catch { throw Failure.malformed("invalid X25519 secret") }
-        let ephemeral: Curve25519.KeyAgreement.PublicKey
-        do { ephemeral = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: Data(pkesk.eccCipherText)) }
-        catch { throw Failure.malformed("invalid X25519 ephemeral public") }
-        let rawECDH = try priv.sharedSecretFromKeyAgreement(with: ephemeral).withUnsafeBytes { Array($0) }
+        let suite = key.suite
+        // gpg can emit the ephemeral as a minimal MPI; the KEM needs the full
+        // curve length on both sides of the wire.
+        let eccCT = suite.normalizePoint(pkesk.eccCipherText)
+
+        // ECC agreement on the suite's curve: X = ECDH(r, V).
+        let rawECDH: [UInt8]
+        switch suite {
+        case .ky768_cv25519:
+            let priv: Curve25519.KeyAgreement.PrivateKey
+            do { priv = try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: Data(key.eccSecret)) }
+            catch { throw Failure.malformed("invalid X25519 secret") }
+            let ephemeral: Curve25519.KeyAgreement.PublicKey
+            do { ephemeral = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: Data(eccCT)) }
+            catch { throw Failure.malformed("invalid X25519 ephemeral public") }
+            rawECDH = try priv.sharedSecretFromKeyAgreement(with: ephemeral).withUnsafeBytes { Array($0) }
+        case .ky1024_cv448:
+            do {
+                rawECDH = [UInt8](try X448.sharedSecret(privateKey: Data(key.eccSecret),
+                                                        publicKey: Data(eccCT)))
+            } catch { throw Failure.malformed("X448 agreement failed") }
+        }
 
         // ML-KEM decapsulation using the seed-derived secret key.
-        let (_, mlkemSecret) = try MLKEMService.generateKeyPair(seed: Data(key.mlkemSeed))
+        let (_, mlkemSecret) = try MLKEMService.generateKeyPair(seed: Data(key.mlkemSeed),
+                                                               level: suite.mlkemLevel)
         let mlkemSS = try MLKEMService.decapsulate(
-            ciphertext: Data(pkesk.mlkemCipherText), secretKey: mlkemSecret)
+            ciphertext: Data(pkesk.mlkemCipherText), secretKey: mlkemSecret,
+            level: suite.mlkemLevel)
 
         // Same combiner as the encrypt path.
         let kek = LibrePGPEncryptService.compositeKEK(
             rawECDH: rawECDH,
-            eccCipherText: pkesk.eccCipherText,
+            eccCipherText: eccCT,
             eccPublic: key.eccPublic,
             mlkemShared: [UInt8](mlkemSS),
             mlkemCipherText: pkesk.mlkemCipherText,
             sessionKeyAlgo: pkesk.sessionKeyAlgo,
-            v5Fingerprint: key.v5Fingerprint)
+            v5Fingerprint: key.v5Fingerprint,
+            suite: suite)
 
         return try AESKeyWrap.unwrap(ciphertext: pkesk.wrappedKey, kek: kek)
     }

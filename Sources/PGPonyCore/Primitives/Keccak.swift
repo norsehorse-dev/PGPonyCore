@@ -68,12 +68,19 @@ enum Keccak {
         }
     }
 
-    // MARK: - Sponge (rate 136 for the 256-bit-capacity functions)
+    // MARK: - Sponge
 
-    private static let rate = 136   // 1600/8 - 2*256/8 = 136 octets
+    /// Default rate for the 256-bit-capacity functions (SHA3-256, SHAKE256,
+    /// cSHAKE256/KMAC256): 1600/8 - 2*256/8 = 136 octets.
+    private static let rate = 136
 
-    /// Absorb `input`, apply `domain` suffix padding, and squeeze `outLen` bytes.
-    private static func sponge(_ input: [UInt8], domain: UInt8, outLen: Int) -> [UInt8] {
+    /// Absorb `input`, apply `domain` suffix padding, and squeeze `outLen`
+    /// bytes. v8.2.0 §1 (K2a): `rate` became a parameter (defaulting to the
+    /// historic 136) because gpg's ECC key-share KDF uses SHA3-512 for X448,
+    /// and SHA3-512's capacity is 1024 bits, so its rate is 72 octets, not
+    /// 136. Every pre-existing caller keeps the default and is byte-for-byte
+    /// unchanged.
+    private static func sponge(_ input: [UInt8], domain: UInt8, outLen: Int, rate: Int = rate) -> [UInt8] {
         var st = [UInt64](repeating: 0, count: 25)
         var pt = 0
         for b in input {
@@ -100,6 +107,9 @@ enum Keccak {
     // MARK: - Public digests
 
     static func sha3_256(_ input: [UInt8]) -> [UInt8] { sponge(input, domain: 0x06, outLen: 32) }
+    /// SHA3-512: rate 72 (capacity 1024 bits). Locked by the NIST vectors in
+    /// LibrePGP1024Tests; used only by gpg's X448 ECC key-share KDF.
+    static func sha3_512(_ input: [UInt8]) -> [UInt8] { sponge(input, domain: 0x06, outLen: 64, rate: 72) }
     static func shake256(_ input: [UInt8], outLen: Int) -> [UInt8] { sponge(input, domain: 0x1f, outLen: outLen) }
 
     // MARK: - NIST SP 800-185 encodings

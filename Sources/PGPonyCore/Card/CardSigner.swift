@@ -210,7 +210,17 @@ enum CardSigner {
             break
         }
         let bitLen = UInt16(bytes.count * 8 - leadingZeros)
-        return [UInt8((bitLen >> 8) & 0xFF), UInt8(bitLen & 0xFF)] + bytes
+        // RFC 4880 3.2: an MPI carries no leading zero octets, and its byte
+        // count must equal ceil(bitLen / 8). Emitting the full input (leading
+        // zeros included) while declaring the shorter bit length leaves the
+        // field self-inconsistent, so a strict reader misaligns the next MPI.
+        // On a card signature that is an EdDSA R or S (S, a reduced scalar,
+        // often has a high zero octet) or the RSA value, so a card-made
+        // signature would intermittently fail to verify. Mirrors the fix in
+        // SigningService / KeyExpirationEditor; covered by CardSignerSignatureTests.
+        var value = bytes
+        while value.first == 0 { value.removeFirst() }
+        return [UInt8((bitLen >> 8) & 0xFF), UInt8(bitLen & 0xFF)] + value
     }
 
     private static func buildNewFormatPacket(tag: UInt8, body: [UInt8]) -> [UInt8] {

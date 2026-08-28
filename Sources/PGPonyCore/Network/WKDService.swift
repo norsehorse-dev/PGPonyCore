@@ -59,7 +59,11 @@ enum KeyLookupSource: String {
 }
 
 struct WKDLookupResult {
-    let armoredKey: String
+    /// The key material exactly as the domain published it — binary (the WKD
+    /// norm) or, from a misconfigured host, armored text. The caller runs it
+    /// through the same robust import path a file uses; this service no longer
+    /// hand-rolls armor, which was the #41 / §5.6.8 import fault.
+    let data: Data
     let source: KeyLookupSource
 }
 
@@ -96,15 +100,13 @@ final class WKDService {
         // Advanced first
         let advancedURL = "https://openpgpkey.\(domain)/.well-known/openpgpkey/\(domain)/hu/\(hash)?l=\(encodedLocalpart)"
         if let data = await tryFetch(advancedURL), !data.isEmpty {
-            let armored = armorBinaryPublicKey(data)
-            return WKDLookupResult(armoredKey: armored, source: .wkdAdvanced)
+            return WKDLookupResult(data: data, source: .wkdAdvanced)
         }
 
         // Direct fallback
         let directURL = "https://\(domain)/.well-known/openpgpkey/hu/\(hash)?l=\(encodedLocalpart)"
         if let data = await tryFetch(directURL), !data.isEmpty {
-            let armored = armorBinaryPublicKey(data)
-            return WKDLookupResult(armoredKey: armored, source: .wkdDirect)
+            return WKDLookupResult(data: data, source: .wkdDirect)
         }
 
         throw WKDError.notFound
@@ -140,49 +142,6 @@ final class WKDService {
         } catch {
             return nil
         }
-    }
-
-    /// Armor binary OpenPGP public-key data so existing importArmoredKey() works.
-    private func armorBinaryPublicKey(_ data: Data) -> String {
-        // Construct standard ASCII armor by hand to avoid pulling ObjectivePGP into this service.
-        // RFC 4880 §6.2: -----BEGIN PGP PUBLIC KEY BLOCK-----, base64 in 64-char lines,
-        // a 24-bit CRC line prefixed with '=', then END marker.
-        let base64 = data.base64EncodedString()
-        var lines: [String] = []
-        lines.append("-----BEGIN PGP PUBLIC KEY BLOCK-----")
-        lines.append("")
-        // Wrap base64 at 64 chars per line
-        var i = base64.startIndex
-        while i < base64.endIndex {
-            let next = base64.index(i, offsetBy: 64, limitedBy: base64.endIndex) ?? base64.endIndex
-            lines.append(String(base64[i..<next]))
-            i = next
-        }
-        // CRC24 per RFC 4880 §6.1
-        let crc = crc24(Array(data))
-        let crcBytes: [UInt8] = [
-            UInt8((crc >> 16) & 0xFF),
-            UInt8((crc >>  8) & 0xFF),
-            UInt8( crc        & 0xFF)
-        ]
-        lines.append("=" + Data(crcBytes).base64EncodedString())
-        lines.append("-----END PGP PUBLIC KEY BLOCK-----")
-        return lines.joined(separator: "\n") + "\n"
-    }
-
-    /// CRC-24 from RFC 4880 §6.1. Initial value 0xB704CE, polynomial 0x1864CFB.
-    private func crc24(_ bytes: [UInt8]) -> UInt32 {
-        var crc: UInt32 = 0xB704CE
-        for byte in bytes {
-            crc ^= UInt32(byte) << 16
-            for _ in 0..<8 {
-                crc <<= 1
-                if (crc & 0x1000000) != 0 {
-                    crc ^= 0x1864CFB
-                }
-            }
-        }
-        return crc & 0xFFFFFF
     }
 
     // -------------------------------------------------------------------------

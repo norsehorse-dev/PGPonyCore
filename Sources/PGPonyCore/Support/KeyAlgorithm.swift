@@ -9,6 +9,11 @@
 // Foundation-only value type: no SwiftData, no UI. KeyServer.mayNotAccept(_:)
 // and callers reason over these cases.
 //
+// CORE SEAM: in the app this enum lives alongside the SwiftData models in
+// PGPKeyModel.swift; the core lifts it out on its own so nothing here depends
+// on SwiftData. Curve recognition comes from ECCurveOID.swift, lifted the same
+// way.
+//
 // String(localized:) is used for display names so a host app's string catalog
 // can localize them; in the standalone core (no catalog) it simply returns the
 // key, which is fine — these are protocol-level identifiers.
@@ -25,8 +30,21 @@ enum KeyAlgorithm: String, Codable, CaseIterable {
     case v6Ed448 = "Ed448 (v6)"
     case v6X448 = "X448 (v6)"
     case v6MLKEM768 = "ML-KEM-768+X25519 (v6)"
+    // v8.2.0 §1: the 1024 composite suite (RFC 9980 algorithm 36).
+    case v6MLKEM1024 = "ML-KEM-1024+X448 (v6)"
     case librePGPKyber = "ML-KEM-768+X25519 (LibrePGP)"
-
+    // v8.2.0 §1 (K2a): the LibrePGP 1024 form (gpg ky1024_cv448, still algo 8).
+    case librePGPKyber1024 = "ML-KEM-1024+X448 (LibrePGP)"
+    // v8.2.0 issue #2: recognition only. GnuPG/GPG4WIN keys on brainpool or
+    // NIST curves import with a real label instead of being mislabeled as RSA;
+    // PGPony does not sign/encrypt with them.
+    case otherEC = "EC key"
+    
+    // v5.0 Phase 5.1 — wrap each case in String(localized:) so Text(algorithm
+    // .displayName) localizes via Localizable.xcstrings. Crypto identifiers
+    // (RSA 2048, Ed25519+Cv25519, etc.) are kept verbatim in every language
+    // since they're protocol-level names, but going through the catalog keeps
+    // the lookup path uniform with the rest of the enums.
     var displayName: String {
         switch self {
         case .rsa2048:   return String(localized: "RSA 2048")
@@ -37,7 +55,10 @@ enum KeyAlgorithm: String, Codable, CaseIterable {
         case .v6Ed448:   return String(localized: "Ed448 (v6)")
         case .v6X448:    return String(localized: "X448 (v6)")
         case .v6MLKEM768:    return String(localized: "Ed25519 + ML-KEM-768 (v6, post-quantum)")
+        case .v6MLKEM1024:   return String(localized: "Ed25519 + ML-KEM-1024 (v6, post-quantum)")
         case .librePGPKyber: return String(localized: "Ed25519 + ML-KEM-768 (LibrePGP, post-quantum)")
+        case .librePGPKyber1024: return String(localized: "Ed25519 + ML-KEM-1024 (LibrePGP, post-quantum)")
+        case .otherEC: return String(localized: "EC key")
         }
     }
 
@@ -51,16 +72,22 @@ enum KeyAlgorithm: String, Codable, CaseIterable {
         case .v6Ed448: return "Ed448 v6"
         case .v6X448: return "X448 v6"
         case .v6MLKEM768: return "ML-KEM-768 v6"
+        case .v6MLKEM1024: return "ML-KEM-1024 v6"
         case .librePGPKyber: return "ML-KEM-768 LibrePGP"
+        case .librePGPKyber1024: return "ML-KEM-1024 LibrePGP"
+        case .otherEC: return "EC"
         }
     }
-
+    
     var keyBits: Int {
         switch self {
         case .rsa2048: return 2048
         case .rsa4096: return 4096
         case .ed25519, .v6Ed25519, .v6X25519, .v6MLKEM768, .librePGPKyber: return 256
-        case .v6Ed448, .v6X448: return 448
+        // The 1024 composites' classical half is X448, so they group with the
+        // 448-bit curves for display purposes.
+        case .v6Ed448, .v6X448, .v6MLKEM1024, .librePGPKyber1024: return 448
+        case .otherEC: return 0   // curve not tracked; recognition only
         }
     }
 
@@ -72,15 +99,37 @@ enum KeyAlgorithm: String, Codable, CaseIterable {
         }
     }
 
-    /// Whether this algorithm is post-quantum (composite ML-KEM-768 + X25519).
+    /// Whether this algorithm is post-quantum (a composite ML-KEM suite).
     var isPostQuantum: Bool {
         switch self {
-        case .v6MLKEM768, .librePGPKyber: return true
+        case .v6MLKEM768, .v6MLKEM1024, .librePGPKyber, .librePGPKyber1024: return true
         default: return false
         }
     }
 
-    /// Whether this algorithm uses native Curve25519 for encryption (ECDH subkey).
+    /// Whether this is a LibrePGP (GnuPG, algorithm 8) composite, either
+    /// level. The message-decrypt router keys its LibrePGP path off this.
+    ///
+    /// v8.2.0 §1: deliberately EXHAUSTIVE (no `default`). The router used to
+    /// enumerate the LibrePGP cases inline in a boolean filter, and when the
+    /// 1024 variant was added the filter silently dropped it (a key that
+    /// decrypted fine in isolation reported "no matching key" in the app,
+    /// caught only on device). Routing through this property, whose switch
+    /// forces every future KeyAlgorithm to declare itself LibrePGP-or-not,
+    /// keeps that class of bug from recurring. Locked by
+    /// KeyAlgorithmTests.testIsLibrePGPCoversBothSuitesOnly.
+    var isLibrePGP: Bool {
+        switch self {
+        case .librePGPKyber, .librePGPKyber1024:
+            return true
+        case .rsa2048, .rsa4096, .ed25519, .v6Ed25519, .v6X25519, .v6Ed448,
+             .v6X448, .v6MLKEM768, .v6MLKEM1024, .otherEC:
+            return false
+        }
+    }
+
+    /// Whether this algorithm uses native Curve25519 for encryption (ECDH subkey)
+    /// Used for routing encrypt/decrypt to the native Cv25519 path vs ObjectivePGP.
     var usesCv25519: Bool {
         switch self {
         case .ed25519, .v6Ed25519, .v6X25519: return true
@@ -96,32 +145,67 @@ enum KeyAlgorithm: String, Codable, CaseIterable {
     }
 
     /// Algorithms that can be selected in the key generation UI.
+    /// v5.0 Phase 2b: v6Ed25519 generation deferred to v6.0 release.
+    /// V6KeyGenerator.swift remains in the codebase as groundwork for v6.0,
+    /// where v6 gen will be paired with hardware-key support and properly
+    /// validated against RFC 9580 Appendix A test vectors.
+    /// All v6 variants (v6Ed25519, v6X25519, v6Ed448, v6X448) remain import-only.
+    /// v6 Ed25519 generation is enabled (RFC 9580; produces a cert-only primary
+    /// with Ed25519 signing + X25519 encryption subkeys, validated against sq).
+    /// The other v6 variants (v6X25519-primary, v6Ed448, v6X448) remain
+    /// import-only.
     static var generatable: [KeyAlgorithm] {
-        [.rsa2048, .rsa4096, .ed25519, .v6Ed25519, .v6MLKEM768, .librePGPKyber]
+        // v8.2.0 §1: v6MLKEM1024 and librePGPKyber1024 joined with their
+        // keygen grafts (same release). The remaining v6 variants stay
+        // import-only.
+        [.rsa2048, .rsa4096, .ed25519, .v6Ed25519, .v6MLKEM768, .v6MLKEM1024,
+         .librePGPKyber, .librePGPKyber1024]
     }
 
     /// Map an OpenPGP algorithm ID + key version to a KeyAlgorithm.
     /// Handles both v4 (RFC 4880) and v6 (RFC 9580) algorithm IDs.
+    ///
+    /// - Parameters:
+    ///   - algorithmID: OpenPGP algorithm byte from the key packet
+    ///   - keyVersion: Key packet version (4 or 6)
+    /// - Returns: Matching KeyAlgorithm, or nil for unknown combinations
     static func from(algorithmID: UInt8, keyVersion: UInt8 = 4) -> KeyAlgorithm? {
         if keyVersion == 6 {
             switch algorithmID {
             case 27:        return .v6Ed25519   // Ed25519 signing key
             case 25:        return .v6X25519    // X25519 encryption subkey
             case 35:        return .v6MLKEM768  // ML-KEM-768 + X25519 composite (RFC 9980)
+            case 36:        return .v6MLKEM1024 // ML-KEM-1024 + X448 composite (RFC 9980)
             case 28:        return .v6Ed448     // Ed448 signing key
             case 26:        return .v6X448      // X448 encryption subkey
-            case 1, 2, 3:   return .rsa4096     // RSA (bit size not derivable from algo ID)
-            case 22:        return .ed25519     // Legacy EdDSA OID
-            case 18:        return .ed25519     // Legacy ECDH
+            // v6 can also carry legacy algorithm IDs (RSA, ECDH, etc.)
+            case 1, 2, 3:   return .rsa4096     // RSA (we can't tell bit size from algo ID alone)
+            case 22:        return .ed25519     // Legacy EdDSA OID — unlikely in v6 but valid
+            case 18:        return .ed25519     // Legacy ECDH — unlikely in v6 but valid
             default:        return nil
             }
         } else {
+            // V4 (RFC 4880)
             switch algorithmID {
-            case 1, 2, 3:   return .rsa4096     // RSA — bit size not derivable from algo ID
+            case 1, 2, 3:   return .rsa4096     // RSA — can't tell bit size from algo ID alone
             case 22:        return .ed25519     // EdDSA (legacy OID-based Ed25519)
             case 18:        return .ed25519     // ECDH (Cv25519 subkey)
             default:        return nil
             }
         }
+    }
+
+    /// Recognize a key's algorithm from its full v4/v6 key-packet body. brainpool
+    /// and NIST EC keys (which PGPony does not itself use) map to `.otherEC` so
+    /// they import with a real label instead of falling back to RSA (algo 19 ->
+    /// nil) or being mislabeled as Cv25519 (algo 18). Everything else delegates
+    /// to `from(algorithmID:keyVersion:)`.
+    static func from(keyPacketBody body: [UInt8]) -> KeyAlgorithm? {
+        guard body.count > 6 else { return nil }
+        let version = body[0]
+        if version == 4, let curve = ECCurve.fromKeyPacketBody(body), curve.isRecognitionOnly {
+            return .otherEC
+        }
+        return from(algorithmID: body[5], keyVersion: version)
     }
 }

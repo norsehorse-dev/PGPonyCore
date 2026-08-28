@@ -20,7 +20,7 @@
 //
 // New code here is confined to the v4 SKESK build/parse. The S2K derivation,
 // the SEIPD bodies, packet parsing, and armoring are all reused from existing,
-// GnuPG-verified code (PGPService.s2kDeriveKey, OpenPGPPacketBuilder, and
+// GnuPG-verified code (S2K.deriveKey, OpenPGPPacketBuilder, and
 // OpenPGPPacketParser).
 
 import Foundation

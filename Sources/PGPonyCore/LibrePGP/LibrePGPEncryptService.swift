@@ -54,11 +54,24 @@ enum LibrePGPEncryptService {
 
     // MARK: - Recipient (parsed v5 Kyber subkey)
 
+    /// v8.2.0 §1 (K2a): `suite` selects ky768_cv25519 or ky1024_cv448; the
+    /// field names keep their 768-era wording but hold X448/ML-KEM-1024
+    /// material at the 1024 level's sizes.
     struct Recipient {
         let keyID: [UInt8]          // 8 bytes — leading octets of the v5 fingerprint
         let v5Fingerprint: [UInt8]  // 32 bytes
-        let eccPublic: [UInt8]      // 32-byte X25519 public (0x40 prefix stripped)
-        let mlkemPublic: [UInt8]    // 1184-byte ML-KEM-768 public
+        let eccPublic: [UInt8]      // ECC public, normalized: 32 (X25519) or 56 (X448)
+        let mlkemPublic: [UInt8]    // ML-KEM public: 1184 (768) or 1568 (1024)
+        let suite: LibrePGPSuite
+
+        init(keyID: [UInt8], v5Fingerprint: [UInt8], eccPublic: [UInt8],
+             mlkemPublic: [UInt8], suite: LibrePGPSuite = .ky768_cv25519) {
+            self.keyID = keyID
+            self.v5Fingerprint = v5Fingerprint
+            self.eccPublic = eccPublic
+            self.mlkemPublic = mlkemPublic
+            self.suite = suite
+        }
     }
 
     // MARK: - Public API
@@ -99,19 +112,34 @@ enum LibrePGPEncryptService {
         let sessionKey = try randomBytes(32)
 
         // 2. Composite KEM to the recipient's subkey → KEK (32 octets).
-        //    ML-KEM encaps + fresh X25519 ephemeral; combine via GnuPG's KMAC256.
-        let (mlkemCT, mlkemSS) = try MLKEMService.encapsulate(publicKey: Data(recipient.mlkemPublic))
+        //    ML-KEM encaps + fresh ECC ephemeral on the suite's curve;
+        //    combine via GnuPG's KMAC256.
+        let suite = recipient.suite
+        let (mlkemCT, mlkemSS) = try MLKEMService.encapsulate(publicKey: Data(recipient.mlkemPublic),
+                                                              level: suite.mlkemLevel)
 
-        let recipientPub: Curve25519.KeyAgreement.PublicKey
-        do { recipientPub = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: Data(recipient.eccPublic)) }
-        catch { throw Failure.malformedKey("recipient X25519 public key invalid") }
-        let ephemeral = Curve25519.KeyAgreement.PrivateKey()
-        let eccCT = [UInt8](ephemeral.publicKey.rawRepresentation)          // V — 32-byte ephemeral public
+        let eccCT: [UInt8]      // V: ephemeral public at the curve's length
         let rawECDH: [UInt8]
-        do {
-            let ss = try ephemeral.sharedSecretFromKeyAgreement(with: recipientPub)
-            rawECDH = ss.withUnsafeBytes { Array($0) }                      // raw X25519 output
-        } catch { throw Failure.internalError("X25519 key agreement failed") }
+        switch suite {
+        case .ky768_cv25519:
+            let recipientPub: Curve25519.KeyAgreement.PublicKey
+            do { recipientPub = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: Data(recipient.eccPublic)) }
+            catch { throw Failure.malformedKey("recipient X25519 public key invalid") }
+            let ephemeral = Curve25519.KeyAgreement.PrivateKey()
+            eccCT = [UInt8](ephemeral.publicKey.rawRepresentation)
+            do {
+                let ss = try ephemeral.sharedSecretFromKeyAgreement(with: recipientPub)
+                rawECDH = ss.withUnsafeBytes { Array($0) }                  // raw X25519 output
+            } catch { throw Failure.internalError("X25519 key agreement failed") }
+        case .ky1024_cv448:
+            // Hand-rolled X448 (X448.swift), same curve the IETF 1024 suite uses.
+            do {
+                let ephemeralSecret = try X448.generatePrivateKey()
+                eccCT = [UInt8](try X448.publicKey(for: ephemeralSecret))
+                rawECDH = [UInt8](try X448.sharedSecret(privateKey: ephemeralSecret,
+                                                        publicKey: Data(recipient.eccPublic)))
+            } catch { throw Failure.internalError("X448 key agreement failed") }
+        }
         let kek = compositeKEK(
             rawECDH: rawECDH,
             eccCipherText: eccCT,
@@ -119,7 +147,8 @@ enum LibrePGPEncryptService {
             mlkemShared: [UInt8](mlkemSS),
             mlkemCipherText: [UInt8](mlkemCT),
             sessionKeyAlgo: sessionKeyAlgoAES256,
-            v5Fingerprint: recipient.v5Fingerprint)
+            v5Fingerprint: recipient.v5Fingerprint,
+            suite: suite)
 
         // 3. AES-256 key-wrap (RFC 3394) the session key with the KEK.
         let wrapped = try AESKeyWrap.wrap(plaintext: sessionKey, kek: kek)   // 40 octets
@@ -139,9 +168,10 @@ enum LibrePGPEncryptService {
 
     /// Derive the 32-octet composite KEK the way GnuPG's encrypt path does.
     ///
-    /// The ECC contribution is NOT the raw X25519 output: GnuPG's
+    /// The ECC contribution is NOT the raw ECDH output: GnuPG's
     /// `gnupg_ecc_kem_simple_kdf` binds it to both public keys as
-    ///   ecc_ss = SHA3-256( rawECDH ‖ ecc_ct ‖ ecc_pk )
+    ///   ecc_ss = SHA3( rawECDH ‖ ecc_ct ‖ ecc_pk )
+    /// (SHA3-256 for X25519, SHA3-512 for X448; see LibrePGPSuite.eccKemKdf)
     /// before the KMAC256 combiner mixes it with the ML-KEM shared secret and the
     /// fixedInfo (sessionKeyAlgo ‖ v5 fingerprint). Factored out so it can be
     /// pinned by a known-answer test independent of the random ephemeral.
@@ -151,8 +181,11 @@ enum LibrePGPEncryptService {
                              mlkemShared: [UInt8],
                              mlkemCipherText: [UInt8],
                              sessionKeyAlgo: UInt8,
-                             v5Fingerprint: [UInt8]) -> [UInt8] {
-        let eccSS = Keccak.sha3_256(rawECDH + eccCipherText + eccPublic)
+                             v5Fingerprint: [UInt8],
+                             suite: LibrePGPSuite = .ky768_cv25519) -> [UInt8] {
+        let eccSS = suite.eccKemKdf(rawECDH: rawECDH,
+                                    eccCipherText: eccCipherText,
+                                    eccPublic: eccPublic)
         return LibrePGPCombiner.deriveKEK(
             eccShared: eccSS,
             eccCipherText: eccCipherText,
@@ -181,29 +214,32 @@ enum LibrePGPEncryptService {
         var p = o
         let matEnd = o + keyMatLen
 
-        // Curve OID (expect X25519: 1.3.101.110 = 2b 65 6e).
+        // Curve OID: X25519 (1.3.101.110 = 2b 65 6e) or X448 (1.3.101.111 =
+        // 2b 65 6f). v8.2.0 §1 (K2a): the OID is the ONLY thing that tells a
+        // 768 key from a 1024 key at algo 8, so the suite is derived here.
         guard p < matEnd else { throw Failure.malformedKey("missing OID") }
         let oidLen = Int(body[p]); p += 1
         guard p + oidLen <= matEnd else { throw Failure.malformedKey("OID overruns") }
+        guard let suite = LibrePGPSuite.fromOidTail(Array(body[p..<(p + oidLen)])) else {
+            throw Failure.malformedKey("unsupported composite curve OID")
+        }
         p += oidLen
 
-        // ECC point as a bit-length SOS; strip the 0x40 native-point prefix.
+        // ECC point as a bit-length SOS/MPI; normalize to the curve length
+        // (drops a 0x40 native-point prefix, left-pads a minimal MPI).
         guard p + 2 <= matEnd else { throw Failure.malformedKey("missing ECC point length") }
         let ptBits = Int(body[p]) << 8 | Int(body[p+1]); p += 2
         let ptBytes = (ptBits + 7) / 8
-        guard p + ptBytes <= matEnd, ptBytes >= 1 else { throw Failure.malformedKey("ECC point overruns") }
-        var eccPoint = Array(body[p..<(p + ptBytes)]); p += ptBytes
-        if eccPoint.first == 0x40 { eccPoint.removeFirst() }
-        guard eccPoint.count == x25519PublicBytes else {
-            throw Failure.malformedKey("X25519 public key must be 32 octets, got \(eccPoint.count)")
-        }
+        guard p + ptBytes <= matEnd, ptBytes >= 1,
+              ptBytes <= suite.eccKeyBytes + 1 else { throw Failure.malformedKey("ECC point overruns") }
+        let eccPoint = suite.normalizePoint(Array(body[p..<(p + ptBytes)])); p += ptBytes
 
-        // ML-KEM public key: 4-octet length prefix then 1184 octets.
+        // ML-KEM public key: 4-octet length prefix then the level's size.
         guard p + 4 <= matEnd else { throw Failure.malformedKey("missing ML-KEM length") }
         let mlkemLen = Int(body[p]) << 24 | Int(body[p+1]) << 16 | Int(body[p+2]) << 8 | Int(body[p+3])
         p += 4
-        guard mlkemLen == mlkemPublicBytes, p + mlkemLen <= matEnd else {
-            throw Failure.malformedKey("ML-KEM public key must be 1184 octets, got \(mlkemLen)")
+        guard mlkemLen == suite.mlkemPublicBytes, p + mlkemLen <= matEnd else {
+            throw Failure.malformedKey("ML-KEM public key must be \(suite.mlkemPublicBytes) octets, got \(mlkemLen)")
         }
         let mlkemPub = Array(body[p..<(p + mlkemLen)])
 
@@ -211,7 +247,8 @@ enum LibrePGPEncryptService {
         return Recipient(keyID: Array(fpr.prefix(8)),
                          v5Fingerprint: fpr,
                          eccPublic: eccPoint,
-                         mlkemPublic: mlkemPub)
+                         mlkemPublic: mlkemPub,
+                         suite: suite)
     }
 
     /// LibrePGP v5 fingerprint: SHA-256( 0x9A ‖ 4-octet big-endian body length ‖ body ).

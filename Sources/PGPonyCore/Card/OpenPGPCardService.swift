@@ -4,33 +4,40 @@
 // OpenPGPCardService.swift
 // PGPony
 //
-// v6.0 — Phase 8a: NFC transport + session for OpenPGP smart cards (hardware keys).
+// The OpenPGP smart card protocol layer — transport-agnostic as of v8.1.0 §1.
 //
-// This is the foundation the card features stand on. It owns the CoreNFC session,
-// speaks ISO 7816 APDUs to the card, selects the OpenPGP applet, reads the card's
-// application data (AID, serial, the three key fingerprints, PIN retry counter),
-// and verifies a PIN. The cryptographic operations themselves — PSO:CDS (sign) and
-// PSO:DECIPHER (cv25519 ECDH) — are Phase 8b and layer on top of `transmit`.
+// This owns everything that is true of an OpenPGP card no matter how the bytes
+// get there: selecting the applet, reading application data, VERIFY and the KDF
+// derivation it may require, PSO:CDS and PSO:DECIPHER, on-card key generation,
+// PIN change and unblock, and the ISO 7816-4 command/response chaining that
+// sits under all of it. It owns NOTHING about sessions — see CardTransport,
+// NFCCardTransport and USBSmartCardTransport for that.
 //
-// SESSION SHAPE: "open once, verify once, run N operations, close." The connected
-// tag is held for the lifetime of the session so multiple operations (e.g. a
-// self-cert plus each subkey binding during a card expiration edit) run under a
-// single tap and a single PIN verify. Do not collapse this into one-shot calls.
+// Through 8.0.x this file also WAS the NFC session. That was extracted in 8.1.0
+// because iPad has no NFC radio, so a universal build needs the USB-C smart
+// card path or hardware keys arrive dead. The extraction was deliberately
+// byte-neutral: same APDUs, same status-word handling, same order. `APDU`
+// mirrors `NFCISO7816APDU`'s member names precisely so that claim stays
+// checkable against the 8.0.x diff by eye.
 //
-// HARDWARE: iPhone only, physical device only (the simulator has no NFC). Verified
-// target is the Token2 R3.3 (Ed25519 sign, cv25519 decrypt). RSA signing keys are
-// supported as of HW-R2 (PSO:CDS over a PKCS#1 v1.5 DigestInfo via `signRSA`); RSA
-// decryption (PSO:DECIPHER) is not wired yet — that is HW-R3, which reuses the
-// outbound command chaining added in HW-R1 (`transmitChained`). Cross-hardware
-// (YubiKey 5.2+, Nitrokey) testing follows hardware arrival.
+// SESSION SHAPE: "open once, verify once, run N operations, close." The
+// connection is held for the lifetime of the session so multiple operations
+// (e.g. a self-cert plus each subkey binding during a card expiration edit) run
+// under a single tap and a single PIN verify. Do not collapse this into
+// one-shot calls. On a persistent USB session this matters even more — see
+// CardTransportKind.isPersistent and §3c.
 //
-// PROJECT SETUP REQUIRED (see the deploy notes): the "Near Field Communication Tag
-// Reading" capability, plus `NFCReaderUsageDescription` and the iso7816
-// select-identifiers list (OpenPGP AID D2760001240103) in Info.plist. Without these
-// the session fails immediately at `begin()`.
+// HARDWARE: verified against the Token2 R3.3 (Ed25519 sign, cv25519 decrypt)
+// and YubiKey 5 NFC. RSA signing is supported as of HW-R2 (PSO:CDS over a
+// PKCS#1 v1.5 DigestInfo via `signRSA`); RSA decryption reuses the outbound
+// command chaining from HW-R1 (`transmitChained`).
+//
+// PROJECT SETUP: NFC needs the "Near Field Communication Tag Reading"
+// capability, `NFCReaderUsageDescription`, and the iso7816 select-identifiers
+// list (OpenPGP AID D2760001240103) in Info.plist. USB-C smart card needs the
+// `com.apple.security.smartcard` entitlement and iOS/iPadOS 16+.
 
 import Foundation
-import CoreNFC
 
 // MARK: - Public surface
 
@@ -79,6 +86,14 @@ struct OpenPGPCardInfo {
     /// Digital-signature counter (number of signatures the card has made).
     let signatureCounter: Int?
 
+    // v8.1.0 — §4b. Whether the card carries an enabled KDF-DO (00F9), meaning it
+    // expects derived PINs rather than the PIN itself. Surfaced in the card-status
+    // UI because a KDF card that PGPony mishandles presents as "wrong PIN", which
+    // sends the user looking in exactly the wrong place.
+    let kdfEnabled: Bool
+    /// Human-readable KDF parameters ("SHA-256, 100000 iterations") or "Off".
+    let kdfDescription: String?
+
     /// The on-card signing algorithm mapped to the packet shape CardSigner can
     /// build, or nil if absent/unsupported.
     var signatureAlgorithm: CardSignatureAlgorithm? {
@@ -97,6 +112,15 @@ enum OpenPGPCardPIN {
         case .signing:         return 0x81
         case .confidentiality: return 0x82
         case .admin:           return 0x83
+        }
+    }
+
+    /// Which KDF salt applies. Both PW1 modes share the PW1 salt — 0x81 vs 0x82
+    /// selects what the verification *authorises*, not which secret it is.
+    var kdfReference: CardKDF.PINReference {
+        switch self {
+        case .signing, .confidentiality: return .pw1
+        case .admin:                     return .pw3
         }
     }
 }
@@ -131,24 +155,68 @@ enum CardSignatureAlgorithm: Equatable {
 
 enum OpenPGPCardError: LocalizedError {
     case nfcUnavailable
+    /// v8.1.0 §1 — USB-C smart card isn't usable on this build or OS version.
+    case usbSmartCardUnavailable
+    /// v8.1.0 §1 — USB is usable but nothing is plugged in, and we waited.
+    /// Distinct from `usbSmartCardUnavailable`: the fix is to insert a key, not
+    /// to use a different device.
+    case usbKeyNotAttached
+    /// v8.1.0 §1 — an NFC session ended without ever seeing a card. This is the
+    /// case behind the original 8.0.1 report: the reporter held a USB-C-only 5C
+    /// Nano against the phone, which can never respond over NFC, and got a
+    /// silent timeout that said nothing about why. Distinct from
+    /// `connectionLost`, which means a card WAS there and went away mid-op.
+    case noCardDetected
+    /// v8.1.0 §1 — neither transport is available. On iPad this is the "no key
+    /// plugged in and there is no NFC radio to fall back to" case, which is a
+    /// real and permanent state rather than a transient failure.
+    case noTransportAvailable
     case notISO7816
     case appletNotFound
     case unexpectedStatus(UInt8, UInt8)
     case pinBlocked
     case wrongPIN(retriesRemaining: Int?)
+    /// #24 — the caller asked for the remembered PIN and this card has none.
+    /// Thrown before anything touches the card; the UI reacts by prompting.
+    case storedPINUnavailable
     case malformedResponse
     case sessionClosed
     case underlying(Error)
     /// B1e — the NFC link dropped mid-operation (tag moved, or session timed out).
     case connectionLost
+    /// The link dropped BETWEEN sending a PIN and reading the card's answer.
+    /// Found by a tester: his wrong PIN was counted by the card, but the NFC
+    /// session died before the 63Cx status word came back, so the app reported
+    /// a generic connection drop and the remaining-attempts feature never
+    /// fired. We cannot recover a status word that never arrived — what we can
+    /// do is stop pretending the attempt didn't happen.
+    case pinCheckInterrupted(lastKnownRetries: Int?)
     /// B1e — a PIN change returned success but the new PIN failed to verify, so it
     /// likely didn't commit to the card.
     case changeNotCommitted
+    /// v8.1.0 §4b — the PIN is longer than the card's declared maximum for that
+    /// reference. Refused locally: sending it would spend a retry for nothing.
+    case pinTooLong(maximum: Int)
+    /// v8.1.0 §4b — the card advertises a KDF-DO we can't parse or can't derive
+    /// (unknown algorithm/hash, or a missing salt). Refusing is deliberate: the
+    /// raw fallback would be rejected by the card and burn an attempt every time.
+    case kdfUnsupported
 
     var errorDescription: String? {
         switch self {
         case .nfcUnavailable:
             return "This device can't read NFC hardware keys, or NFC is unavailable right now."
+        case .usbSmartCardUnavailable:
+            return String(localized: "This device can't use a USB-C hardware key. That needs iOS or iPadOS 16 or later.")
+        case .usbKeyNotAttached:
+            return String(localized: "No USB-C hardware key detected. Plug your key in and try again.")
+        case .noCardDetected:
+            if CardTransportAvailability.isUSBSmartCardAvailable {
+                return String(localized: "No card detected. If your key is USB-C only — like a YubiKey 5C — it can't be tapped. Plug it into the USB-C port instead.")
+            }
+            return String(localized: "No card detected. Check that your key supports NFC and hold it flat against the top of your iPhone. USB-C-only keys such as the YubiKey 5C can't be tapped.")
+        case .noTransportAvailable:
+            return String(localized: "No way to reach a hardware key. Plug a USB-C key into this device, or use a device that supports NFC.")
         case .notISO7816:
             return "That tag isn't an OpenPGP smart card."
         case .appletNotFound:
@@ -156,18 +224,42 @@ enum OpenPGPCardError: LocalizedError {
         case .unexpectedStatus(let sw1, let sw2):
             return String(format: "The card returned an unexpected status (0x%02X%02X).", sw1, sw2)
         case .pinBlocked:
-            return "This PIN is blocked. Unblock it with your admin PIN (PW3) before continuing."
+            return String(localized: "This PIN is blocked — the card refused it too many times. Unblock it with your admin PIN (PW3) or your reset code. Your keys are not lost.")
         case .wrongPIN(let n):
-            if let n { return String(localized: "Incorrect PIN. \(n) attempts remaining.") }
-            return String(localized: "Incorrect PIN.")
+            // #25 — the count is the difference between an annoyance and a
+            // blocked card, so it escalates instead of staying flat.
+            switch n {
+            case .some(1):
+                return String(localized: "Incorrect PIN. Only 1 attempt remains — if it fails, this key's PIN will be blocked. Double-check before trying again.")
+            case .some(let n):
+                return String(localized: "Incorrect PIN. \(n) attempts remaining before this key's PIN is blocked.")
+            case .none:
+                return String(localized: "Incorrect PIN.")
+            }
+        case .pinCheckInterrupted(let lastKnown):
+            if let lastKnown {
+                return String(localized: "The connection dropped while your PIN was being checked, so the result is unknown — if the PIN was wrong, the attempt was still counted. Before this try, \(lastKnown) attempts remained. Reconnect and the current count will be shown.")
+            }
+            return String(localized: "The connection dropped while your PIN was being checked, so the result is unknown — if the PIN was wrong, the attempt was still counted. Reconnect and the current count will be shown.")
+        case .storedPINUnavailable:
+            return String(localized: "No PIN is remembered for this key. Enter its PIN once and it can be remembered.")
         case .malformedResponse:
             return "The card's response could not be understood."
         case .sessionClosed:
             return "The card session is no longer active. Tap your key again."
         case .connectionLost:
-            return "The card connection dropped before the operation finished. Hold your key steady against the top of your iPhone and tap to try again."
+            // v8.1.0: was NFC wording unconditionally. A tester on USB-C was
+            // told to hold his key against the phone and tap.
+            return CardConnectionCopy.prompt(
+                nfc: String(localized: "The card connection dropped before the operation finished. Hold your key steady against the top of your iPhone and tap to try again."),
+                usb: String(localized: "The card connection dropped before the operation finished. Check the key is firmly in the USB-C port and try again.")
+            )
         case .changeNotCommitted:
             return "The card reported the PIN change but the new PIN didn't verify — it may not have saved. Hold the key steady and try again."
+        case .pinTooLong(let maximum):
+            return String(localized: "That PIN is longer than this card accepts (maximum \(maximum) characters). It wasn't sent, so no attempt was used.")
+        case .kdfUnsupported:
+            return String(localized: "This card uses a PIN-protection setting (KDF) that PGPony can't read. PGPony didn't send your PIN, so no attempt was used. The card still works with GnuPG or Kleopatra.")
         case .underlying(let e):
             return e.localizedDescription
         }
@@ -176,64 +268,214 @@ enum OpenPGPCardError: LocalizedError {
 
 // MARK: - Service
 
-final class OpenPGPCardService: NSObject {
+final class OpenPGPCardService {
 
     /// OpenPGP applet AID prefix (RID D27600 + application 0124 + 01). The card's
     /// full AID adds version + manufacturer + serial; SELECT by this prefix.
     static let openPGPAID: [UInt8] = [0xD2, 0x76, 0x00, 0x01, 0x24, 0x01]
 
-    private var session: NFCTagReaderSession?
-    private var tag: NFCISO7816Tag?
-    private var connectContinuation: CheckedContinuation<NFCISO7816Tag, Error>?
+    // v8.1.0 — §1. How this session reaches the card. Resolved at connect()
+    // rather than at init so the 15 existing `OpenPGPCardService()` call sites
+    // keep working unchanged and pick up transport selection for free.
+    private var transport: CardTransport?
+    private let explicitTransport: CardTransport?
+    private let preferredKind: CardTransportKind?
 
-    var isAvailable: Bool { NFCTagReaderSession.readingAvailable }
+    /// The connected card's serial from its AID, read during connect. This is
+    /// what the PIN cache is keyed by (#24); nil means the card would not
+    /// identify itself, in which case no cached PIN is ever used for it.
+    private(set) var connectedSerialHex: String?
+
+    /// Which transport this session actually ended up on — for UI that wants to
+    /// say "connected over USB-C" rather than guessing.
+    var activeTransportKind: CardTransportKind? { transport?.kind }
+
+    /// Build a session. Pass nothing for automatic selection (a plugged-in USB-C
+    /// key wins over prompting for a tap); pass `preferring:` to force a
+    /// transport when the user has overridden it in the UI; pass `transport:`
+    /// directly in tests.
+    init(transport: CardTransport? = nil, preferring kind: CardTransportKind? = nil) {
+        self.explicitTransport = transport
+        self.preferredKind = kind
+    }
+
+    // v8.1.0 — §4b. Read once at connect and held for the session.
+    //
+    // `kdf` nil means the card has no KDF-DO and PINs go over the wire as UTF-8,
+    // which is the path every currently-working card takes. Non-nil-but-disabled
+    // (algorithm byte 0x00) means the same thing, explicitly. Only an *enabled*
+    // KDF-DO changes what gets sent.
+    private(set) var kdf: CardKDF?
+    /// True when DO 00F9 was present but could not be parsed into something we
+    /// can derive with. Distinct from `kdf == nil` (genuinely absent) because
+    /// the raw fallback is safe in the second case and harmful in the first.
+    private(set) var kdfUnreadable = false
+    /// PW status maxima (PW1, reset code, PW3), read at connect so a too-long
+    /// PIN can be refused locally instead of costing the user a retry.
+    private var pinMaxLengths: (pw1: Int, resetCode: Int, pw3: Int)?
+
+    /// PW1 retry counter as read from DO 00C4 at connect — BEFORE any verify in
+    /// this session. Used to make an interrupted PIN check honest about what was
+    /// at stake, and refreshed after failures for cards that answer 0x6982
+    /// without a count.
+    private(set) var pw1RetriesAtConnect: Int?
+
+    /// Whether ANY transport can reach a hardware key on this device. Callers
+    /// that need to distinguish should ask CardTransportAvailability directly —
+    /// iPad in particular must show no NFC affordance at all rather than a
+    /// disabled one.
+    var isAvailable: Bool { CardTransportAvailability.isAnyAvailable }
 
     // MARK: Lifecycle
 
-    /// Open an NFC session, wait for the user to present a card, connect, and SELECT
-    /// the OpenPGP applet. The returned service keeps the tag live until `end(...)`.
-    func connect(alertMessage: String = "Hold your hardware key near the top of your iPhone.") async throws -> OpenPGPCardService {
-        guard NFCTagReaderSession.readingAvailable else { throw OpenPGPCardError.nfcUnavailable }
-
-        let connectedTag: NFCISO7816Tag = try await withCheckedThrowingContinuation { cont in
-            self.connectContinuation = cont
-            guard let s = NFCTagReaderSession(pollingOption: .iso14443, delegate: self, queue: nil) else {
-                self.connectContinuation = nil
-                cont.resume(throwing: OpenPGPCardError.nfcUnavailable)
-                return
-            }
-            s.alertMessage = alertMessage
-            self.session = s
-            s.begin()
+    /// Open a session on the selected transport, connect to a card, and SELECT
+    /// the OpenPGP applet. The connection is held until `end(...)`.
+    ///
+    /// `alertMessage` drives the CoreNFC sheet and is ignored on a wired
+    /// session, which has no system UI. Whether this blocks on a human depends
+    /// on the transport: NFC waits for a tap, USB may return immediately if a
+    /// key is already plugged in.
+    func connect(alertMessage: String = CardConnectionCopy.connectPrompt) async throws -> OpenPGPCardService {
+        let resolved: CardTransport
+        if let explicitTransport {
+            resolved = explicitTransport
+        } else if let made = CardTransportAvailability.makeTransport(preferredKind) {
+            resolved = made
+        } else {
+            // Pick the message that names something the user can actually do.
+            // On a device or build with no USB support at all, "plug in a USB-C
+            // key" is advice about a transport that doesn't exist here.
+            throw USBSmartCardTransport.isAvailable
+                ? OpenPGPCardError.noTransportAvailable
+                : OpenPGPCardError.nfcUnavailable
         }
+        self.transport = resolved
 
-        self.tag = connectedTag
+        try await resolved.connect(alertMessage: alertMessage)
         try await selectOpenPGPApplet()
+        // #24 — identify the card before any PIN can be needed. One GET DATA;
+        // a card that won't answer simply gets no PIN-cache participation.
+        connectedSerialHex = try? await readAIDSerial()
+        // §4b — must happen before any PIN is sent. A transport failure here
+        // propagates and fails the connect, which is correct: we would rather
+        // not open a session than open one that might burn PW1 attempts.
+        try await readKDFConfiguration()
         return self
     }
 
-    /// Update the on-screen NFC prompt mid-session (e.g. "Signing…").
+    /// v8.1.0 — §4b. Read the KDF data object (DO 00F9) and the PW status bytes
+    /// (DO 00C4) so `verify` knows what form the card expects a PIN in, and how
+    /// long a PIN it will accept.
+    ///
+    /// A card without KDF configured answers GET DATA 00F9 with 6A88 ("referenced
+    /// data not found") or similar. That is the overwhelmingly common case and it
+    /// leaves `kdf` nil, preserving the existing raw-PIN behaviour exactly.
+    private func readKDFConfiguration() async throws {
+        kdf = nil
+        kdfUnreadable = false
+
+        let kdfApdu = APDU(
+            instructionClass: 0x00, instructionCode: 0xCA,
+            p1Parameter: 0x00, p2Parameter: 0xF9,
+            data: Data(), expectedResponseLength: 256
+        )
+        let (kdfData, k1, k2) = try await transmit(kdfApdu)
+        if k1 == 0x90, k2 == 0x00, !kdfData.isEmpty {
+            if let parsed = CardKDF.parse(kdfData) {
+                kdf = parsed
+            } else if kdfData.count >= 3, kdfData[0] == 0x81, kdfData[1] == 0x01,
+                      kdfData[2] != CardKDF.Algorithm.none.rawValue {
+                // The card is unambiguously declaring a KDF algorithm we can't
+                // derive. Refuse rather than fall back: raw would be rejected and
+                // would cost an attempt on every try.
+                kdfUnreadable = true
+            }
+            // Anything else that answered 0x9000 but doesn't look like a KDF-DO
+            // (a card echoing a template, a vendor quirk) is treated as "no KDF"
+            // and takes the unchanged raw path. Declaring it unreadable would
+            // make the card 100% unusable in PGPony, which is a strictly worse
+            // outcome than the behaviour that shipped in 8.0.x.
+        }
+
+        // PW status: exactly 7 bytes, [0] = signature PIN forced flag,
+        // [1...3] = max lengths for PW1 / reset code / PW3.
+        //
+        // The length is checked strictly (== 7, not >= 4) because this drives a
+        // *local* refusal: a card that answers 00C4 with something else — an
+        // echoed template, a vendor quirk — would otherwise populate bogus
+        // maxima and start rejecting PINs that used to work, turning a guard
+        // meant to save attempts into a new way to fail. The high bit of each
+        // length byte is the PIN-format flag, not length, so it is masked off;
+        // that only ever loosens the guard.
+        pinMaxLengths = nil
+        let pwApdu = APDU(
+            instructionClass: 0x00, instructionCode: 0xCA,
+            p1Parameter: 0x00, p2Parameter: 0xC4,
+            data: Data(), expectedResponseLength: 256
+        )
+        pw1RetriesAtConnect = nil
+        if let (pw, p1, p2) = try? await transmit(pwApdu), p1 == 0x90, p2 == 0x00, pw.count == 7 {
+            pw1RetriesAtConnect = Int(pw[4])
+            pinMaxLengths = (
+                pw1: Int(pw[1] & 0x7F),
+                resetCode: Int(pw[2] & 0x7F),
+                pw3: Int(pw[3] & 0x7F)
+            )
+        }
+    }
+
+    /// v8.1.0 — §4b. Turn a user-entered PIN into the bytes this specific card
+    /// expects in the command data field.
+    ///
+    /// This is the single chokepoint for every command that carries a PIN, so a
+    /// new call site cannot forget the KDF step. That is deliberate: forgetting
+    /// it is silent and costs the user a retry each time.
+    ///
+    /// The length guard applies only to the raw path. When KDF is on, the value
+    /// sent is a fixed-length digest and the card's maxima describe *that*, not
+    /// the passphrase the user typed.
+    func pinPayload(_ pin: String, reference: CardKDF.PINReference) throws -> [UInt8] {
+        if kdfUnreadable { throw OpenPGPCardError.kdfUnsupported }
+
+        if let kdf, kdf.isEnabled {
+            guard let derived = kdf.derive(pin: pin, reference: reference) else {
+                throw OpenPGPCardError.kdfUnsupported
+            }
+            return derived
+        }
+
+        let bytes = Array(pin.utf8)
+        if let maxima = pinMaxLengths {
+            let maximum: Int
+            switch reference {
+            case .pw1:       maximum = maxima.pw1
+            case .resetCode: maximum = maxima.resetCode
+            case .pw3:       maximum = maxima.pw3
+            }
+            if maximum > 0, bytes.count > maximum {
+                throw OpenPGPCardError.pinTooLong(maximum: maximum)
+            }
+        }
+        return bytes
+    }
+
+    /// Update system-provided progress UI mid-session (e.g. "Signing…"). A
+    /// no-op on a wired session; PGPony's own UI carries progress there.
     func updateAlert(_ message: String) {
-        session?.alertMessage = message
+        transport?.updateStatus(message)
     }
 
     /// Close the session. On success the system shows a checkmark; on failure the
     /// red error UI with `message`.
     func end(success: Bool, message: String? = nil) {
-        if success {
-            if let message { session?.alertMessage = message }
-            session?.invalidate()
-        } else {
-            session?.invalidate(errorMessage: message ?? "Couldn't read the card.")
-        }
-        session = nil
-        tag = nil
+        transport?.disconnect(success: success, message: message)
+        transport = nil
     }
 
     // MARK: Applet operations
 
     private func selectOpenPGPApplet() async throws {
-        let apdu = NFCISO7816APDU(
+        let apdu = APDU(
             instructionClass: 0x00, instructionCode: 0xA4,
             p1Parameter: 0x04, p2Parameter: 0x00,
             data: Data(Self.openPGPAID), expectedResponseLength: 256
@@ -242,9 +484,22 @@ final class OpenPGPCardService: NSObject {
         guard sw1 == 0x90, sw2 == 0x00 else { throw OpenPGPCardError.appletNotFound }
     }
 
+    /// Read just the AID (DO 0x4F) and pull the 4-byte serial out of it.
+    /// AID layout: RID(5) app(1) version(2) manufacturer(2) serial(4) rfu(2).
+    private func readAIDSerial() async throws -> String? {
+        let apdu = APDU(
+            instructionClass: 0x00, instructionCode: 0xCA,
+            p1Parameter: 0x00, p2Parameter: 0x4F,
+            data: Data(), expectedResponseLength: 256
+        )
+        let (data, sw1, sw2) = try await transmit(apdu)
+        guard sw1 == 0x90, sw2 == 0x00, data.count >= 14 else { return nil }
+        return hex(Array(data[10..<14]))
+    }
+
     /// Read application-related data (DO 0x6E) and parse the fields we surface.
     func readCardInfo() async throws -> OpenPGPCardInfo {
-        let apdu = NFCISO7816APDU(
+        let apdu = APDU(
             instructionClass: 0x00, instructionCode: 0xCA,
             p1Parameter: 0x00, p2Parameter: 0x6E,
             data: Data(), expectedResponseLength: 256
@@ -303,7 +558,7 @@ final class OpenPGPCardService: NSObject {
         // (DO 0x7A → 0x93, 3-byte big-endian). Best-effort: a card that doesn't
         // return it just leaves the counter nil.
         var sigCounter: Int? = nil
-        let secApdu = NFCISO7816APDU(
+        let secApdu = APDU(
             instructionClass: 0x00, instructionCode: 0xCA,
             p1Parameter: 0x00, p2Parameter: 0x7A,
             data: Data(), expectedResponseLength: 256
@@ -337,20 +592,49 @@ final class OpenPGPCardService: NSObject {
             touchPolicySign: uif(0x00D6),
             touchPolicyDecrypt: uif(0x00D7),
             touchPolicyAuth: uif(0x00D8),
-            signatureCounter: sigCounter
+            signatureCounter: sigCounter,
+            kdfEnabled: kdf?.isEnabled ?? false,
+            kdfDescription: kdf?.displayDescription
         )
     }
 
     /// VERIFY a PIN for the given mode. Throws `wrongPIN`/`pinBlocked` on failure so
     /// the caller can prompt again with the remaining-attempts count.
+    ///
+    /// An EMPTY pin is a sentinel meaning "use this card's remembered PIN".
+    /// #24 — the caller cannot know which card will be present when it decides
+    /// to skip the prompt, so the lookup has to happen here, after the card has
+    /// identified itself. If this card has no remembered PIN, nothing is sent:
+    /// `storedPINUnavailable` is thrown before any APDU, and no attempt is
+    /// spent. That ordering is the entire fix — the old code sent first and
+    /// found out by burning a retry on the wrong card.
     func verify(pin: String, mode: OpenPGPCardPIN) async throws {
-        let pinBytes = Array(pin.utf8)
-        let apdu = NFCISO7816APDU(
+        var pin = pin
+        if pin.isEmpty {
+            guard let remembered = CardPINCache.shared.pin(forSerial: connectedSerialHex) else {
+                throw OpenPGPCardError.storedPINUnavailable
+            }
+            pin = remembered
+        }
+        // §4b — derived on a KDF card, raw otherwise. Never `Array(pin.utf8)`
+        // directly: that is the bug that burned the Jul 30 reporter's attempts.
+        let pinBytes = try pinPayload(pin, reference: mode.kdfReference)
+        let apdu = APDU(
             instructionClass: 0x00, instructionCode: 0x20,
             p1Parameter: 0x00, p2Parameter: mode.p2,
             data: Data(pinBytes), expectedResponseLength: -1
         )
-        let (_, sw1, sw2) = try await transmit(apdu)
+        let sw1: UInt8, sw2: UInt8
+        do {
+            (_, sw1, sw2) = try await transmit(apdu)
+        } catch OpenPGPCardError.connectionLost {
+            // The command may have reached the card even though the answer did
+            // not reach us — a tester's retry counter proved exactly that. A
+            // generic "dropped, tap again" here hides a possibly-consumed
+            // attempt, which is how someone taps their way to a blocked card
+            // believing nothing happened.
+            throw OpenPGPCardError.pinCheckInterrupted(lastKnownRetries: pw1RetriesAtConnect)
+        }
         if sw1 == 0x90, sw2 == 0x00 { return }
         // 0x63 0xCx = verification failed, x attempts left. 0x69 0x83 = blocked.
         if sw1 == 0x63, (sw2 & 0xF0) == 0xC0 {
@@ -358,9 +642,29 @@ final class OpenPGPCardService: NSObject {
         }
         if sw1 == 0x69, sw2 == 0x83 { throw OpenPGPCardError.pinBlocked }
         // Some cards (incl. YubiKey) report a failed PIN check as 0x6982 "security
-        // status not satisfied" rather than 0x63Cx — no attempt count is provided.
-        if sw1 == 0x69, sw2 == 0x82 { throw OpenPGPCardError.wrongPIN(retriesRemaining: nil) }
+        // status not satisfied" rather than 0x63Cx — no attempt count in the
+        // status word. Which means the remaining-attempts feature would never
+        // fire on exactly the hardware our testers carry. The count still
+        // exists on the card, in the PW status bytes — fetch it while the
+        // session is still open. Best-effort: a failed read degrades to the
+        // countless message rather than failing the failure.
+        if sw1 == 0x69, sw2 == 0x82 {
+            throw OpenPGPCardError.wrongPIN(retriesRemaining: await readPW1RetriesBestEffort())
+        }
         throw OpenPGPCardError.unexpectedStatus(sw1, sw2)
+    }
+
+    /// Read the PW1 retry counter from DO 00C4, returning nil on any failure.
+    /// Called after a countless wrong-PIN answer, inside the same session.
+    private func readPW1RetriesBestEffort() async -> Int? {
+        let apdu = APDU(
+            instructionClass: 0x00, instructionCode: 0xCA,
+            p1Parameter: 0x00, p2Parameter: 0xC4,
+            data: Data(), expectedResponseLength: 256
+        )
+        guard let (pw, p1, p2) = try? await transmit(apdu),
+              p1 == 0x90, p2 == 0x00, pw.count == 7 else { return nil }
+        return Int(pw[4])
     }
 
     // MARK: Change Reference Data (Phase 10a — PW1 PIN change)
@@ -371,8 +675,13 @@ final class OpenPGPCardService: NSObject {
     /// for PW3 (admin). Assumes the applet is already selected (connect() does
     /// that). Throws `wrongPIN`/`pinBlocked` so the UI can show remaining attempts.
     func changeReferenceData(pinReference: UInt8, oldPIN: String, newPIN: String) async throws {
-        let payload = Array(oldPIN.utf8) + Array(newPIN.utf8)
-        let apdu = NFCISO7816APDU(
+        // §4b — both halves must be in the card's expected form. On a KDF card
+        // each is a fixed-length digest, which also makes the card's split
+        // unambiguous. Mixing forms here would reject *and* spend an attempt.
+        let reference: CardKDF.PINReference = (pinReference == 0x83) ? .pw3 : .pw1
+        let payload = try pinPayload(oldPIN, reference: reference)
+                    + pinPayload(newPIN, reference: reference)
+        let apdu = APDU(
             instructionClass: 0x00, instructionCode: 0x24,
             p1Parameter: 0x00, p2Parameter: pinReference,
             data: Data(payload), expectedResponseLength: -1
@@ -429,10 +738,13 @@ final class OpenPGPCardService: NSObject {
     /// counter. Use this when PW1 is blocked (0 attempts remaining).
     func unblockUserPin(adminPIN: String, newPIN: String) async throws {
         try await verify(pin: adminPIN, mode: .admin)
-        let apdu = NFCISO7816APDU(
+        // §4b — the new PW1 is installed in the card's expected form, so on a
+        // KDF card it must be derived with the PW1 salt before being sent.
+        let newPINBytes = try pinPayload(newPIN, reference: .pw1)
+        let apdu = APDU(
             instructionClass: 0x00, instructionCode: 0x2C,
             p1Parameter: 0x02, p2Parameter: 0x81,
-            data: Data(Array(newPIN.utf8)), expectedResponseLength: -1
+            data: Data(newPINBytes), expectedResponseLength: -1
         )
         let (_, sw1, sw2) = try await transmit(apdu)
         if sw1 == 0x90, sw2 == 0x00 { return }
@@ -456,7 +768,7 @@ final class OpenPGPCardService: NSObject {
             // proceed: card may allow reset when PINs are blocked
         }
 
-        let terminate = NFCISO7816APDU(
+        let terminate = APDU(
             instructionClass: 0x00, instructionCode: 0xE6,
             p1Parameter: 0x00, p2Parameter: 0x00,
             data: Data(), expectedResponseLength: -1
@@ -464,7 +776,7 @@ final class OpenPGPCardService: NSObject {
         let (_, t1, t2) = try await transmit(terminate)
         guard t1 == 0x90, t2 == 0x00 else { throw OpenPGPCardError.unexpectedStatus(t1, t2) }
 
-        let activate = NFCISO7816APDU(
+        let activate = APDU(
             instructionClass: 0x00, instructionCode: 0x44,
             p1Parameter: 0x00, p2Parameter: 0x00,
             data: Data(), expectedResponseLength: -1
@@ -477,7 +789,7 @@ final class OpenPGPCardService: NSObject {
     /// verified in this session. Sends the 32-byte digest, returns the 64-byte
     /// Ed25519 signature (R || S).
     func sign(digest: [UInt8]) async throws -> [UInt8] {
-        let apdu = NFCISO7816APDU(
+        let apdu = APDU(
             instructionClass: 0x00, instructionCode: 0x2A,
             p1Parameter: 0x9E, p2Parameter: 0x9A,
             data: Data(digest), expectedResponseLength: 256
@@ -523,7 +835,7 @@ final class OpenPGPCardService: NSObject {
         let do7F49: [UInt8] = [0x7F, 0x49] + berLength(do86.count) + do86
         let doA6: [UInt8] = [0xA6] + berLength(do7F49.count) + do7F49
 
-        let apdu = NFCISO7816APDU(
+        let apdu = APDU(
             instructionClass: 0x00, instructionCode: 0x2A,
             p1Parameter: 0x80, p2Parameter: 0x86,
             data: Data(doA6), expectedResponseLength: 256
@@ -572,7 +884,7 @@ final class OpenPGPCardService: NSObject {
     /// decryption key). Strips a leading 0x40. Used by the ECDH self-test and,
     /// later, card-key import.
     func readEncryptionPublicKey() async throws -> [UInt8] {
-        let apdu = NFCISO7816APDU(
+        let apdu = APDU(
             instructionClass: 0x00, instructionCode: 0x47,
             p1Parameter: 0x81, p2Parameter: 0x00,
             data: Data([0xB8, 0x00]), expectedResponseLength: 256
@@ -590,7 +902,7 @@ final class OpenPGPCardService: NSObject {
     /// 512 bytes, so the response (~520 bytes) needs an extended-length Le;
     /// `transmit` also follows any 0x61xx response chaining. No PIN required.
     func readEncryptionRSAPublicKey() async throws -> (modulus: [UInt8], exponent: [UInt8]) {
-        let apdu = NFCISO7816APDU(
+        let apdu = APDU(
             instructionClass: 0x00, instructionCode: 0x47,
             p1Parameter: 0x81, p2Parameter: 0x00,
             data: Data([0xB8, 0x00]), expectedResponseLength: 1024
@@ -660,7 +972,7 @@ final class OpenPGPCardService: NSObject {
     /// tag (e.g. 0x00C7). The objects written here are admin-protected, so PW3 must
     /// already be verified. Assumes the applet is selected.
     func putData(tag: UInt16, _ value: [UInt8]) async throws {
-        let apdu = NFCISO7816APDU(
+        let apdu = APDU(
             instructionClass: 0x00, instructionCode: 0xDA,
             p1Parameter: UInt8((tag >> 8) & 0xFF), p2Parameter: UInt8(tag & 0xFF),
             data: Data(value), expectedResponseLength: -1
@@ -678,7 +990,7 @@ final class OpenPGPCardService: NSObject {
     /// secret key never leaves the card. DESTRUCTIVE — overwrites the slot. Requires
     /// PW3 (admin) verified first.
     func generateKeyPair(slot: CardKeySlot) async throws -> CardPublicKeyMaterial {
-        let apdu = NFCISO7816APDU(
+        let apdu = APDU(
             instructionClass: 0x00, instructionCode: 0x47,
             p1Parameter: 0x80, p2Parameter: 0x00,
             data: Data([slot.crt, 0x00]), expectedResponseLength: 1024
@@ -773,31 +1085,31 @@ final class OpenPGPCardService: NSObject {
     /// Send one APDU, transparently following 0x61xx (GET RESPONSE) and 0x6Cxx
     /// (wrong Le) so the caller always gets the full response body plus final SW.
     @discardableResult
-    func transmit(_ apdu: NFCISO7816APDU) async throws -> (data: [UInt8], sw1: UInt8, sw2: UInt8) {
-        guard let tag else { throw OpenPGPCardError.sessionClosed }
+    func transmit(_ apdu: APDU) async throws -> APDUResponse {
+        guard let transport, transport.isConnected else { throw OpenPGPCardError.sessionClosed }
 
-        var (response, sw1, sw2) = try await sendOnce(apdu, tag: tag)
+        var (response, sw1, sw2) = try await transport.send(apdu)
         var accumulated = response
 
         // 0x6Cxx: card wants a specific Le; resend the same command with Le = sw2.
         if sw1 == 0x6C {
-            let retry = NFCISO7816APDU(
-                instructionClass: apduCLA(apdu), instructionCode: apdu.instructionCode,
+            let retry = APDU(
+                instructionClass: apdu.instructionClass, instructionCode: apdu.instructionCode,
                 p1Parameter: apdu.p1Parameter, p2Parameter: apdu.p2Parameter,
-                data: apdu.data ?? Data(), expectedResponseLength: Self.leFromSW2(sw2)
+                data: apdu.data, expectedResponseLength: Self.leFromSW2(sw2)
             )
-            (response, sw1, sw2) = try await sendOnce(retry, tag: tag)
+            (response, sw1, sw2) = try await transport.send(retry)
             accumulated = response
         }
 
         // 0x61xx: more data available; pull it with GET RESPONSE until 0x9000.
         while sw1 == 0x61 {
-            let getResponse = NFCISO7816APDU(
+            let getResponse = APDU(
                 instructionClass: 0x00, instructionCode: 0xC0,
                 p1Parameter: 0x00, p2Parameter: 0x00,
                 data: Data(), expectedResponseLength: Self.leFromSW2(sw2)
             )
-            let (more, s1, s2) = try await sendOnce(getResponse, tag: tag)
+            let (more, s1, s2) = try await transport.send(getResponse)
             accumulated += more
             sw1 = s1; sw2 = s2
         }
@@ -820,19 +1132,19 @@ final class OpenPGPCardService: NSObject {
         p2Parameter p2: UInt8,
         data: [UInt8],
         expectedResponseLength: Int
-    ) async throws -> (data: [UInt8], sw1: UInt8, sw2: UInt8) {
-        guard let tag else { throw OpenPGPCardError.sessionClosed }
+    ) async throws -> APDUResponse {
+        guard let transport, transport.isConnected else { throw OpenPGPCardError.sessionClosed }
 
         let blocks = Self.commandChainBlocks(data: data)
 
         // Intermediate blocks: CLA 0x10, Le absent, each must ack 0x9000.
         for block in blocks where !block.isLast {
-            let apdu = NFCISO7816APDU(
+            let apdu = APDU(
                 instructionClass: block.cla, instructionCode: ins,
                 p1Parameter: p1, p2Parameter: p2,
                 data: Data(block.data), expectedResponseLength: -1
             )
-            let (_, sw1, sw2) = try await sendOnce(apdu, tag: tag)
+            let (_, sw1, sw2) = try await transport.send(apdu)
             guard sw1 == 0x90, sw2 == 0x00 else { throw OpenPGPCardError.unexpectedStatus(sw1, sw2) }
         }
 
@@ -840,46 +1152,13 @@ final class OpenPGPCardService: NSObject {
         // transparent response chaining. `commandChainBlocks` always returns at
         // least one block, so `last` is non-nil.
         guard let last = blocks.last else { throw OpenPGPCardError.malformedResponse }
-        let finalApdu = NFCISO7816APDU(
+        let finalApdu = APDU(
             instructionClass: last.cla, instructionCode: ins,
             p1Parameter: p1, p2Parameter: p2,
             data: Data(last.data), expectedResponseLength: expectedResponseLength
         )
         return try await transmit(finalApdu)
     }
-
-    private func sendOnce(_ apdu: NFCISO7816APDU, tag: NFCISO7816Tag) async throws -> ([UInt8], UInt8, UInt8) {
-        do {
-            let (data, sw1, sw2) = try await tag.sendCommand(apdu: apdu)
-            return (Array(data), sw1, sw2)
-        } catch {
-            throw Self.mapNFCError(error)
-        }
-    }
-
-    /// B1e — turn raw CoreNFC transceive/session failures into a clear, actionable
-    /// `.connectionLost` (the "hold steady, tap again" case) instead of a generic
-    /// `.underlying` message. Anything we don't recognise stays `.underlying`.
-    static func mapNFCError(_ error: Error) -> OpenPGPCardError {
-        if let already = error as? OpenPGPCardError { return already }
-        if let nfc = error as? NFCReaderError {
-            switch nfc.code {
-            case .readerTransceiveErrorTagConnectionLost,
-                 .readerTransceiveErrorTagResponseError,
-                 .readerTransceiveErrorTagNotConnected,
-                 .readerSessionInvalidationErrorSessionTimeout,
-                 .readerSessionInvalidationErrorSessionTerminatedUnexpectedly:
-                return .connectionLost
-            default:
-                return .underlying(error)
-            }
-        }
-        return .underlying(error)
-    }
-
-    /// NFCISO7816APDU doesn't expose its CLA; we only ever resend our own commands,
-    /// which all use CLA 0x00, so this is safe for the 0x6Cxx retry path.
-    private func apduCLA(_ apdu: NFCISO7816APDU) -> UInt8 { 0x00 }
 
     // MARK: Helpers
 
@@ -914,46 +1193,6 @@ final class OpenPGPCardService: NSObject {
 
     private func hex(_ bytes: [UInt8]) -> String {
         bytes.map { String(format: "%02X", $0) }.joined()
-    }
-}
-
-// MARK: - NFCTagReaderSessionDelegate
-
-extension OpenPGPCardService: NFCTagReaderSessionDelegate {
-
-    func tagReaderSessionDidBecomeActive(_ session: NFCTagReaderSession) {
-        // No-op; polling starts automatically.
-    }
-
-    func tagReaderSession(_ session: NFCTagReaderSession, didInvalidateWithError error: Error) {
-        // If we were still waiting to connect, surface the failure to connect().
-        resumeConnect(.failure(Self.mapNFCError(error)))
-    }
-
-    func tagReaderSession(_ session: NFCTagReaderSession, didDetect tags: [NFCTag]) {
-        Task {
-            guard let first = tags.first else { return }
-            guard case let .iso7816(iso) = first else {
-                session.invalidate(errorMessage: "That isn't an OpenPGP smart card.")
-                resumeConnect(.failure(OpenPGPCardError.notISO7816))
-                return
-            }
-            do {
-                try await session.connect(to: first)
-                resumeConnect(.success(iso))
-            } catch {
-                resumeConnect(.failure(OpenPGPCardError.underlying(error)))
-            }
-        }
-    }
-
-    private func resumeConnect(_ result: Result<NFCISO7816Tag, Error>) {
-        guard let cont = connectContinuation else { return }
-        connectContinuation = nil
-        switch result {
-        case .success(let t): cont.resume(returning: t)
-        case .failure(let e): cont.resume(throwing: e)
-        }
     }
 }
 
@@ -1046,7 +1285,14 @@ final class CardPINCache {
             case .oneMinute:      return String(localized: "1 minute")
             case .fiveMinutes:    return String(localized: "5 minutes")
             case .fifteenMinutes: return String(localized: "15 minutes")
-            case .untilCleared:   return String(localized: "Until I clear it")
+            // v8.1.0 §3c — was "Until I clear it", which is not true: this
+            // cache is in memory and dies with the process. A user who fully
+            // quits PGPony and returns to a PIN prompt reported it as a bug,
+            // and they were right to — the label promised persistence the
+            // implementation never had. The behaviour is deliberate (a PIN on
+            // disk alongside a key on the card collapses two factors into one),
+            // so the label changed rather than the storage.
+            case .untilCleared:   return String(localized: "Until PGPony quits")
             }
         }
     }
@@ -1058,8 +1304,18 @@ final class CardPINCache {
         set { UserDefaults.standard.set(newValue.rawValue, forKey: modeKey) }
     }
 
-    private var pin: String?
-    private var expiry: Date?
+    // v8.1.0 build 3 (#24) — keyed by card serial, because a single global PIN
+    // was replayed to whichever card happened to be present next. A tester with
+    // two YubiKeys remembered the PIN on one, inserted the other, and the app
+    // sent the first card's PIN to it: wrong, and a PW1 retry burned, with the
+    // user never having typed anything. Same harm as the §4b KDF bug, harder to
+    // notice.
+    private struct Entry {
+        var pin: String
+        var expiry: Date?
+        var storedAt: Date
+    }
+    private var entries: [String: Entry] = [:]
     private let queue = DispatchQueue(label: "app.pgpony.pincache")
 
     private init() {
@@ -1073,7 +1329,7 @@ final class CardPINCache {
     }
 
     /// Live, read-only snapshot for the Settings countdown. Never mutates the
-    /// cache (expiry is still enforced on read in `cachedPIN()`).
+    /// cache (expiry is enforced on read in `pin(forSerial:)`).
     enum CacheState: Equatable {
         case off                                // mode is "Ask every time"
         case empty                              // caching on, nothing held right now
@@ -1084,49 +1340,76 @@ final class CardPINCache {
     func state() -> CacheState {
         queue.sync {
             guard Self.mode != .never else { return .off }
-            guard pin != nil else { return .empty }
-            if let expiry {
-                let remaining = expiry.timeIntervalSinceNow
-                if remaining <= 0 { return .empty }
-                return .counting(remaining: remaining)
+            purgeExpiredLocked()
+            // Several cards may be held; the countdown shows the most recently
+            // stored one, which is the one the user is thinking about.
+            guard let latest = entries.values.max(by: { $0.storedAt < $1.storedAt }) else {
+                return .empty
+            }
+            if let expiry = latest.expiry {
+                return .counting(remaining: expiry.timeIntervalSinceNow)
             }
             return .untilCleared
         }
     }
 
-    /// The cached user PIN if caching is enabled and the entry is still valid,
-    /// otherwise nil. Expired entries are dropped on read.
-    func cachedPIN() -> String? {
+    /// True when at least one live entry exists — the UI's pre-connect signal
+    /// to skip the PIN prompt. Which card's entry applies is decided later, in
+    /// the session, once the card has identified itself.
+    var hasLiveEntry: Bool {
         queue.sync {
-            guard Self.mode != .never, let pin else { return nil }
-            if let expiry, Date() >= expiry {
-                self.pin = nil
-                self.expiry = nil
-                return nil
-            }
-            return pin
+            guard Self.mode != .never else { return false }
+            purgeExpiredLocked()
+            return !entries.isEmpty
         }
     }
 
-    /// Store the user PIN after a *successful* verify. No-op when caching is off.
-    func store(_ pin: String) {
+    private func purgeExpiredLocked() {
+        let now = Date()
+        entries = entries.filter { $0.value.expiry.map { $0 > now } ?? true }
+    }
+
+    /// The remembered PIN for THIS card, or nil. Never returns another card's
+    /// PIN — that is the whole point of #24.
+    func pin(forSerial serial: String?) -> String? {
+        queue.sync {
+            guard Self.mode != .never, let serial, !serial.isEmpty else { return nil }
+            purgeExpiredLocked()
+            return entries[serial]?.pin
+        }
+    }
+
+    /// Store a PIN the card has just accepted, against that card's serial.
+    /// A nil or empty serial means the card could not be identified, and an
+    /// unidentifiable card gets nothing remembered — refusing to store beats
+    /// storing under a key that can collide.
+    func store(_ pin: String, forSerial serial: String?) {
         queue.sync {
             let mode = Self.mode
-            guard mode != .never else { return }
-            self.pin = pin
-            if let secs = mode.seconds, secs > 0 {
-                self.expiry = Date().addingTimeInterval(secs)
+            guard mode != .never, !pin.isEmpty, let serial, !serial.isEmpty else { return }
+            let expiry = mode.seconds.flatMap { $0 > 0 ? Date().addingTimeInterval($0) : nil }
+            entries[serial] = Entry(pin: pin, expiry: expiry, storedAt: Date())
+        }
+    }
+
+    /// Drop the entry for one card — after that card rejected its PIN.
+    /// Falls back to clearing everything when the card was never identified,
+    /// because keeping entries we can no longer attribute is how stale PINs
+    /// outlive their welcome.
+    func clearEntry(forSerial serial: String?) {
+        queue.sync {
+            if let serial, !serial.isEmpty {
+                entries.removeValue(forKey: serial)
             } else {
-                self.expiry = nil   // untilCleared
+                entries.removeAll()
             }
         }
     }
 
-    /// Wipe the cached PIN immediately.
+    /// Wipe every remembered PIN immediately.
     func clear() {
         queue.sync {
-            self.pin = nil
-            self.expiry = nil
+            entries.removeAll()
         }
     }
 
@@ -1151,19 +1434,138 @@ final class CardPINCache {
     func setMode(_ newMode: Mode) {
         queue.sync {
             Self.mode = newMode
-            guard pin != nil else { return }
+            guard !entries.isEmpty else { return }
             switch newMode {
             case .never:
-                self.pin = nil
-                self.expiry = nil
+                entries.removeAll()
             case .untilCleared:
-                self.expiry = nil
+                for key in entries.keys { entries[key]?.expiry = nil }
             default:
-                if let secs = newMode.seconds, secs > 0 {
-                    self.expiry = Date().addingTimeInterval(secs)
-                } else {
-                    self.expiry = nil
-                }
+                let expiry = newMode.seconds.flatMap { $0 > 0 ? Date().addingTimeInterval($0) : nil }
+                for key in entries.keys { entries[key]?.expiry = expiry }
+            }
+        }
+    }
+}
+
+// MARK: - Passphrase cache (v8.2.0 §5)
+
+/// The passphrase twin of `CardPINCache`, colocated with it because they are the
+/// same mechanism for two secret kinds: an in-memory, never-persisted cache
+/// bounded only by the chosen duration. §4.6 posture decision (Kevin): software
+/// key passphrases mirror the card-PIN posture rather than going to the Keychain,
+/// because a passphrase written to disk beside its key would collapse two factors
+/// into one. It reuses `CardPINCache.Mode` so the duration options and labels stay
+/// identical across both caches.
+///
+/// - Keyed by key FINGERPRINT so each key is remembered separately. This is the
+///   passphrase analogue of #24's per-serial keying: caching a single global
+///   passphrase would replay key A's secret to key B, burning attempts on a key
+///   the user never typed a passphrase for. Callers must therefore only apply a
+///   cached passphrase to the key it was stored under.
+/// - Held ONLY in memory, never written to disk / UserDefaults / Keychain (only
+///   the mode enum persists). Wiped on: expiry, a wrong-passphrase clear, the
+///   manual "Clear Remembered Passphrase" action, and app termination. NOT wiped
+///   on backgrounding, matching the PIN cache (so the Mail -> share-sheet flow
+///   keeps working).
+final class PassphraseCache {
+    static let shared = PassphraseCache()
+
+    typealias Mode = CardPINCache.Mode
+    private static let modeKey = "pgpony_passphrase_cache_mode"
+
+    static var mode: Mode {
+        get { Mode(rawValue: UserDefaults.standard.string(forKey: modeKey) ?? "") ?? .never }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: modeKey) }
+    }
+
+    private struct Entry {
+        var passphrase: String
+        var expiry: Date?
+        var storedAt: Date
+    }
+    private var entries: [String: Entry] = [:]
+    private let queue = DispatchQueue(label: "app.pgpony.passphrasecache")
+    private init() {}
+
+    enum CacheState: Equatable {
+        case off
+        case empty
+        case untilCleared
+        case counting(remaining: TimeInterval)
+    }
+
+    func state() -> CacheState {
+        queue.sync {
+            guard Self.mode != .never else { return .off }
+            purgeExpiredLocked()
+            guard let latest = entries.values.max(by: { $0.storedAt < $1.storedAt }) else {
+                return .empty
+            }
+            if let expiry = latest.expiry {
+                return .counting(remaining: expiry.timeIntervalSinceNow)
+            }
+            return .untilCleared
+        }
+    }
+
+    private func purgeExpiredLocked() {
+        let now = Date()
+        entries = entries.filter { $0.value.expiry.map { $0 > now } ?? true }
+    }
+
+    /// The remembered passphrase for THIS key, or nil. Never returns another
+    /// key's passphrase.
+    func passphrase(forFingerprint fingerprint: String?) -> String? {
+        queue.sync {
+            guard Self.mode != .never, let fingerprint, !fingerprint.isEmpty else { return nil }
+            purgeExpiredLocked()
+            return entries[fingerprint]?.passphrase
+        }
+    }
+
+    /// Store a passphrase a key has just accepted, against that key's fingerprint.
+    func store(_ passphrase: String, forFingerprint fingerprint: String?) {
+        queue.sync {
+            let mode = Self.mode
+            guard mode != .never, !passphrase.isEmpty, let fingerprint, !fingerprint.isEmpty else { return }
+            let expiry = mode.seconds.flatMap { $0 > 0 ? Date().addingTimeInterval($0) : nil }
+            entries[fingerprint] = Entry(passphrase: passphrase, expiry: expiry, storedAt: Date())
+        }
+    }
+
+    /// Drop one key's entry — after that key rejected its passphrase.
+    func clearEntry(forFingerprint fingerprint: String?) {
+        queue.sync {
+            if let fingerprint, !fingerprint.isEmpty {
+                entries.removeValue(forKey: fingerprint)
+            } else {
+                entries.removeAll()
+            }
+        }
+    }
+
+    /// Wipe every remembered passphrase immediately.
+    func clear() {
+        queue.sync { entries.removeAll() }
+    }
+
+    /// Change the duration and re-apply it to any held passphrase right away, so
+    /// switching (e.g.) "1 minute" -> "Until PGPony quits" takes effect on the
+    /// currently held secret instead of waiting for the next store(). Mirrors
+    /// `CardPINCache.setMode`.
+    func setMode(_ newMode: Mode) {
+        queue.sync {
+            Self.mode = newMode
+            guard !entries.isEmpty else { return }
+            switch newMode {
+            case .never:
+                entries.removeAll()
+            case .untilCleared:
+                for key in entries.keys { entries[key]?.expiry = nil }
+            default:
+                let expiry = newMode.seconds.flatMap { $0 > 0 ? Date().addingTimeInterval($0) : nil }
+                for key in entries.keys { entries[key]?.expiry = expiry }
             }
         }
     }

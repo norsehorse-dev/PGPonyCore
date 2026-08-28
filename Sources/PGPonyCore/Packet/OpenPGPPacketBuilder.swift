@@ -24,8 +24,9 @@ import Security
 // extension target, so the same armorer + setting is available everywhere
 // armor is produced without any project membership surgery.
 //
-// Persistence is via the App Group UserDefaults suite (KeychainService
-// .sharedDefaults → group.com.pgpony.shared), so the toggle + custom string
+// Persistence lives in the host app — in PGPony, the App Group UserDefaults
+// suite (group.com.pgpony.shared) reached through the CORE SEAM hooks
+// `settingsProvider` / `pubkeySettingsProvider` — so the toggle + custom string
 // survive an app restart AND are shared with the share extension. The
 // SwiftUI Settings screen binds @AppStorage to the same suite + keys.
 //
@@ -96,17 +97,20 @@ enum ArmorComment {
         return s.isEmpty ? nil : s
     }
 
-    /// Injectable hook for the host app to supply the user's Comment-header
-    /// preference (toggle + text). The core keeps no app storage of its own, so
-    /// a host that wants a persisted/@AppStorage-backed toggle assigns this once
-    /// at launch, e.g. from its App Group defaults suite. The default reproduces
-    /// PGPony's first-launch behavior: comment ON with `defaultComment`.
-    /// Returning (false, _) writes no header.
+    /// CORE SEAM: injectable hook for the host app to supply the user's
+    /// Comment-header preference (toggle + text). The core keeps no app storage
+    /// of its own, so a host that wants a persisted/@AppStorage-backed toggle
+    /// assigns this once at launch, e.g. from its App Group defaults suite (in
+    /// PGPony, `KeychainService.sharedDefaults` under `includeKey`/`textKey`).
+    /// The default reproduces PGPony's first-launch behavior: comment ON with
+    /// `defaultComment`. Returning (false, _) writes no header.
     static var settingsProvider: () -> (include: Bool, raw: String) = {
         (true, defaultComment)
     }
 
-    /// The validated Comment value to embed. nil means "write no Comment header".
+    /// The validated Comment value to embed. nil means "write no Comment
+    /// header". Reads are synchronous, so the crypto/armor path can call this
+    /// directly (no cache needed, unlike Android's DataStore which is async).
     static var current: String? {
         let (include, raw) = settingsProvider()
         return validate(include: include, raw: raw)
@@ -126,15 +130,15 @@ enum ArmorComment {
     /// reuses the same comment text. Default ON.
     static let pubkeyIncludeKey = "armor_comment_pubkey_include"
 
-    /// Injectable hook for the host app's public-key-export Comment preference
-    /// (separate toggle, shared text). Default mirrors first launch: ON with
-    /// `defaultComment`.
+    /// The Comment value for public-key exports, or nil for none. Honors the
+    /// separate pubkey toggle (default ON) and the shared comment text.
+    /// CORE SEAM: injectable hook for the host app's public-key-export Comment
+    /// preference (separate toggle, shared text). Default mirrors first launch:
+    /// ON with `defaultComment`.
     static var pubkeySettingsProvider: () -> (include: Bool, raw: String) = {
         (true, defaultComment)
     }
 
-    /// The Comment value for public-key exports, or nil for none. Honors the
-    /// separate pubkey toggle (default ON) and the shared comment text.
     static func pubkeyComment() -> String? {
         let (include, raw) = pubkeySettingsProvider()
         guard include else { return nil }
@@ -207,6 +211,18 @@ struct Ed25519SigningInfo {
     let fingerprint: [UInt8]                         // 20-byte fingerprint of primary key
 }
 
+// MARK: - RSA Signing Info
+
+/// v8.1.0 build 8 — the RSA counterpart to `Ed25519SigningInfo`. CryptoKit has
+/// no RSA support, so the private key is a Security-framework `SecKey` rather
+/// than a CryptoKit type; everything else about the shape matches, so a
+/// `StreamingBinarySigner` can be built from either the same way.
+struct RSASigningInfo {
+    let keyID: [UInt8]           // 8-byte key ID of the signing (sub)key
+    let fingerprint: [UInt8]     // 20-byte v4 fingerprint of the signing (sub)key
+    let privateKey: SecKey
+}
+
 // MARK: - OpenPGP Packet Builder
 
 class OpenPGPPacketBuilder {
@@ -233,21 +249,34 @@ class OpenPGPPacketBuilder {
     ///   - filename: Optional filename for literal data packet (nil = empty)
     ///   - armor: If true, returns ASCII-armored output
     /// - Returns: The encrypted OpenPGP message as Data
-    static func buildEncryptedMessage(
-        plaintext: Data,
+    /// A session key, the cipher it is for, and the recipient packets that
+    /// carry it.
+    ///
+    /// v8.1.0 §3a — lifted out of `buildEncryptedMessage` so the streaming
+    /// large-file path builds its recipient packets the same way rather than a
+    /// second way. The branch below is a policy decision, not a mechanical one:
+    /// which cipher, which PKESK version, and therefore which SEIPD version the
+    /// message ends up in. Two copies of it would eventually disagree, and the
+    /// symptom would be a file that a recipient can open at one size and not
+    /// another.
+    struct SessionKeyEnvelope {
+        let sessionKey: [UInt8]
+        let cipherID: UInt8
+        /// True when every recipient is a v6 key, so the message takes the
+        /// v6 PKESK + SEIPD v2 (AEAD) path.
+        let isV6: Bool
+        let recipientPackets: Data
+    }
+
+    static func buildSessionKeyEnvelope(
         recipients: [Cv25519Recipient],
-        rsaRecipients: [RSARecipient] = [],
-        signingInfo: Ed25519SigningInfo? = nil,
-        prebuiltSignature: (packet: [UInt8], keyID: [UInt8])? = nil,
-        filename: String? = nil,
-        armor: Bool = true
-    ) throws -> Data {
+        rsaRecipients: [RSARecipient] = []
+    ) throws -> SessionKeyEnvelope {
 
         guard !recipients.isEmpty || !rsaRecipients.isEmpty else {
             throw PacketBuilderError.noRecipients
         }
 
-        // 1. Choose the session cipher and generate a random session key.
         // v6.0 Phase V6-C: the all-v6 path uses AES-256 (algo 9) to match the v6
         // ecosystem (Sequoia sq, GnuPG 2.4), which emit AES-256 for v6 SEIPDv2 and
         // reject AES-128 there by policy. The legacy v3 + SEIPDv1 path stays on
@@ -264,17 +293,59 @@ class OpenPGPPacketBuilder {
             throw PacketBuilderError.sessionKeyGenerationFailed
         }
 
-        // 2. Build recipient packets + encrypted payload.
         // When EVERY recipient is a v6 key (32-byte fingerprint), emit v6 PKESK
-        // packets followed by a SEIPDv2 (AES-OCB) packet, per RFC 9580 (a v6 PKESK
-        // MUST precede a v2 SEIPD). If any recipient is a v4 key, fall back to the
-        // legacy v3 PKESK + SEIPDv1/MDC path so v4 recipients can still read it.
-        var message = Data()
-
+        // packets, which RFC 9580 requires to precede a v2 SEIPD. If any recipient
+        // is a v4 key, fall back to v3 PKESKs so they can still read it.
+        var packets = Data()
         if allV6 {
             for recipient in recipients {
-                message.append(try buildV6PKESKPacket(sessionKey: sessionKey, recipient: recipient))
+                packets.append(try buildV6PKESKPacket(sessionKey: sessionKey, recipient: recipient))
             }
+        } else {
+            for recipient in recipients {
+                packets.append(try buildPKESKPacket(
+                    sessionKey: sessionKey,
+                    sessionAlgorithmID: defaultSessionCipherID,
+                    recipient: recipient
+                ))
+            }
+            for rsaRecipient in rsaRecipients {
+                packets.append(try buildRSAPKESKPacket(
+                    sessionKey: sessionKey,
+                    sessionAlgorithmID: defaultSessionCipherID,
+                    recipient: rsaRecipient
+                ))
+            }
+        }
+
+        return SessionKeyEnvelope(
+            sessionKey: sessionKey, cipherID: cipherID, isV6: allV6, recipientPackets: packets
+        )
+    }
+
+    static func buildEncryptedMessage(
+        plaintext: Data,
+        recipients: [Cv25519Recipient],
+        rsaRecipients: [RSARecipient] = [],
+        signingInfo: Ed25519SigningInfo? = nil,
+        prebuiltSignature: (packet: [UInt8], keyID: [UInt8])? = nil,
+        filename: String? = nil,
+        armor: Bool = true
+    ) throws -> Data {
+
+        guard !recipients.isEmpty || !rsaRecipients.isEmpty else {
+            throw PacketBuilderError.noRecipients
+        }
+
+        // 1-2. Session key, cipher choice, and the recipient packets.
+        let envelope = try buildSessionKeyEnvelope(
+            recipients: recipients, rsaRecipients: rsaRecipients
+        )
+        let sessionKey = envelope.sessionKey
+        let cipherID = envelope.cipherID
+        var message = envelope.recipientPackets
+
+        if envelope.isV6 {
             let seipd2 = try buildSEIPDv2Packet(
                 plaintext: Array(plaintext),
                 sessionKey: sessionKey,
@@ -285,23 +356,6 @@ class OpenPGPPacketBuilder {
             )
             message.append(seipd2)
         } else {
-            for recipient in recipients {
-                let pkesk = try buildPKESKPacket(
-                    sessionKey: sessionKey,
-                    sessionAlgorithmID: defaultSessionCipherID,
-                    recipient: recipient
-                )
-                message.append(pkesk)
-            }
-            for rsaRecipient in rsaRecipients {
-                let pkesk = try buildRSAPKESKPacket(
-                    sessionKey: sessionKey,
-                    sessionAlgorithmID: defaultSessionCipherID,
-                    recipient: rsaRecipient
-                )
-                message.append(pkesk)
-            }
-
             // Encrypt plaintext with session key → SEIPDv1 packet
             let seipd = try buildSEIPDPacket(
                 plaintext: Array(plaintext),
@@ -480,13 +534,22 @@ class OpenPGPPacketBuilder {
         sessionAlgorithmID: UInt8,
         signingInfo: Ed25519SigningInfo? = nil,
         prebuiltSignature: (packet: [UInt8], keyID: [UInt8])? = nil,
-        filename: String? = nil
+        filename: String? = nil,
+        /// v8.1.0 §3a — TEST SEAM ONLY. Injects the CFB randomisation prefix so
+        /// the streaming SEIPD writer can be pinned byte-for-byte against this
+        /// implementation. Production callers omit it and get fresh randomness,
+        /// exactly as before. `blockSize` bytes; the trailing 2-byte repeat is
+        /// still appended here.
+        injectedPrefix: [UInt8]? = nil,
+        /// v8.1.0 §3a — TEST SEAM ONLY. Fixes the literal packet's embedded
+        /// timestamp so two independently built packets are comparable.
+        injectedDate: Date? = nil
     ) throws -> Data {
 
         let blockSize = try cipherBlockSize(for: sessionAlgorithmID)
 
         // Build the literal data packet that wraps the plaintext
-        let literalPacket = buildLiteralDataPacket(data: plaintext, filename: filename)
+        let literalPacket = buildLiteralDataPacket(data: plaintext, filename: filename, date: injectedDate)
 
         // Build the inner packet sequence
         var innerPackets: [UInt8]
@@ -539,7 +602,11 @@ class OpenPGPPacketBuilder {
 
         // Build prefix: blockSize random bytes + repeat last 2
         var prefix = [UInt8](repeating: 0, count: blockSize)
-        _ = SecRandomCopyBytes(kSecRandomDefault, blockSize, &prefix)
+        if let injectedPrefix, injectedPrefix.count == blockSize {
+            prefix = injectedPrefix
+        } else {
+            _ = SecRandomCopyBytes(kSecRandomDefault, blockSize, &prefix)
+        }
         prefix.append(prefix[blockSize - 2])
         prefix.append(prefix[blockSize - 1])
 
@@ -577,8 +644,10 @@ class OpenPGPPacketBuilder {
     // MARK: - v6 PKESK + SEIPDv2 (RFC 9580) — Phase V6-C
 
     /// SEIPDv2 chunk size byte: actual chunk = 2^(byte + 6) bytes (here 4096).
-    private static let seipdV2ChunkSizeByte: UInt8 = 0x06
-    private static let aeadOCB: UInt8 = 2
+    /// v8.1.0 §3a — visibility widened so the streaming v2 writer and reader
+    /// use the same constants rather than a second copy of them.
+    static let seipdV2ChunkSizeByte: UInt8 = 0x06
+    static let aeadOCB: UInt8 = 2
 
     /// RFC 9580 §5.1.6 — encrypt a session key to an X25519 recipient.
     /// HKDF-SHA256 (no salt, info "OpenPGP X25519",
@@ -644,20 +713,34 @@ class OpenPGPPacketBuilder {
         return buildNewFormatPacket(tag: 1, body: Data(body))
     }
 
-    // MARK: - Composite (RFC 9980, algorithm 35) Encrypt
+    // MARK: - Composite (RFC 9980, algorithms 35/36) Encrypt
 
-    /// A recipient's RFC 9980 ML-KEM-768 + X25519 composite encryption subkey,
-    /// parsed from its v6 public-subkey packet.
+    /// A recipient's RFC 9980 composite encryption subkey, parsed from its v6
+    /// public-subkey packet. v8.2.0 §1: `suite` selects 768+X25519 (algo 35)
+    /// or 1024+X448 (algo 36). The `x25519Public` field name is kept from the
+    /// 768-only era and holds the X448 point (56 octets) for the 1024 suite;
+    /// renaming it would churn every call site for no wire-level gain.
     struct CompositeRecipient {
         let subkeyFingerprint: [UInt8]  // 32-byte v6 fingerprint of the subkey
-        let x25519Public: [UInt8]       // 32-byte X25519 public
-        let mlkemPublic: [UInt8]        // 1184-byte ML-KEM-768 public
+        let x25519Public: [UInt8]       // ECC public: 32 (X25519) or 56 (X448)
+        let mlkemPublic: [UInt8]        // ML-KEM public: 1184 (768) or 1568 (1024)
+        let suite: CompositeSuite
+
+        init(subkeyFingerprint: [UInt8], x25519Public: [UInt8], mlkemPublic: [UInt8],
+             suite: CompositeSuite = .ietf768) {
+            self.subkeyFingerprint = subkeyFingerprint
+            self.x25519Public = x25519Public
+            self.mlkemPublic = mlkemPublic
+            self.suite = suite
+        }
     }
 
-    /// Encrypt to a single RFC 9980 composite recipient (algorithm 35). Emits a
-    /// v6 PKESK (algo 35) followed by a SEIPDv2 (AES-256-OCB) packet — the exact
+    /// Encrypt to a single RFC 9980 composite recipient (algorithm 35 or 36).
+    /// Emits a v6 PKESK followed by a SEIPDv2 (AES-256-OCB) packet, the exact
     /// inverse of OpenPGPPacketParser's composite decrypt path, and the wire
-    /// format Sequoia (sq) produces and consumes.
+    /// format Sequoia (sq) produces and consumes for the 768 suite. The 1024
+    /// layout is identical apart from the algorithm id and sizes, as
+    /// interop-proven on Android against gpg 2.5.x.
     static func buildCompositeEncryptedMessage(
         plaintext: Data,
         recipient: CompositeRecipient,
@@ -678,20 +761,22 @@ class OpenPGPPacketBuilder {
         // Composite KEM → 32-octet KEK, then RFC 3394 key-wrap the session key.
         let enc = try CompositeKEMService.encapsulate(
             mlkemPublicKey: Data(recipient.mlkemPublic),
-            ecdhPublicKey: Data(recipient.x25519Public)
+            ecdhPublicKey: Data(recipient.x25519Public),
+            suite: recipient.suite
         )
         let wrapped = try AESKeyWrap.wrap(plaintext: sessionKey, kek: Array(enc.kek))  // 40 octets
 
-        // v6 PKESK, algorithm 35: fingerprint header, then algorithm-specific
-        // ecdhCipherText(32) ‖ mlkemCipherText(1088) ‖ len(1) ‖ wrappedSessionKey.
+        // v6 PKESK, algorithm 35/36: fingerprint header, then the
+        // algorithm-specific fields at the suite's sizes:
+        // ecdhCipherText ‖ mlkemCipherText ‖ len(1) ‖ wrappedSessionKey.
         var body: [UInt8] = []
         body.append(6)                                        // PKESK version 6
         body.append(33)                                       // size of (keyVersion + fingerprint)
         body.append(6)                                        // target key version
         body.append(contentsOf: recipient.subkeyFingerprint)  // 32-byte v6 fingerprint
-        body.append(35)                                       // public-key algorithm: ML-KEM-768 + X25519
-        body.append(contentsOf: Array(enc.ecdhCipherText))    // V (32)
-        body.append(contentsOf: Array(enc.mlkemCipherText))   // ML-KEM ciphertext (1088)
+        body.append(recipient.suite.algId)                    // public-key algorithm: 35 or 36
+        body.append(contentsOf: Array(enc.ecdhCipherText))    // V (32 or 56)
+        body.append(contentsOf: Array(enc.mlkemCipherText))   // ML-KEM ciphertext (1088 or 1568)
         body.append(UInt8(wrapped.count))                     // size of wrapped session key (40)
         body.append(contentsOf: wrapped)                      // wrapped session key
         let pkesk = buildNewFormatPacket(tag: 1, body: Data(body))
@@ -724,10 +809,15 @@ class OpenPGPPacketBuilder {
         cipherAlgorithmID: UInt8,
         signingInfo: Ed25519SigningInfo? = nil,
         prebuiltSignature: (packet: [UInt8], keyID: [UInt8])? = nil,
-        filename: String? = nil
+        filename: String? = nil,
+        injectedSalt: [UInt8]? = nil,
+        injectedDate: Date? = nil
     ) throws -> Data {
         // Inner packet stream — NO random prefix and NO MDC (AEAD provides integrity).
-        let literalPacket = buildLiteralDataPacket(data: plaintext, filename: filename)
+        // v8.1.0 §3a — injectedSalt/injectedDate are TEST SEAMS matching the ones
+        // buildSEIPDPacket already carries, so the streaming v2 writer can be
+        // pinned byte-for-byte against this builder. Production omits both.
+        let literalPacket = buildLiteralDataPacket(data: plaintext, filename: filename, date: injectedDate)
         var innerPackets: [UInt8]
         if let signer = signingInfo {
             // Phase V6-D: emit v6 inline framing (OPS v6 + v6 sig, shared salt) for
@@ -778,8 +868,12 @@ class OpenPGPPacketBuilder {
 
         // 32-byte salt
         var salt = [UInt8](repeating: 0, count: 32)
-        guard SecRandomCopyBytes(kSecRandomDefault, 32, &salt) == errSecSuccess else {
-            throw PacketBuilderError.sessionKeyGenerationFailed
+        if let injectedSalt, injectedSalt.count == 32 {
+            salt = injectedSalt
+        } else {
+            guard SecRandomCopyBytes(kSecRandomDefault, 32, &salt) == errSecSuccess else {
+                throw PacketBuilderError.sessionKeyGenerationFailed
+            }
         }
 
         // HKDF → messageKey(keySize) || iv-prefix(nonceSize-8); last 8 nonce bytes
@@ -856,7 +950,15 @@ class OpenPGPPacketBuilder {
 
     /// Build a literal data packet wrapping the plaintext.
     /// Format: format(1) || filename_len(1) || filename || date(4) || data
-    private static func buildLiteralDataPacket(data: [UInt8], filename: String? = nil) -> [UInt8] {
+    /// v8.1.0 §3a — visibility widened so the streaming path and its tests
+    /// build the same literal packet rather than a second copy of the format.
+    /// - Parameter date: TEST SEAM. The literal packet embeds a 4-byte unix
+    ///   timestamp, so two calls a second apart produce different bytes. That is
+    ///   correct for production and fatal for any test comparing two
+    ///   independently built packets — it makes the comparison quietly
+    ///   time-dependent, failing more often the slower the test. Tests pass a
+    ///   fixed date; production omits it and gets the current time as before.
+    static func buildLiteralDataPacket(data: [UInt8], filename: String? = nil, date: Date? = nil) -> [UInt8] {
         var body: [UInt8] = []
 
         // Format: 'b' = binary, 't' = text
@@ -872,7 +974,7 @@ class OpenPGPPacketBuilder {
         }
 
         // Date (4 bytes — current unix timestamp)
-        let now = UInt32(Date().timeIntervalSince1970)
+        let now = UInt32((date ?? Date()).timeIntervalSince1970)
         body.append(UInt8((now >> 24) & 0xFF))
         body.append(UInt8((now >> 16) & 0xFF))
         body.append(UInt8((now >> 8) & 0xFF))
@@ -927,116 +1029,19 @@ class OpenPGPPacketBuilder {
         signingKey: Curve25519.Signing.PrivateKey,
         keyID: [UInt8],
         fingerprint: [UInt8],
-        literalBody: [UInt8]
+        literalBody: [UInt8],
+        creationTime: Date? = nil
     ) throws -> [UInt8] {
-
-        let creationTime = UInt32(Date().timeIntervalSince1970)
-
-        // Hashed subpackets
-        var hashedSubpackets: [UInt8] = []
-
-        // Signature creation time (subpacket type 2)
-        let timeSubpacket = buildSignatureSubpacket(type: 2, data: [
-            UInt8((creationTime >> 24) & 0xFF),
-            UInt8((creationTime >> 16) & 0xFF),
-            UInt8((creationTime >> 8) & 0xFF),
-            UInt8(creationTime & 0xFF)
-        ])
-        hashedSubpackets.append(contentsOf: timeSubpacket)
-
-        // Issuer fingerprint (subpacket type 33 / 0x21)
-        // Data: version(1) || fingerprint(20 for v4)
-        var fpData: [UInt8] = [4]  // V4 key
-        fpData.append(contentsOf: fingerprint)
-        let fpSubpacket = buildSignatureSubpacket(type: 33, data: fpData)
-        hashedSubpackets.append(contentsOf: fpSubpacket)
-
-        // Unhashed subpackets
-        var unhashedSubpackets: [UInt8] = []
-
-        // Issuer key ID (subpacket type 16)
-        let issuerSubpacket = buildSignatureSubpacket(type: 16, data: keyID)
-        unhashedSubpackets.append(contentsOf: issuerSubpacket)
-
-        // Build the data to hash:
-        //   literal_body || sig_trailer
-        // sig_trailer = version(4) || sigType(0x00) || pubAlgo(22) || hashAlgo(8) ||
-        //               hashedSubpacketsLen(2) || hashedSubpackets ||
-        //               v4_final_trailer(6)
-        var hashInput = Data(literalBody)
-
-        var trailer: [UInt8] = []
-        trailer.append(4)     // Version 4
-        trailer.append(0x00)  // Signature type: binary document
-        trailer.append(22)    // EdDSA
-        trailer.append(8)     // SHA-256
-
-        let hashedLen = UInt16(hashedSubpackets.count)
-        trailer.append(UInt8((hashedLen >> 8) & 0xFF))
-        trailer.append(UInt8(hashedLen & 0xFF))
-        trailer.append(contentsOf: hashedSubpackets)
-
-        hashInput.append(contentsOf: trailer)
-
-        // V4 final trailer: 0x04 0xFF + 4-byte count of hashed portion
-        let totalHashedLen = UInt32(trailer.count)
-        hashInput.append(4)
-        hashInput.append(0xFF)
-        hashInput.append(UInt8((totalHashedLen >> 24) & 0xFF))
-        hashInput.append(UInt8((totalHashedLen >> 16) & 0xFF))
-        hashInput.append(UInt8((totalHashedLen >> 8) & 0xFF))
-        hashInput.append(UInt8(totalHashedLen & 0xFF))
-
-        // Hash with SHA-256
-        let digest = SHA256.hash(data: hashInput)
-        let digestBytes = Array(digest)
-
-        // Sign the digest (OpenPGP EdDSA signs the hash, not the raw data)
-        let signature: Data
-        do {
-            signature = try signingKey.signature(for: Data(digestBytes))
-        } catch {
-            throw PacketBuilderError.signingFailed(error.localizedDescription)
-        }
-        let sigBytes = Array(signature)
-
-        // Assemble signature packet body
-        var sigBody: [UInt8] = []
-        sigBody.append(4)     // Version
-        sigBody.append(0x00)  // Binary document
-        sigBody.append(22)    // EdDSA
-        sigBody.append(8)     // SHA-256
-
-        // Hashed subpackets
-        sigBody.append(UInt8((hashedLen >> 8) & 0xFF))
-        sigBody.append(UInt8(hashedLen & 0xFF))
-        sigBody.append(contentsOf: hashedSubpackets)
-
-        // Unhashed subpackets
-        let unhashedLen = UInt16(unhashedSubpackets.count)
-        sigBody.append(UInt8((unhashedLen >> 8) & 0xFF))
-        sigBody.append(UInt8(unhashedLen & 0xFF))
-        sigBody.append(contentsOf: unhashedSubpackets)
-
-        // Left 16 bits of hash (for quick check)
-        sigBody.append(digestBytes[0])
-        sigBody.append(digestBytes[1])
-
-        // EdDSA signature: two MPIs (R and S, each 32 bytes)
-        let rBytes = Array(sigBytes[0..<32])
-        let sBytes = Array(sigBytes[32..<64])
-
-        let rBits = UInt16(rBytes.count * 8 - countLeadingZeroBits(rBytes))
-        sigBody.append(UInt8((rBits >> 8) & 0xFF))
-        sigBody.append(UInt8(rBits & 0xFF))
-        sigBody.append(contentsOf: rBytes)
-
-        let sBits = UInt16(sBytes.count * 8 - countLeadingZeroBits(sBytes))
-        sigBody.append(UInt8((sBits >> 8) & 0xFF))
-        sigBody.append(UInt8(sBits & 0xFF))
-        sigBody.append(contentsOf: sBytes)
-
-        return buildNewFormatPacketBytes(tag: 2, body: sigBody)
+        // v8.1.0 §3a — delegates to StreamingBinarySigner rather than keeping a
+        // second copy of the subpacket layout and hashed trailer. The signature
+        // over a whole buffer is the streaming case with exactly one update, so
+        // there is no reason for two implementations — and two would eventually
+        // disagree by a byte, producing signatures nothing accepts.
+        let signer = StreamingBinarySigner(
+            signingKey: signingKey, keyID: keyID, fingerprint: fingerprint, creationTime: creationTime
+        )
+        signer.update(literalBody)
+        return try signer.finish()
     }
 
     // MARK: - v6 inline signing (RFC 9580) — Phase V6-D
@@ -1150,7 +1155,7 @@ class OpenPGPPacketBuilder {
     }
 
     /// Build a signature subpacket: length(1-2) || type(1) || data
-    private static func buildSignatureSubpacket(type: UInt8, data: [UInt8]) -> [UInt8] {
+    static func buildSignatureSubpacket(type: UInt8, data: [UInt8]) -> [UInt8] {
         var subpacket: [UInt8] = []
         let totalLen = data.count + 1  // +1 for type byte
 
@@ -1179,7 +1184,10 @@ class OpenPGPPacketBuilder {
     ///   3. Feedback register = previous ciphertext block (standard CFB)
     ///
     /// This matches the decrypt side in OpenPGPPacketParser.openPGPCFBDecrypt.
-    private static func openPGPCFBEncrypt(
+    /// v8.1.0 §3a — visibility widened so tests can pin the STREAMING
+    /// encryptor against this shipping one-shot implementation byte for byte.
+    /// This remains the reference; the streaming version must agree with it.
+    static func openPGPCFBEncrypt(
         plaintext: [UInt8],
         key: [UInt8],
         algorithmID: UInt8
@@ -1267,7 +1275,10 @@ class OpenPGPPacketBuilder {
 
     // MARK: - Crypto Helpers
 
-    private static func aesECBBlock(input: [UInt8], key: [UInt8]) throws -> [UInt8] {
+    /// v8.1.0 §3a — visibility widened from `private` so the streaming CFB
+    /// encryptor can share the exact same primitive rather than owning a second
+    /// copy of it. Two implementations of a cipher core is how they drift.
+    static func aesECBBlock(input: [UInt8], key: [UInt8]) throws -> [UInt8] {
         var output = [UInt8](repeating: 0, count: 32) // Extra space for CCCrypt
         var outLen = 0
 
@@ -1287,14 +1298,14 @@ class OpenPGPPacketBuilder {
         return Array(output[0..<16])
     }
 
-    private static func cipherBlockSize(for algorithmID: UInt8) throws -> Int {
+    static func cipherBlockSize(for algorithmID: UInt8) throws -> Int {
         switch algorithmID {
         case 7, 8, 9: return 16  // AES-128/192/256 all use 128-bit blocks
         default: throw PacketBuilderError.encryptionFailed("Unsupported cipher: \(algorithmID)")
         }
     }
 
-    private static func countLeadingZeroBits(_ bytes: [UInt8]) -> Int {
+    static func countLeadingZeroBits(_ bytes: [UInt8]) -> Int {
         for (i, byte) in bytes.enumerated() {
             if byte != 0 {
                 return i * 8 + byte.leadingZeroBitCount
@@ -1331,5 +1342,113 @@ class OpenPGPPacketBuilder {
             UInt8((crc >> 8) & 0xFF),
             UInt8(crc & 0xFF)
         ]
+    }
+
+    // MARK: - v8.2.0 §3f streaming armor
+
+    /// Incremental CRC-24 (RFC 4880 §6.1) for streaming armor: seed once,
+    /// update per chunk, finalize to the three checksum octets. The scalar loop
+    /// is identical to the one in `crc24`, split so a large message can be
+    /// checksummed as it streams past instead of held whole.
+    struct StreamingCRC24 {
+        // Table-driven (one lookup per byte, not eight shift-and-test loops),
+        // generated from the same bit loop `crc24` uses. StreamingArmorTests
+        // cross-checks the streamed CRC against `armorMessage`'s on the same
+        // bytes, so this optimization can't silently diverge from the wire CRC.
+        private static let table: [UInt32] = {
+            var t = [UInt32](repeating: 0, count: 256)
+            for i in 0..<256 {
+                var crc = UInt32(i) << 16
+                for _ in 0..<8 {
+                    crc <<= 1
+                    if crc & 0x1000000 != 0 { crc ^= 0x1864CFB }
+                }
+                t[i] = crc & 0xFFFFFF
+            }
+            return t
+        }()
+        private var crc: UInt32 = 0xB704CE
+        mutating func update(_ bytes: Data) {
+            var c = crc
+            for byte in bytes {
+                c = ((c << 8) ^ Self.table[Int(((c >> 16) ^ UInt32(byte)) & 0xFF)]) & 0xFFFFFF
+            }
+            crc = c
+        }
+        func finalize() -> [UInt8] {
+            let c = crc & 0xFFFFFF
+            return [UInt8((c >> 16) & 0xFF), UInt8((c >> 8) & 0xFF), UInt8(c & 0xFF)]
+        }
+    }
+
+    /// §3f — write the OpenPGP message at `binaryURL` as ASCII armor into an
+    /// already-open `output`, streaming. The file is read in bounded chunks and
+    /// base64-encoded in 57-byte units (one 76-char line each; 57 is a multiple
+    /// of 3 so no intermediate padding), and the CRC-24 is accumulated across
+    /// the stream, so neither the message nor its armor is ever held whole.
+    /// `nl` is "\n" for a standalone .asc and "\r\n" when writing inside a MIME
+    /// part. The result is a valid armored `PGP MESSAGE`, semantically identical
+    /// to `armorMessage` (locked by StreamingArmorTests' de-armor round trip);
+    /// the user Comment header is omitted so the streamed output is
+    /// deterministic and self-contained.
+    static func streamArmoredMessage(
+        binaryAt binaryURL: URL,
+        to output: FileHandle,
+        lineEnding nl: String,
+        progress: ((Int) -> Void)? = nil
+    ) throws {
+        let input = try FileHandle(forReadingFrom: binaryURL)
+        defer { try? input.close() }
+        func w(_ s: String) throws { try output.write(contentsOf: Data(s.utf8)) }
+
+        try w("-----BEGIN PGP MESSAGE-----\(nl)\(nl)")
+
+        let lineBytes = 57
+        let chunkBytes = lineBytes * 3000
+        let nlData = Data(nl.utf8)
+        var carry = Data()
+        var crc = StreamingCRC24()
+        var read = 0
+
+        // Encode one 57-byte block into a 76-char base64 line and append it,
+        // with its terminator, to the per-read output buffer. Batching a whole
+        // read's worth of lines into one write is the fix for the export stall:
+        // a write per line is a syscall, and a large message has millions.
+        func encode(_ block: Data, into out: inout Data) {
+            crc.update(block)
+            out.append(Data(block.base64EncodedString().utf8))
+            out.append(nlData)
+        }
+
+        while let chunk = try input.read(upToCount: chunkBytes), !chunk.isEmpty {
+            read += chunk.count
+            carry.append(chunk)
+            var out = Data()
+            var offset = 0
+            while carry.count - offset >= lineBytes {
+                encode(carry.subdata(in: offset..<(offset + lineBytes)), into: &out)
+                offset += lineBytes
+            }
+            if offset > 0 { carry = carry.subdata(in: offset..<carry.count) }
+            if !out.isEmpty { try output.write(contentsOf: out) }
+            progress?(read)
+        }
+        if !carry.isEmpty {
+            var out = Data()
+            encode(carry, into: &out)
+            try output.write(contentsOf: out)
+        }
+
+        let crcB64 = Data(crc.finalize()).base64EncodedString()
+        try w("=\(crcB64)\(nl)-----END PGP MESSAGE-----\(nl)")
+    }
+
+    /// Stream the OpenPGP message at `binaryURL` to a standalone armored `.asc`
+    /// file at `output` (LF line endings), never holding the message.
+    static func streamArmoredFile(binaryAt binaryURL: URL, to output: URL, progress: ((Int) -> Void)? = nil) throws {
+        FileManager.default.createFile(atPath: output.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: output)
+        defer { try? handle.close() }
+        try streamArmoredMessage(binaryAt: binaryURL, to: handle, lineEnding: "\n", progress: progress)
     }
 }

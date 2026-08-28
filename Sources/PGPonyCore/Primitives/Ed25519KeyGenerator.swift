@@ -101,7 +101,8 @@ class Ed25519KeyGenerator {
         email: String,
         passphrase: String?,
         expirationInterval: TimeInterval?,
-        pqcEncryption: Bool = false
+        pqcEncryption: Bool = false,
+        pqcSuite: LibrePGPSuite = .ky768_cv25519
     ) throws -> Ed25519KeyGeneratorResult {
 
         let creationTime = UInt32(Date().timeIntervalSince1970)
@@ -119,19 +120,30 @@ class Ed25519KeyGenerator {
         let encryptionPublicBytes = Array(encryptionKey.publicKey.rawRepresentation)
         let encryptionPrivateBytes = Array(encryptionKey.rawRepresentation)
 
-        // For the PQC variant: a fresh ML-KEM-768 keypair, stored as its 64-octet
-        // seed (d‖z) alongside the raw X25519 secret.
+        // For the PQC variant: a fresh ML-KEM keypair at the suite's level,
+        // stored as its 64-octet seed (d‖z) alongside the raw ECC secret.
+        // v8.2.0 §1 (K2a): ky1024_cv448 pairs ML-KEM-1024 with an X448
+        // keypair from the hand-rolled curve; the Curve25519 keypair above
+        // then goes unused by the subkey.
         var mlkemSeed: [UInt8] = []
         var mlkemPublic: [UInt8] = []
+        var pqcEccPublic: [UInt8] = encryptionPublicBytes
+        var pqcEccPrivate: [UInt8] = encryptionPrivateBytes
         if pqcEncryption {
             var seed = [UInt8](repeating: 0, count: 64)
             guard SecRandomCopyBytes(kSecRandomDefault, 64, &seed) == errSecSuccess else {
                 throw NSError(domain: "PGPony.Ed25519KeyGen", code: 3,
                               userInfo: [NSLocalizedDescriptionKey: "Random generation failed"])
             }
-            let (pub, _) = try MLKEMService.generateKeyPair(seed: Data(seed))
+            let (pub, _) = try MLKEMService.generateKeyPair(seed: Data(seed),
+                                                           level: pqcSuite.mlkemLevel)
             mlkemSeed = seed
             mlkemPublic = Array(pub)
+            if pqcSuite == .ky1024_cv448 {
+                let x448Priv = try X448.generatePrivateKey()
+                pqcEccPublic = [UInt8](try X448.publicKey(for: x448Priv))
+                pqcEccPrivate = [UInt8](x448Priv)
+            }
         }
         
         // Build primary public key packet body
@@ -161,8 +173,9 @@ class Ed25519KeyGenerator {
         // Build encryption subkey packet body — Cv25519 (v4) or Kyber (v5).
         let subkeyPubBody = pqcEncryption
             ? buildKyberPublicKeyBody(creationTime: creationTime,
-                                      x25519Public: encryptionPublicBytes,
-                                      mlkemPublic: mlkemPublic)
+                                      x25519Public: pqcEccPublic,
+                                      mlkemPublic: mlkemPublic,
+                                      suite: pqcSuite)
             : buildECDHPublicKeyBody(creationTime: creationTime,
                                      publicKey: encryptionPublicBytes)
 
@@ -194,7 +207,7 @@ class Ed25519KeyGenerator {
         
         let subkeySecretBody = pqcEncryption
             ? buildKyberSecretKeyBody(publicBody: subkeyPubBody,
-                                      x25519Private: encryptionPrivateBytes,
+                                      x25519Private: pqcEccPrivate,
                                       mlkemSeed: mlkemSeed,
                                       passphrase: passphrase)
             : buildECDHSecretKeyBody(publicBody: subkeyPubBody,
@@ -276,23 +289,45 @@ class Ed25519KeyGenerator {
     // MARK: - v5 Kyber (ML-KEM-768 + X25519) subkey — LibrePGP algorithm 8
 
     /// Build a v5 public-key packet body for the GnuPG LibrePGP Kyber composite
-    /// (algorithm 8). Byte layout matches GnuPG 2.5.x exactly:
+    /// (algorithm 8). Byte layout matches GnuPG 2.5.x:
     ///   ver(1)=5 | ctime(4) | algo(1)=8 | keyMatLen(4 BE)
-    ///     | OID(len(1)=3 ‖ 2b 65 6e)                       — X25519 native
-    ///     | ecc point SOS(bit-len(2)=0x0107 ‖ 0x40 ‖ X25519 public(32))
-    ///     | mlkemLen(4 BE)=1184 ‖ ML-KEM-768 public(1184)
+    ///     | OID(len(1)=3 ‖ curve OID)
+    ///     | ecc point (see below)
+    ///     | mlkemLen(4 BE) ‖ ML-KEM public
+    ///
+    /// v8.2.0 §1 (K2a): the point encoding differs BY DESIGN between suites.
+    ///   768: the 0x40-prefixed fixed 263-bit SOS this generator has always
+    ///        written, kept byte-identical so existing keys and fixtures do
+    ///        not change under this refactor. Whether current gpg 2.5.x still
+    ///        accepts this form is exactly what the §0/K3 gate tests; Android
+    ///        found its equivalent encoding rejected and moved to minimal
+    ///        MPIs, so if the gate fails, this branch adopts the minimal
+    ///        form too (plus a regeneration advisory).
+    ///  1024: bare minimal MPI, NO 0x40 prefix, NOT fixed-width. Both points
+    ///        matter, each found by Android via live gpg interop: a prefixed
+    ///        point fails gpg encryption ("pubkey_encrypt: Invalid data"),
+    ///        and a fixed-width point with a leading zero makes gpg
+    ///        canonicalize during binding-signature verification and drop
+    ///        the subkey. gpg's KEM left-pads a short MPI back to the curve
+    ///        length, so minimal still decodes correctly.
     static func buildKyberPublicKeyBody(creationTime: UInt32,
                                         x25519Public: [UInt8],
-                                        mlkemPublic: [UInt8]) -> [UInt8] {
+                                        mlkemPublic: [UInt8],
+                                        suite: LibrePGPSuite = .ky768_cv25519) -> [UInt8] {
         var keyMat: [UInt8] = []
-        keyMat.append(UInt8(x25519NativeOID.count))       // 0x03
-        keyMat.append(contentsOf: x25519NativeOID)        // 2b 65 6e
-        // X25519 KEM point: 0x40 native-point prefix + 32 octets, as a fixed
-        // 263-bit SOS (the 0x40 top byte pins the bit length at 263).
-        keyMat.append(0x01); keyMat.append(0x07)          // bit length 263
-        keyMat.append(0x40)
-        keyMat.append(contentsOf: x25519Public)
-        // ML-KEM-768 public key: 4-octet length prefix.
+        keyMat.append(UInt8(suite.oidTail.count))         // 0x03
+        keyMat.append(contentsOf: suite.oidTail)          // 2b 65 6e / 2b 65 6f
+        switch suite {
+        case .ky768_cv25519:
+            // X25519 KEM point: 0x40 native-point prefix + 32 octets, as a
+            // fixed 263-bit SOS (the 0x40 top byte pins the bit length).
+            keyMat.append(0x01); keyMat.append(0x07)      // bit length 263
+            keyMat.append(0x40)
+            keyMat.append(contentsOf: x25519Public)
+        case .ky1024_cv448:
+            keyMat.append(contentsOf: canonicalMPI(x25519Public))
+        }
+        // ML-KEM public key: 4-octet length prefix.
         let n = UInt32(mlkemPublic.count)
         keyMat.append(contentsOf: n.bigEndianBytes)
         keyMat.append(contentsOf: mlkemPublic)
@@ -499,7 +534,9 @@ class Ed25519KeyGenerator {
     }
     
     /// Derive encryption key from passphrase using Iterated+Salted S2K (RFC 4880 §3.7.1.3)
-    private static func deriveS2KKey(
+    /// Internal (not private) so ClassicalSubkeyGen protects a new RSA subkey's
+    /// multi-MPI secret with the exact same vetted derivation this generator uses.
+    static func deriveS2KKey(
         passphrase: String,
         salt: [UInt8],
         codedCount: UInt8,
@@ -546,7 +583,10 @@ class Ed25519KeyGenerator {
     }
     
     /// AES-128 CFB encryption (OpenPGP style — no padding, byte-aligned)
-    private static func aesCFBEncrypt(plaintext: [UInt8], key: [UInt8], iv: [UInt8]) -> [UInt8] {
+    /// Internal (not private) so ClassicalSubkeyGen encrypts a new RSA subkey's
+    /// protected secret with the identical CFB writer, keeping the bytes in
+    /// agreement with PGPService's RSA secret-key parser.
+    static func aesCFBEncrypt(plaintext: [UInt8], key: [UInt8], iv: [UInt8]) -> [UInt8] {
         var ciphertext = [UInt8](repeating: 0, count: plaintext.count)
         var currentIV = iv
         

@@ -243,8 +243,8 @@ class OpenPGPPacketParser {
                 }
             }
 
-            // V6 PKESK with algo 35 (ML-KEM-768 + X25519) — composite PQC path
-            if pkesk.version == 6 && pkesk.algorithm == 35 {
+            // V6 PKESK with algo 35/36, the ML-KEM composite PQC path
+            if pkesk.version == 6 && CompositeSuite.from(algId: pkesk.algorithm) != nil {
                 if let sk = CompositeKEMPacket.trySessionKey(pkesk: pkesk, keys: compositeKeys) {
                     sessionAlgorithmID = seipd.cipherAlgorithm != 0 ? seipd.cipherAlgorithm : 9
                     sessionKey = sk
@@ -271,11 +271,19 @@ class OpenPGPPacketParser {
             )
         }
 
-        let innerPackets = try parsePackets(data: plaintext)
-        let literalData = (try? extractLiteralData(from: innerPackets)) ?? nil
+        // v8.1.1 — flatten any Compressed Data (tag 8) packet before searching
+        // for a signature or extracting literal data. A compressed+signed
+        // message nests OnePassSig/Literal/Signature INSIDE the compressed
+        // packet, not as top-level siblings — the previous top-level-only scan
+        // reported every compressed, signed message as unsigned, and silently
+        // returned the raw undecompressed bytes as "plaintext" whenever
+        // extraction failed (e.g. an unsupported compression algorithm),
+        // instead of surfacing the error like the file-decrypt path does.
+        let innerPackets = flattenCompressedPackets(try parsePackets(data: plaintext))
+        let literalData = try extractLiteralData(from: innerPackets) ?? Data()
 
         return DecryptedMessageContents(
-            literalData: literalData ?? Data(plaintext),
+            literalData: literalData,
             innerPackets: innerPackets
         )
     }
@@ -285,50 +293,25 @@ class OpenPGPPacketParser {
         let innerPackets: [ParsedPacket]
     }
 
-    /// Original entry point, preserved for callers that don't care about
-    /// signature packets. Returns only the literal data content (compression
-    /// transparently handled).
-    static func decryptMessage(
-        messageData: Data,
+    /// Recover the session key from a message's PKESK packets.
+    ///
+    /// v8.1.0 §3a — lifted out of `decryptMessage` unchanged so the streaming
+    /// large-file path can reuse it. That path reads only the FRONT of the file
+    /// (PKESKs are small by construction) and must not parse the encrypted
+    /// packet's body, which is the whole point — so it cannot call
+    /// `decryptMessage`, but it must not reimplement this either. Two
+    /// implementations of "which key opens this message" would diverge, and the
+    /// symptom would be a file that decrypts at one size and not another.
+    ///
+    /// - Parameter seipdCipherAlgorithm: from the SEIPD v2 header, or 0 when the
+    ///   caller has not parsed one. Only the v6 branches consult it; SEIPD v1
+    ///   carries the algorithm in the PKESK itself.
+    static func recoverSessionKey(
+        pkeskPackets: [ParsedPKESK],
+        seipdCipherAlgorithm: UInt8,
         decryptionKeys: [Cv25519DecryptionKey],
         compositeKeys: [CompositeKEMPacket.DecryptionKey] = []
-    ) throws -> Data {
-
-        // 1. Parse all packets
-        pgpDebugLog("DEBUG Parser: raw message data size = \(messageData.count) bytes")
-        let packets = try parsePackets(data: Array(messageData))
-
-        // 2. Extract PKESK and SEIPD packets
-        var pkeskPackets: [ParsedPKESK] = []
-        var seipdPacket: ParsedSEIPD?
-
-        for packet in packets {
-            switch packet.tag {
-            case 1:
-                if let pkesk = try? parsePKESK(body: packet.body) {
-                    pkeskPackets.append(pkesk)
-                }
-            case 18:
-                // SEIPD v1 (CFB+MDC) or v2 (AEAD with HKDF)
-                seipdPacket = try parseSEIPD(body: packet.body)
-                pgpDebugLog("DEBUG Parser: SEIPD tag 18, version=\(seipdPacket?.version ?? 0), body size = \(packet.body.count), encrypted data size = \(seipdPacket?.encryptedData.count ?? -1)")
-            case 20:
-                // Tag 20: AEAD Encrypted Data (GnuPG 2.4.x legacy AEAD format)
-                // Structure: version(1) | cipher(1) | aead(1) | chunkSizeByte(1) | nonce(N) | encrypted_data
-                // This is different from SEIPDv2: no 32-byte salt, session key used directly, nonce in packet
-                seipdPacket = try parseAEADEncryptedData(body: packet.body)
-                pgpDebugLog("DEBUG Parser: AEAD tag 20, cipher=\(seipdPacket?.cipherAlgorithm ?? 0), aead=\(seipdPacket?.aeadAlgorithm ?? 0), encrypted data size = \(seipdPacket?.encryptedData.count ?? -1)")
-            default:
-                continue
-            }
-        }
-
-        guard !pkeskPackets.isEmpty else {
-            throw PacketParserError.noPKESKFound
-        }
-        guard let seipd = seipdPacket else {
-            throw PacketParserError.noSEIPDFound
-        }
+    ) throws -> (algorithmID: UInt8, sessionKey: [UInt8]) {
 
         // 3. Try to decrypt session key with available keys
         var sessionAlgorithmID: UInt8?
@@ -376,7 +359,7 @@ class OpenPGPPacketParser {
                                 recipientFingerprint: key.subkeyFingerprint
                             )
                             // V6 PKESK: the session key algo comes from the SEIPD v2 header, not the PKESK
-                            sessionAlgorithmID = seipd.cipherAlgorithm != 0 ? seipd.cipherAlgorithm : result.algorithmID
+                            sessionAlgorithmID = seipdCipherAlgorithm != 0 ? seipdCipherAlgorithm : result.algorithmID
                             sessionKey = result.sessionKey
                             break
                         } catch {
@@ -387,12 +370,12 @@ class OpenPGPPacketParser {
                 }
             }
 
-            // V6 PKESK with algo 35 (ML-KEM-768 + X25519) — composite PQC path
-            if pkesk.version == 6 && pkesk.algorithm == 35 {
-                pgpDebugLog("DEBUG Parser: PKESK v6 ML-KEM+X25519 targets key ID = \(pkesk.keyID.map { String(format: "%02x", $0) }.joined())")
+            // V6 PKESK with algo 35/36, the ML-KEM composite PQC path
+            if pkesk.version == 6 && CompositeSuite.from(algId: pkesk.algorithm) != nil {
+                pgpDebugLog("DEBUG Parser: PKESK v6 ML-KEM composite (algo \(pkesk.algorithm)) targets key ID = \(pkesk.keyID.map { String(format: "%02x", $0) }.joined())")
                 if let sk = CompositeKEMPacket.trySessionKey(pkesk: pkesk, keys: compositeKeys) {
                     // V6 PKESK: the session-key cipher comes from the SEIPD v2 header.
-                    sessionAlgorithmID = seipd.cipherAlgorithm != 0 ? seipd.cipherAlgorithm : 9
+                    sessionAlgorithmID = seipdCipherAlgorithm != 0 ? seipdCipherAlgorithm : 9
                     sessionKey = sk
                 }
             }
@@ -403,6 +386,62 @@ class OpenPGPPacketParser {
         guard let algID = sessionAlgorithmID, let sKey = sessionKey else {
             throw PacketParserError.noMatchingKey
         }
+
+        return (algID, sKey)
+    }
+
+    /// Original entry point, preserved for callers that don't care about
+    /// signature packets. Returns only the literal data content (compression
+    /// transparently handled).
+    static func decryptMessage(
+        messageData: Data,
+        decryptionKeys: [Cv25519DecryptionKey],
+        compositeKeys: [CompositeKEMPacket.DecryptionKey] = []
+    ) throws -> Data {
+
+        // 1. Parse all packets
+        pgpDebugLog("DEBUG Parser: raw message data size = \(messageData.count) bytes")
+        let packets = try parsePackets(data: Array(messageData))
+
+        // 2. Extract PKESK and SEIPD packets
+        var pkeskPackets: [ParsedPKESK] = []
+        var seipdPacket: ParsedSEIPD?
+
+        for packet in packets {
+            switch packet.tag {
+            case 1:
+                if let pkesk = try? parsePKESK(body: packet.body) {
+                    pkeskPackets.append(pkesk)
+                }
+            case 18:
+                // SEIPD v1 (CFB+MDC) or v2 (AEAD with HKDF)
+                seipdPacket = try parseSEIPD(body: packet.body)
+                pgpDebugLog("DEBUG Parser: SEIPD tag 18, version=\(seipdPacket?.version ?? 0), body size = \(packet.body.count), encrypted data size = \(seipdPacket?.encryptedData.count ?? -1)")
+            case 20:
+                // Tag 20: AEAD Encrypted Data (GnuPG 2.4.x legacy AEAD format)
+                // Structure: version(1) | cipher(1) | aead(1) | chunkSizeByte(1) | nonce(N) | encrypted_data
+                // This is different from SEIPDv2: no 32-byte salt, session key used directly, nonce in packet
+                seipdPacket = try parseAEADEncryptedData(body: packet.body)
+                pgpDebugLog("DEBUG Parser: AEAD tag 20, cipher=\(seipdPacket?.cipherAlgorithm ?? 0), aead=\(seipdPacket?.aeadAlgorithm ?? 0), encrypted data size = \(seipdPacket?.encryptedData.count ?? -1)")
+            default:
+                continue
+            }
+        }
+
+        guard !pkeskPackets.isEmpty else {
+            throw PacketParserError.noPKESKFound
+        }
+        guard let seipd = seipdPacket else {
+            throw PacketParserError.noSEIPDFound
+        }
+
+        // 3. Recover the session key. Shared with the streaming large-file path.
+        let (algID, sKey) = try recoverSessionKey(
+            pkeskPackets: pkeskPackets,
+            seipdCipherAlgorithm: seipd.cipherAlgorithm,
+            decryptionKeys: decryptionKeys,
+            compositeKeys: compositeKeys
+        )
         
         pgpDebugLog("DEBUG Parser: session algorithm ID = \(algID) (7=AES128, 8=AES192, 9=AES256)")
         pgpDebugLog("DEBUG Parser: session key size = \(sKey.count) bytes")
@@ -483,10 +522,12 @@ class OpenPGPPacketParser {
             kdfCipherID: kdfCipherID,
             provideSharedSecret: provideSharedSecret
         )
-        let innerPackets = try parsePackets(data: plaintext)
-        let literalData = (try? extractLiteralData(from: innerPackets)) ?? nil
+        // v8.1.1 — flatten compressed packets before signature search / literal
+        // extraction; see the comment in decryptMessageReturningInnerPackets.
+        let innerPackets = flattenCompressedPackets(try parsePackets(data: plaintext))
+        let literalData = try extractLiteralData(from: innerPackets) ?? Data()
         return DecryptedMessageContents(
-            literalData: literalData ?? Data(plaintext),
+            literalData: literalData,
             innerPackets: innerPackets
         )
     }
@@ -579,6 +620,83 @@ class OpenPGPPacketParser {
         }
 
         return plaintext
+    }
+
+    // MARK: - Session-key-only card recovery (large-file streaming, #21)
+
+    /// Recover the session key on the card WITHOUT decrypting the body, so a
+    /// large file can be streamed from disk instead of held in memory. Takes the
+    /// PKESK packets already parsed from the file head. The card performs one
+    /// PSO:DECIPHER via `provideSharedSecret`; the RFC 6637 KDF and AES key-unwrap
+    /// run host-side through the same helper as `decryptMessageOnCardRaw`. This is
+    /// exactly the session-key half of that function, stopping before bulk
+    /// decryption. Scope: v3 PKESK / algo 18 (Cv25519), what OpenPGP cards expose.
+    static func recoverSessionKeyOnCard(
+        pkeskPackets: [ParsedPKESK],
+        recipientSubkeyID: [UInt8],
+        recipientFingerprint: [UInt8],
+        kdfHashID: UInt8,
+        kdfCipherID: UInt8,
+        provideSharedSecret: (_ ephemeralPublicKey: [UInt8]) async throws -> [UInt8]
+    ) async throws -> (algorithmID: UInt8, sessionKey: [UInt8]) {
+        guard !pkeskPackets.isEmpty else { throw PacketParserError.noPKESKFound }
+        var firstCardError: Error?
+        for pkesk in pkeskPackets {
+            guard pkesk.version == 3, pkesk.algorithm == 18 else { continue }
+            guard pkesk.keyID == recipientSubkeyID
+                  || pkesk.keyID == [UInt8](repeating: 0, count: 8) else { continue }
+            let shared: [UInt8]
+            do {
+                shared = try await provideSharedSecret(pkesk.ephemeralPublicKey)
+            } catch {
+                if firstCardError == nil { firstCardError = error }
+                continue
+            }
+            do {
+                let result = try Cv25519ECDHService.sessionKeyFromSharedSecret(
+                    sharedSecret: shared,
+                    wrappedSessionKey: pkesk.wrappedSessionKey,
+                    recipientFingerprint: recipientFingerprint,
+                    kdfHashID: kdfHashID,
+                    kdfCipherID: kdfCipherID
+                )
+                return (result.algorithmID, result.sessionKey)
+            } catch {
+                continue
+            }
+        }
+        throw firstCardError ?? PacketParserError.noMatchingKey
+    }
+
+    /// RSA sibling of `recoverSessionKeyOnCard`. The card performs one RSA
+    /// PSO:DECIPHER via `provideSessionKeyBlock`; the returned block is parsed
+    /// host-side. Scope: v3 PKESK / algo 1 (RSA card keys).
+    static func recoverSessionKeyOnCardRSA(
+        pkeskPackets: [ParsedPKESK],
+        recipientKeyID: [UInt8],
+        provideSessionKeyBlock: (_ cryptogram: [UInt8]) async throws -> [UInt8]
+    ) async throws -> (algorithmID: UInt8, sessionKey: [UInt8]) {
+        guard !pkeskPackets.isEmpty else { throw PacketParserError.noPKESKFound }
+        var firstCardError: Error?
+        for pkesk in pkeskPackets {
+            guard pkesk.version == 3, pkesk.algorithm == 1 else { continue }
+            guard pkesk.keyID == recipientKeyID
+                  || pkesk.keyID == [UInt8](repeating: 0, count: 8) else { continue }
+            let block: [UInt8]
+            do {
+                block = try await provideSessionKeyBlock(pkesk.rsaCipher)
+            } catch {
+                if firstCardError == nil { firstCardError = error }
+                continue
+            }
+            do {
+                let result = try parseCardSessionKeyBlock(block)
+                return (result.algorithmID, result.sessionKey)
+            } catch {
+                continue
+            }
+        }
+        throw firstCardError ?? PacketParserError.noMatchingKey
     }
 
     // MARK: - RSA hardware-key decrypt (HW-R3)
@@ -709,10 +827,12 @@ class OpenPGPPacketParser {
             recipientKeyID: recipientKeyID,
             provideSessionKeyBlock: provideSessionKeyBlock
         )
-        let innerPackets = try parsePackets(data: plaintext)
-        let literalData = (try? extractLiteralData(from: innerPackets)) ?? nil
+        // v8.1.1 — flatten compressed packets before signature search / literal
+        // extraction; see the comment in decryptMessageReturningInnerPackets.
+        let innerPackets = flattenCompressedPackets(try parsePackets(data: plaintext))
+        let literalData = try extractLiteralData(from: innerPackets) ?? Data()
         return DecryptedMessageContents(
-            literalData: literalData ?? Data(),
+            literalData: literalData,
             innerPackets: innerPackets
         )
     }
@@ -733,6 +853,7 @@ class OpenPGPPacketParser {
                 case 0: decompressed = compressed
                 case 1: decompressed = try? zlibDecompress(compressed, rawDeflate: true)
                 case 2: decompressed = try? zlibDecompress(compressed, rawDeflate: false)
+                case 3: decompressed = try? BZip2Decompressor.decompress(compressed)
                 default: decompressed = nil
                 }
                 if let dec = decompressed, let inner = try? parsePackets(data: dec) {
@@ -777,10 +898,12 @@ class OpenPGPPacketParser {
                 algorithmID: cipherAlgorithmID)
         }
 
-        let innerPackets = try parsePackets(data: plaintext)
-        let literalData = (try? extractLiteralData(from: innerPackets)) ?? nil
+        // v8.1.1 — flatten compressed packets before signature search / literal
+        // extraction; see the comment in decryptMessageReturningInnerPackets.
+        let innerPackets = flattenCompressedPackets(try parsePackets(data: plaintext))
+        let literalData = try extractLiteralData(from: innerPackets) ?? Data()
         return DecryptedMessageContents(
-            literalData: literalData ?? Data(plaintext),
+            literalData: literalData,
             innerPackets: innerPackets)
     }
 
@@ -845,8 +968,8 @@ class OpenPGPPacketParser {
         // Flatten any Compressed packet so the tag-2 signature (ObjectivePGP
         // compresses the signed content) is visible to introspection.
         let innerPackets = flattenCompressedPackets(try parsePackets(data: plaintext))
-        let literalData = (try? extractLiteralData(from: innerPackets)) ?? nil
-        return DecryptedMessageContents(literalData: literalData ?? Data(), innerPackets: innerPackets)
+        let literalData = try extractLiteralData(from: innerPackets) ?? Data()
+        return DecryptedMessageContents(literalData: literalData, innerPackets: innerPackets)
     }
 
     /// List the recipient key IDs (PKESK, tag 1) in a message, so the UI can tell
@@ -875,33 +998,7 @@ class OpenPGPPacketParser {
 
             case 8:
                 // Compressed data packet — decompress, then parse inner packets
-                guard !packet.body.isEmpty else {
-                    throw PacketParserError.decompressionFailed("Empty compressed packet")
-                }
-                let compressionAlgo = packet.body[0]
-                let compressedData = Array(packet.body[1...])
-                pgpDebugLog("DEBUG Parser: compressed packet, algo=\(compressionAlgo) (0=none, 1=ZIP, 2=ZLIB, 3=BZip2), compressed size=\(compressedData.count)")
-
-                let decompressedData: [UInt8]
-                switch compressionAlgo {
-                case 0:
-                    // Uncompressed
-                    decompressedData = compressedData
-                case 1:
-                    // ZIP (raw DEFLATE, RFC 1951 — no zlib header/trailer)
-                    decompressedData = try zlibDecompress(compressedData, rawDeflate: true)
-                case 2:
-                    // ZLIB (RFC 1950 — has zlib header/trailer)
-                    decompressedData = try zlibDecompress(compressedData, rawDeflate: false)
-                case 3:
-                    throw PacketParserError.unsupportedCompression(3)  // BZip2 not supported
-                default:
-                    throw PacketParserError.unsupportedCompression(compressionAlgo)
-                }
-                pgpDebugLog("DEBUG Parser: decompressed \(compressedData.count) → \(decompressedData.count) bytes")
-
-                // Parse decompressed data for inner packets
-                let innerPackets = try parsePackets(data: decompressedData)
+                let innerPackets = try parsePackets(data: decompressCompressedBody(packet.body))
                 return try extractLiteralData(from: innerPackets)
 
             default:
@@ -909,6 +1006,55 @@ class OpenPGPPacketParser {
             }
         }
         return nil
+    }
+
+    /// Decompress a Compressed Data packet body (RFC 4880 §5.6): a 1-octet
+    /// algorithm identifier followed by the compressed stream. Extracted from
+    /// `extractLiteralData` so the signed-message flattener can reuse it.
+    static func decompressCompressedBody(_ body: [UInt8]) throws -> [UInt8] {
+        guard !body.isEmpty else {
+            throw PacketParserError.decompressionFailed("Empty compressed packet")
+        }
+        let algo = body[0]
+        let compressed = Array(body[1...])
+        switch algo {
+        case 0: return compressed                                   // uncompressed
+        case 1: return try zlibDecompress(compressed, rawDeflate: true)   // ZIP (raw DEFLATE)
+        case 2: return try zlibDecompress(compressed, rawDeflate: false)  // ZLIB
+        case 3: return try BZip2Decompressor.decompress(compressed)       // BZip2
+        default: throw PacketParserError.unsupportedCompression(algo)
+        }
+    }
+
+    /// Parse a message and flatten any Compressed Data packets, so a caller
+    /// sees the real inner packet stream (one-pass sig, literal, signature)
+    /// rather than a single opaque tag-8. gpg compresses inline-signed messages
+    /// by default, so this is the common shape for a signed-only .asc.
+    static func flattenMessagePackets(_ data: [UInt8]) throws -> [ParsedPacket] {
+        var out: [ParsedPacket] = []
+        for p in try parsePackets(data: data) {
+            if p.tag == 8 {
+                out.append(contentsOf: try flattenMessagePackets(decompressCompressedBody(p.body)))
+            } else {
+                out.append(p)
+            }
+        }
+        return out
+    }
+
+    /// If `data` is a signed-but-NOT-encrypted message (RFC 4880 §11.3: an
+    /// optional one-pass signature, a literal data packet, and a signature
+    /// packet, optionally compressed), return the signed content and the tag-2
+    /// signature packet. Returns nil when the message carries ANY encryption
+    /// packet (PKESK 1, SKESK 3, SED 9, SEIPD 18) or lacks a signature+literal
+    /// pair — i.e. it is not a verify-in-place candidate and the caller should
+    /// fall through to decryption.
+    static func signedMessageParts(_ data: [UInt8]) -> (literal: [UInt8], sigPacket: ParsedPacket)? {
+        guard let flat = try? flattenMessagePackets(data) else { return nil }
+        if flat.contains(where: { [1, 3, 9, 18].contains($0.tag) }) { return nil }
+        guard let sig = flat.first(where: { $0.tag == 2 }),
+              let lit = flat.first(where: { $0.tag == 11 }) else { return nil }
+        return (parseLiteralData(body: lit.body), sig)
     }
 
     // MARK: - Packet Parsing
@@ -1190,22 +1336,25 @@ class OpenPGPPacketParser {
                 throw PacketParserError.invalidPacket("PKESK v6 X25519: wrapped key truncated")
             }
             wrappedKey = Array(body[off..<(off + wrapSize)]); off += wrapSize
-        } else if algorithm == 35 {
-            // v8.0.0 Phase F: composite ML-KEM-768+X25519 (RFC 9980 §4.3.2).
-            // Algorithm-specific fields, in order:
-            //   ecdhCipherText (32) || mlkemCipherText (1088) || len(1) || C
-            // where C is the AES-256-wrapped session key. (symAlgId is only
-            // present for a v3 PKESK, never here.)
-            guard off + 32 + 1088 < body.count else {
-                throw PacketParserError.invalidPacket("PKESK v6 ML-KEM+X25519: ciphertext truncated")
+        } else if let suite = CompositeSuite.from(algId: algorithm) {
+            // v8.0.0 Phase F: composite ML-KEM+ECDH (RFC 9980 §4.3.2), the
+            // suite chosen by the algorithm id (35 = 768+X25519, 36 =
+            // 1024+X448, added v8.2.0 §1). Algorithm-specific fields:
+            //   ecdhCipherText || mlkemCipherText || len(1) || C
+            // at the suite's sizes, where C is the AES-256-wrapped session
+            // key. (symAlgId is only present for a v3 PKESK, never here.)
+            let eccLen = suite.eccKeyBytes
+            let ctLen = suite.mlkemCiphertextBytes
+            guard off + eccLen + ctLen < body.count else {
+                throw PacketParserError.invalidPacket("PKESK v6 ML-KEM composite: ciphertext truncated")
             }
-            ephemeralKey = Array(body[off..<(off + 32)]); off += 32           // V
-            mlkemCipherText = Array(body[off..<(off + 1088)]); off += 1088    // ML-KEM ct
+            ephemeralKey = Array(body[off..<(off + eccLen)]); off += eccLen    // V
+            mlkemCipherText = Array(body[off..<(off + ctLen)]); off += ctLen   // ML-KEM ct
             let wrapSize = Int(body[off]); off += 1
             guard off + wrapSize <= body.count else {
-                throw PacketParserError.invalidPacket("PKESK v6 ML-KEM+X25519: wrapped key truncated")
+                throw PacketParserError.invalidPacket("PKESK v6 ML-KEM composite: wrapped key truncated")
             }
-            wrappedKey = Array(body[off..<(off + wrapSize)]); off += wrapSize // C
+            wrappedKey = Array(body[off..<(off + wrapSize)]); off += wrapSize  // C
         } else {
             ephemeralKey = []
             wrappedKey = off < body.count ? Array(body[off...]) : []
@@ -1465,12 +1614,19 @@ class OpenPGPPacketParser {
             throw PacketParserError.decryptionFailed("Prefix quick-check failed — wrong session key")
         }
 
-        // Hex dump entire decrypted output for debugging
-        let hexDump = decrypted.enumerated().map { i, b in
-            let prefix = (i % 16 == 0) ? "\n  [\(String(format: "%03d", i))] " : ""
-            return "\(prefix)\(String(format: "%02x", b))"
-        }.joined(separator: " ")
-        pgpDebugLog("DEBUG SEIPD: full decrypted hex:\(hexDump)")
+        // v8.1.0 §3a — REMOVED: a full hex dump of the decrypted plaintext.
+        //
+        // It was computed as a `let` OUTSIDE the pgpDebugLog call, so the
+        // @autoclosure that makes logging a no-op in release protected nothing
+        // and this ran in shipping builds. It allocated one String per plaintext
+        // byte and joined them: for a 1.6 GB file that is ~26 GB of array before
+        // a ~5 GB joined string, which is the reported crash. It also printed
+        // the entire decrypted plaintext in DEBUG, against this file's own
+        // stated policy that secret-bearing dumps are removed rather than gated.
+        //
+        // Do not reintroduce. If a dump is ever needed here, bound it
+        // (`decrypted.prefix(64)`) and put the work INSIDE the log call so the
+        // autoclosure can elide it.
 
         // Strip prefix (bs+2 bytes)
         let payload = Array(decrypted[(bs + 2)...])
@@ -2766,14 +2922,16 @@ class OpenPGPPacketParser {
         }
 
         // ---- DIAGNOSTIC (TEMP, Phase 2b debug) ----
+        // v8.1.0 §3a — the dumps were already bounded to 64/48 bytes, but
+        // `let hashInputArr = Array(hashInput)` copied the ENTIRE document to
+        // get there, in release, for a diagnostic. On a large verify that is a
+        // full extra copy of the file for nothing. Everything now happens
+        // INSIDE the pgpDebugLog calls, so the @autoclosure elides all of it in
+        // release, and prefix/suffix slice the original rather than a copy.
         if signature.version == 6 {
-            let hashInputArr = Array(hashInput)
-            pgpDebugLog("DEBUG V6 Verify: doc=\(document.count)B salt=\(signature.salt.count)B rawHashed=\(signature.rawHashedPortion.count)B hashInput total=\(hashInputArr.count)B")
-            let dumpRange = min(64, hashInputArr.count)
-            let hexPrefix = hashInputArr.prefix(dumpRange).map { String(format: "%02x", $0) }.joined(separator: " ")
-            let hexSuffix = hashInputArr.suffix(min(48, hashInputArr.count)).map { String(format: "%02x", $0) }.joined(separator: " ")
-            pgpDebugLog("DEBUG V6 Verify: hashInput[0..\(dumpRange)] = \(hexPrefix)")
-            pgpDebugLog("DEBUG V6 Verify: hashInput[last 48] = \(hexSuffix)")
+            pgpDebugLog("DEBUG V6 Verify: doc=\(document.count)B salt=\(signature.salt.count)B rawHashed=\(signature.rawHashedPortion.count)B hashInput total=\(hashInput.count)B")
+            pgpDebugLog("DEBUG V6 Verify: hashInput[0..64] = \(hashInput.prefix(64).map { String(format: "%02x", $0) }.joined(separator: " "))")
+            pgpDebugLog("DEBUG V6 Verify: hashInput[last 48] = \(hashInput.suffix(48).map { String(format: "%02x", $0) }.joined(separator: " "))")
             pgpDebugLog("DEBUG V6 Verify: SHA-256 digest = \(digestBytes.map { String(format: "%02x", $0) }.joined())")
         }
         // ---- END DIAGNOSTIC ----
@@ -2848,5 +3006,85 @@ extension OpenPGPPacketParser {
     static func decryptTag20AEAD(packetBody: [UInt8], sessionKey: [UInt8]) throws -> [UInt8] {
         let seipd = try parseAEADEncryptedData(body: packetBody)
         return try decryptAEADTag20(seipd: seipd, sessionKey: sessionKey)
+    }
+
+    // MARK: - v8.2.0 §3 streaming de-armor
+
+    /// Streaming counterpart to `dearmor`: read an armored `PGP MESSAGE` (a
+    /// standalone .asc, or an RFC 3156 .eml whose part 2 carries it) from
+    /// `armoredURL` and write the decoded binary OpenPGP message to `binaryURL`,
+    /// never holding either whole. Finds the `-----BEGIN PGP MESSAGE-----`
+    /// block past any MIME/transport headers (the envelope skip), skips the
+    /// armor headers and the `=CRC` line, and base64-decodes each body line on
+    /// its own (armor lines are 76 chars, a multiple of 4, so each decodes
+    /// independently). The result feeds the streaming binary decrypt, so a large
+    /// armored message no longer has to fit in memory. Same body/CRC/header
+    /// rules as `dearmor`, so the two agree byte for byte.
+    static func streamingDearmor(fileAt armoredURL: URL, to binaryURL: URL, progress: ((Int) -> Void)? = nil) throws {
+        let input = try FileHandle(forReadingFrom: armoredURL)
+        defer { try? input.close() }
+        FileManager.default.createFile(atPath: binaryURL.path, contents: nil)
+        let output = try FileHandle(forWritingTo: binaryURL)
+        defer { try? output.close() }
+
+        enum State { case seekBegin, headers, body }
+        var state: State = .seekBegin
+        let beginMarker = Array("-----BEGIN PGP MESSAGE-----".utf8)
+
+        // Accumulate raw base64 body bytes and decode in bulk. Every armor body
+        // line is a multiple of 4 chars, so the buffer is always a multiple of 4
+        // and a large prefix decodes cleanly; padding only ever appears on the
+        // final line, handled by the force-flush at EOF. Decoding per line (a
+        // Data(base64Encoded:) call for each of millions of 76-char lines) is
+        // what made a big message crawl.
+        var b64 = Data()
+        func flushDecode(force: Bool) throws {
+            let full = force ? b64.count : (b64.count - b64.count % 4)
+            guard full > 0 else { return }
+            if let decoded = Data(base64Encoded: b64.prefix(full)) {
+                try output.write(contentsOf: decoded)
+            }
+            b64.removeFirst(full)
+        }
+
+        // Process one line (an ArraySlice into `carry`), appending base64 body
+        // bytes directly without materializing a per-line Array (except the rare
+        // BEGIN compare).
+        func processLine(_ line: ArraySlice<UInt8>) throws {
+            var end = line.endIndex
+            if end > line.startIndex, line[end - 1] == 0x0D { end -= 1 }   // strip CR
+            let body = line[line.startIndex..<end]
+            switch state {
+            case .seekBegin:
+                if !body.isEmpty, Array(body) == beginMarker { state = .headers }
+            case .headers:
+                if body.isEmpty { state = .body }   // blank line ends the headers
+            case .body:
+                if body.isEmpty { return }
+                let first = body[body.startIndex]
+                if first == UInt8(ascii: "=") { return }                 // CRC line
+                if first == UInt8(ascii: "-") { state = .seekBegin; return }  // END line
+                // A base64 line never contains ": ", so no header check needed.
+                b64.append(contentsOf: body)
+                if b64.count >= 4 * 1024 * 1024 { try flushDecode(force: false) }
+            }
+        }
+
+        var carry = [UInt8]()
+        let chunkBytes = 1024 * 1024
+        var read = 0
+        while let chunk = try input.read(upToCount: chunkBytes), !chunk.isEmpty {
+            read += chunk.count
+            carry.append(contentsOf: chunk)
+            var lineStart = 0
+            while let nl = carry[lineStart...].firstIndex(of: 0x0A) {
+                try processLine(carry[lineStart..<nl])
+                lineStart = nl + 1
+            }
+            if lineStart > 0 { carry.removeFirst(lineStart) }
+            progress?(read)
+        }
+        if !carry.isEmpty { try processLine(carry[carry.startIndex..<carry.endIndex]) }
+        try flushDecode(force: true)
     }
 }

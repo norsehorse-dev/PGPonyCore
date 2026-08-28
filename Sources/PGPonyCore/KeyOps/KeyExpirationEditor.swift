@@ -92,11 +92,12 @@ enum KeyExpirationEditor {
 
     // MARK: - Entry point (pure crypto, no side effects)
 
-    /// Build a re-dated copy of a key's material.
+    /// Build a re-dated copy of a v4 Ed25519 key's material.
     ///
     /// CORE SEAM: in the app, a thin wrapper feeds this from the SwiftData model
     /// (`PGPService.extractEd25519SigningKey` for the signing material, plus the
-    /// Keychain-loaded secret ring). The core takes the extracted materials
+    /// Keychain-loaded secret ring), and routes v6 keys to `buildEditedV6Key`
+    /// off the model's algorithm. The core takes the extracted materials
     /// directly, so it performs no storage access of its own.
     ///
     /// - Parameters:
@@ -124,6 +125,48 @@ enum KeyExpirationEditor {
             algorithm: .eddsa,
             sign: { digest in Array(try signingInfo.privateKey.signature(for: Data(digest))) }
         )
+    }
+
+    /// v8.2.0 issue #4 — software expiration edit for a v6 key. Extracts the
+    /// primary certification key (signs the direct-key sig and each binding) and
+    /// the signing subkey (signs its own 0x19 back-signature), then re-dates the
+    /// whole ring via V6KeyGenerator's v6 signature builders. The primary is
+    /// extracted first so a wrong passphrase surfaces here; the signing subkey is
+    /// optional (an encryption-only v6 key has none).
+    ///
+    /// CORE SEAM: in the app this takes the SwiftData model and extracts the two
+    /// signing keys itself (`PGPService.extractEd25519SigningKey`, once with
+    /// `preferSigningSubkey: false` and once with `true`) plus the Keychain
+    /// secret ring; the core takes the already-extracted materials. `signingSubkey`
+    /// is nil for an encryption-only v6 key (no Sign-capable subkey).
+    static func buildEditedV6Key(
+        armoredPublic: String,
+        secretRing: Data,
+        primary: Ed25519SigningInfo,
+        signingSubkey: Ed25519SigningInfo?,
+        expiresAt: Date?
+    ) throws -> EditedKey {
+        let pubData = Data(try dearmor(armoredPublic))
+        let signSub = signingSubkey
+
+        do {
+            let result = try V6KeyGenerator.editV6Expiration(
+                publicKeyData: pubData,
+                secretKeyData: secretRing,
+                primarySigningKey: primary.privateKey,
+                primaryFingerprint: Array(primary.fingerprint.suffix(32)),
+                signingSubkey: signSub?.privateKey,
+                signingSubkeyFingerprint: signSub.map { Array($0.fingerprint.suffix(32)) },
+                expiresAt: expiresAt
+            )
+            return EditedKey(
+                secretKeyData: result.secretKeyData,
+                armoredPublicKey: armorPublicKeyBlock(Array(result.publicKeyData)),
+                expiresAt: expiresAt
+            )
+        } catch {
+            throw EditError.underlying(error)
+        }
     }
 
     /// Card-backed expiration edit. Re-signs the user-ID self-cert and each subkey
@@ -273,7 +316,7 @@ enum KeyExpirationEditor {
         }
 
         // 6. Splice the fresh signatures into both rings. The public ring gives us
-        //    the new armored public key; the secret ring (supplied by the caller)
+        //    the new armored public key; the secret ring (loaded from the Keychain)
         //    gives us the bytes to persist. Both rings share the same UID/subkey
         //    ordering, so positional indices line up.
         let newPublicRing = spliceRing(
