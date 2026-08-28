@@ -16,7 +16,7 @@
  */
 /* #undef OQS_VERSION_PRE_RELEASE */
 
-#define OQS_COMPILE_BUILD_TARGET "arm64-Darwin-25.3.0"
+#define OQS_COMPILE_BUILD_TARGET "arm64-Darwin-25.5.0"
 /* #undef OQS_DIST_BUILD */
 /* #undef OQS_DIST_X86_64_BUILD */
 /* #undef OQS_DIST_X86_BUILD */
@@ -139,7 +139,7 @@
 /* #undef OQS_ENABLE_KEM_ml_kem_768_x86_64 */
 /* #undef OQS_ENABLE_KEM_ml_kem_768_aarch64 */
 /* #undef OQS_ENABLE_KEM_ml_kem_768_cuda */
-/* #undef OQS_ENABLE_KEM_ml_kem_1024 */
+#define OQS_ENABLE_KEM_ml_kem_1024 1
 /* #undef OQS_ENABLE_KEM_ml_kem_1024_x86_64 */
 /* #undef OQS_ENABLE_KEM_ml_kem_1024_aarch64 */
 /* #undef OQS_ENABLE_KEM_ml_kem_1024_cuda */
