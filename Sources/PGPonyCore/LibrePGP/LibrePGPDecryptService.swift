@@ -81,17 +81,81 @@ enum LibrePGPDecryptService {
         // several LibrePGP keys tries the wrong key's passphrase and loops the
         // decrypt prompt forever.
         let packets = try OpenPGPPacketParser.parsePackets(data: messageData)
-        guard let pkeskPacket = packets.first(where: { $0.tag == 1 }) else { throw Failure.noPKESK }
-        let pkesk = try parsePKESK(pkeskPacket.body)
+        // 8.3.0 (4.4): every algorithm-8 PKESK is a candidate, not only the
+        // first tag 1 packet. A multi-recipient message carries one PKESK per
+        // recipient, in the sender's order, and other recipients' packets (v6
+        // composite, classical) sit in the same stream; those do not parse as
+        // algorithm 8 and are skipped.
+        let pkesks: [PKESK] = packets
+            .filter { $0.tag == 1 }
+            .compactMap { try? parsePKESK($0.body) }
+        guard !pkesks.isEmpty else { throw Failure.noPKESK }
 
-        guard let key = try extractDecryptionKey(privateKeyData: secretKeyData, passphrase: passphrase, matchKeyID: pkesk.keyID) else {
-            throw Failure.noCompositeSubkey
+        var matched: (pkesk: PKESK, key: DecryptionKey)? = nil
+        for candidate in pkesks {
+            if let key = try extractDecryptionKey(privateKeyData: secretKeyData, passphrase: passphrase, matchKeyID: candidate.keyID) {
+                matched = (candidate, key)
+                break
+            }
         }
+        guard let (pkesk, key) = matched else { throw Failure.noCompositeSubkey }
         let sessionKey = try recoverSessionKey(pkesk: pkesk, key: key)
         return try OpenPGPPacketParser.decryptMessageWithSessionKey(
             messageData: Data(messageData),
             sessionKey: sessionKey,
             cipherAlgorithmID: pkesk.sessionKeyAlgo)
+    }
+
+    // MARK: - Unprotected v5 secret layout
+
+    /// The tail of an unprotected (S2K usage 0) v5 secret subkey after the
+    /// public material, as rfc4880bis / LibrePGP lay it out and as PGPony
+    /// Android writes it:
+    ///   usage(0) | protection-parameter count(0) | count(4) | material | checksum(2)
+    /// PGPony iOS through 8.2.x omitted the zero count octet and the checksum
+    /// (usage | count | material), so an Android key would not open here and
+    /// an iOS key misparsed on Android, found by the 8.3.0 build 2 fixtures.
+    /// Both readers below accept either layout; the writers emit this one.
+    static func unprotectedV5SecretTail(_ secret: [UInt8]) -> [UInt8] {
+        // The caller writes the usage octet; this starts with the protection
+        // parameter count, zero for an unprotected key.
+        var tail: [UInt8] = [0]
+        let n = UInt32(secret.count)
+        tail.append(contentsOf: [UInt8(n >> 24), UInt8((n >> 16) & 0xFF), UInt8((n >> 8) & 0xFF), UInt8(n & 0xFF)])
+        tail.append(contentsOf: secret)
+        let sum = secret.reduce(UInt16(0)) { $0 &+ UInt16($1) }
+        tail.append(UInt8(sum >> 8))
+        tail.append(UInt8(sum & 0xFF))
+        return tail
+    }
+
+    /// Read the material of an unprotected v5 secret subkey starting at the
+    /// octet after the usage octet, in either layout. `expected` is the
+    /// suite's material length, which is what tells the layouts apart: the
+    /// four octets at `start` read as that length in the old iOS layout and
+    /// as zero (the protection count octet plus three of the count) in the
+    /// LibrePGP one. Returns nil when neither fits or a checksum is wrong.
+    static func readUnprotectedV5Secret(body: [UInt8], start: Int, expected: Int) -> [UInt8]? {
+        func count(at o: Int) -> Int? {
+            guard o + 4 <= body.count else { return nil }
+            return Int(body[o]) << 24 | Int(body[o + 1]) << 16 | Int(body[o + 2]) << 8 | Int(body[o + 3])
+        }
+        var o = start
+        var checksummed = false
+        if count(at: o) != expected, body.count > o, body[o] == 0, count(at: o + 1) == expected {
+            o += 1
+            checksummed = true
+        }
+        guard count(at: o) == expected else { return nil }
+        o += 4
+        guard o + expected <= body.count else { return nil }
+        let secret = Array(body[o..<(o + expected)])
+        if checksummed, o + expected + 2 <= body.count {
+            let sum = secret.reduce(UInt16(0)) { $0 &+ UInt16($1) }
+            let stored = UInt16(body[o + expected]) << 8 | UInt16(body[o + expected + 1])
+            guard sum == stored else { return nil }
+        }
+        return secret
     }
 
     // MARK: - Key extraction
@@ -148,11 +212,9 @@ enum LibrePGPDecryptService {
         let secretLen = suite.secretBytes               // 96 @768, 120 @1024
         let secret: [UInt8]
         if usage == 0 {
-            guard o + 4 <= body.count else { return nil }
-            let count = Int(body[o]) << 24 | Int(body[o+1]) << 16 | Int(body[o+2]) << 8 | Int(body[o+3])
-            o += 4
-            guard count == secretLen, o + count <= body.count else { return nil }
-            secret = Array(body[o..<(o + count)])
+            // Either unprotected layout (see readUnprotectedV5Secret).
+            guard let material = readUnprotectedV5Secret(body: body, start: o, expected: secretLen) else { return nil }
+            secret = material
         } else if usage == 254 || usage == 255 {
             guard let pass = passphrase, !pass.isEmpty else { throw Failure.passphraseRequired }
             // v5 keys prepend a 1-octet protection-material length before the

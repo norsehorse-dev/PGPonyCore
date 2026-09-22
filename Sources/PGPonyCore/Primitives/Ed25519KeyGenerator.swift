@@ -39,6 +39,7 @@ class Ed25519KeyGenerator {
     private static let eddsaAlgorithm: UInt8 = 22   // EdDSA
     private static let ecdhAlgorithm: UInt8 = 18     // ECDH
     private static let kyberAlgorithm: UInt8 = 8     // LibrePGP ML-KEM-768 + X25519 (GnuPG "Kyber")
+    private static let mlkem768X25519Algorithm: UInt8 = 35   // RFC 9980 ML-KEM-768 + X25519 (v4 subkey, 8.3.0 planning 4.3)
     
     // S2K constants
     private static let s2kSaltLength = 8
@@ -102,10 +103,19 @@ class Ed25519KeyGenerator {
         passphrase: String?,
         expirationInterval: TimeInterval?,
         pqcEncryption: Bool = false,
-        pqcSuite: LibrePGPSuite = .ky768_cv25519
+        pqcSuite: LibrePGPSuite = .ky768_cv25519,
+        v4Algo35Subkey: Bool = false
     ) throws -> Ed25519KeyGeneratorResult {
 
         let creationTime = UInt32(Date().timeIntervalSince1970)
+        // 8.3.0 (planning 4.3): the v4 interop shape (Android 4.5.0 item 14)
+        // keeps the classical Cv25519 subkey for pre-PQC correspondents and
+        // grafts an RFC 9980 algorithm 35 ML-KEM-768 + X25519 subkey after it.
+        // The primary self-signature then advertises Features 0x09 (SEIPDv1 +
+        // SEIPDv2), which is what lets a sender reach the ML-KEM subkey with a
+        // v6 PKESK; every other v4 shape keeps 0x01. Mutually exclusive with
+        // the LibrePGP graft.
+        precondition(!(pqcEncryption && v4Algo35Subkey), "one post-quantum subkey shape at a time")
 
         // Generate Ed25519 signing key (primary)
         let signingKey = Curve25519.Signing.PrivateKey()
@@ -156,8 +166,8 @@ class Ed25519KeyGenerator {
         let fingerprint = calculateV4Fingerprint(keyBody: primaryPubBody)
         let keyID = Array(fingerprint.suffix(8))
         
-        // Build User ID
-        let userID = "\(name) <\(email)>"
+        // Build User ID. 8.3.0 (6.1): the address is optional.
+        let userID = UserIDFormat.compose(name: name, email: email)
         let userIDBytes = Array(userID.utf8)
         
         // Build self-signature (type 0x13 = positive certification)
@@ -167,7 +177,8 @@ class Ed25519KeyGenerator {
             userIDBytes: userIDBytes,
             creationTime: creationTime,
             expirationInterval: expirationInterval,
-            keyID: keyID
+            keyID: keyID,
+            features: v4Algo35Subkey ? 0x09 : 0x01
         )
         
         // Build encryption subkey packet body — Cv25519 (v4) or Kyber (v5).
@@ -197,7 +208,38 @@ class Ed25519KeyGenerator {
         publicKeyPackets.append(buildPacket(tag: 2, body: Data(selfSignature)))    // Signature
         publicKeyPackets.append(buildPacket(tag: 14, body: Data(subkeyPubBody)))   // Public-Subkey
         publicKeyPackets.append(buildPacket(tag: 2, body: Data(subkeyBindingSig))) // Signature
-        
+
+        // 8.3.0 (4.3): the v4 algorithm 35 subkey and its v4 binding (0x99
+        // framing on both keys, SHA-256, key flags encrypt), after the
+        // classical subkey, as Android grafts it.
+        var algo35PubBody: [UInt8] = []
+        var algo35SecretBody: [UInt8] = []
+        var algo35BindingSig: [UInt8] = []
+        if v4Algo35Subkey {
+            let xKey = Curve25519.KeyAgreement.PrivateKey()
+            let mlkemSeed = SecureRandom.bytesOrTrap(64)                       // d‖z
+            let (mlkemPub, _) = try MLKEMService.generateKeyPair(seed: Data(mlkemSeed), level: .mlkem768)
+            algo35PubBody = buildV4MLKEMPublicKeyBody(
+                creationTime: creationTime,
+                x25519Public: Array(xKey.publicKey.rawRepresentation),
+                mlkemPublic: Array(mlkemPub))
+            algo35SecretBody = buildV4MLKEMSecretKeyBody(
+                publicBody: algo35PubBody,
+                x25519Private: Array(xKey.rawRepresentation),
+                mlkemSeed: mlkemSeed,
+                passphrase: passphrase)
+            algo35BindingSig = try buildSubkeyBindingSignature(
+                signingKey: signingKey,
+                primaryKeyBody: primaryPubBody,
+                subkeyBody: algo35PubBody,
+                creationTime: creationTime,
+                keyID: keyID,
+                expirationInterval: expirationInterval
+            )
+            publicKeyPackets.append(buildPacket(tag: 14, body: Data(algo35PubBody)))
+            publicKeyPackets.append(buildPacket(tag: 2, body: Data(algo35BindingSig)))
+        }
+
         // Build secret key bodies
         let primarySecretBody = buildEdDSASecretKeyBody(
             publicBody: primaryPubBody,
@@ -221,7 +263,11 @@ class Ed25519KeyGenerator {
         secretKeyPackets.append(buildPacket(tag: 2, body: Data(selfSignature)))       // Signature
         secretKeyPackets.append(buildPacket(tag: 7, body: Data(subkeySecretBody)))    // Secret-Subkey
         secretKeyPackets.append(buildPacket(tag: 2, body: Data(subkeyBindingSig)))    // Signature
-        
+        if v4Algo35Subkey {
+            secretKeyPackets.append(buildPacket(tag: 7, body: Data(algo35SecretBody)))
+            secretKeyPackets.append(buildPacket(tag: 2, body: Data(algo35BindingSig)))
+        }
+
         // Armor
         let armoredPublic = armorData(publicKeyPackets, type: .publicKey)
         let armoredSecret = armorData(secretKeyPackets, type: .secretKey)
@@ -341,6 +387,67 @@ class Ed25519KeyGenerator {
         return body
     }
 
+    // MARK: - v4 ML-KEM-768 + X25519 subkey (RFC 9980 algorithm 35; 8.3.0 planning 4.3)
+
+    /// A v4 public subkey body for RFC 9980 algorithm 35: no OID, no MPI, no
+    /// length field. ver(1)=4 | ctime(4) | algo(1)=35 | X25519pub(32) ‖
+    /// ML-KEMpub(1184), the fixed 1216-octet material of RFC 9980 5.2.
+    static func buildV4MLKEMPublicKeyBody(creationTime: UInt32,
+                                          x25519Public: [UInt8],
+                                          mlkemPublic: [UInt8]) -> [UInt8] {
+        var body: [UInt8] = []
+        body.append(4)
+        body.append(contentsOf: creationTime.bigEndianBytes)
+        body.append(mlkem768X25519Algorithm)
+        body.append(contentsOf: x25519Public)
+        body.append(contentsOf: mlkemPublic)
+        return body
+    }
+
+    /// The matching v4 secret subkey body. The secret material is the raw
+    /// 32-octet X25519 scalar (CryptoKit's rawRepresentation, fed straight back
+    /// to Curve25519 on decapsulation, exactly as the v6 composite subkey stores
+    /// it) followed by the 64-octet ML-KEM seed (d‖z). Unprotected: usage 0,
+    /// material, two-octet checksum (RFC 9980 A.2.1). Protected: the classic v4
+    /// form gpg writes for a passphrase-set key and this generator already uses
+    /// for its Cv25519 subkey, usage 254 (SHA-1 trailer), AES-128 CFB under an
+    /// iterated+salted S2K; PGPService.parseV4CompositeSecretSubkeyPacket reads
+    /// both, and Android's V4Algo35Protection the protected one.
+    static func buildV4MLKEMSecretKeyBody(publicBody: [UInt8],
+                                          x25519Private: [UInt8],
+                                          mlkemSeed: [UInt8],
+                                          passphrase: String? = nil) -> [UInt8] {
+        var body = publicBody
+        let material = x25519Private + mlkemSeed          // 32 + 64 = 96
+
+        guard let passphrase = passphrase, !passphrase.isEmpty else {
+            body.append(0)                                    // S2K usage 0 (unprotected)
+            body.append(contentsOf: material)
+            let checksum = material.reduce(UInt16(0)) { $0 &+ UInt16($1) }
+            body.append(contentsOf: checksum.bigEndianBytes)
+            return body
+        }
+
+        body.append(254)                                  // S2K usage: SHA-1 trailer
+        body.append(s2kCipherAES128)                      // AES-128
+        body.append(s2kIteratedSalted)                    // S2K type 3
+        body.append(s2kHashSHA256)                        // SHA-256
+        let salt = SecureRandom.bytesOrTrap(s2kSaltLength)
+        body.append(contentsOf: salt)
+        body.append(s2kCodedCount)
+        let iv = SecureRandom.bytesOrTrap(aes128BlockSize)
+        body.append(contentsOf: iv)
+
+        let derivedKey = deriveS2KKey(passphrase: passphrase, salt: salt,
+                                      codedCount: s2kCodedCount, keySize: aes128KeySize)
+        var plaintext = material
+        var sha1 = [UInt8](repeating: 0, count: Int(CC_SHA1_DIGEST_LENGTH))
+        CC_SHA1(material, CC_LONG(material.count), &sha1)
+        plaintext.append(contentsOf: sha1)                // 96 + 20 = 116
+        body.append(contentsOf: aesCFBEncrypt(plaintext: plaintext, key: derivedKey, iv: iv))
+        return body
+    }
+
     /// Build the matching v5 unprotected secret-key packet body. A v5 secret key
     /// carries a 4-octet count of the secret material after the S2K-usage octet.
     /// The composite secret is the raw 32-octet X25519 scalar (CryptoKit's little-
@@ -354,9 +461,12 @@ class Ed25519KeyGenerator {
         let secret = x25519Private + mlkemSeed            // 32 + 64 = 96
 
         guard let passphrase = passphrase, !passphrase.isEmpty else {
+            // 8.3.0 build 2: the LibrePGP layout (usage | parameter count 0 |
+            // count | material | checksum), which PGPony Android writes and
+            // reads; the reader accepts the 8.2.x layout without the two extra
+            // fields as well. See LibrePGPDecryptService.unprotectedV5SecretTail.
             body.append(0)                                    // S2K usage 0 (unprotected)
-            body.append(contentsOf: UInt32(secret.count).bigEndianBytes)   // v5 secret-material count
-            body.append(contentsOf: secret)
+            body.append(contentsOf: LibrePGPDecryptService.unprotectedV5SecretTail(secret))
             return body
         }
 
@@ -371,12 +481,11 @@ class Ed25519KeyGenerator {
         body.append(s2kCipherAES128)                      // AES-128
         body.append(s2kIteratedSalted)                    // S2K type 3
         body.append(s2kHashSHA256)                        // SHA-256
-        var salt = [UInt8](repeating: 0, count: s2kSaltLength)
-        _ = SecRandomCopyBytes(kSecRandomDefault, s2kSaltLength, &salt)
+        // 8.3.0 (section 5, audit 6): random or trap, never a zero salt / IV.
+        let salt = SecureRandom.bytesOrTrap(s2kSaltLength)
         body.append(contentsOf: salt)
         body.append(s2kCodedCount)                        // 0x60 -> 65536 iterations
-        var iv = [UInt8](repeating: 0, count: aes128BlockSize)
-        _ = SecRandomCopyBytes(kSecRandomDefault, aes128BlockSize, &iv)
+        let iv = SecureRandom.bytesOrTrap(aes128BlockSize)
         body.append(contentsOf: iv)
 
         let derivedKey = deriveS2KKey(passphrase: passphrase, salt: salt,
@@ -493,9 +602,8 @@ class Ed25519KeyGenerator {
         result.append(s2kIteratedSalted)  // Type 3: Iterated+Salted
         result.append(s2kHashSHA256)       // Hash: SHA-256
         
-        // 8-byte random salt
-        var salt = [UInt8](repeating: 0, count: s2kSaltLength)
-        _ = SecRandomCopyBytes(kSecRandomDefault, s2kSaltLength, &salt)
+        // 8-byte random salt. 8.3.0 (section 5, audit 6): random or trap.
+        let salt = SecureRandom.bytesOrTrap(s2kSaltLength)
         result.append(contentsOf: salt)
         
         // Coded count byte (0x60 = 65536 iterations, GnuPG default)
@@ -521,9 +629,8 @@ class Ed25519KeyGenerator {
         CC_SHA1(plaintext, CC_LONG(plaintext.count), &sha1Hash)
         plaintext.append(contentsOf: sha1Hash)
         
-        // Random IV for AES-128 CFB
-        var iv = [UInt8](repeating: 0, count: aes128BlockSize)
-        _ = SecRandomCopyBytes(kSecRandomDefault, aes128BlockSize, &iv)
+        // Random IV for AES-128 CFB. 8.3.0 (section 5, audit 6): random or trap.
+        let iv = SecureRandom.bytesOrTrap(aes128BlockSize)
         result.append(contentsOf: iv)
         
         // Encrypt with AES-128 CFB (no padding — OpenPGP CFB is byte-aligned)
@@ -648,9 +755,10 @@ class Ed25519KeyGenerator {
         userIDBytes: [UInt8],
         creationTime: UInt32,
         expirationInterval: TimeInterval?,
-        keyID: [UInt8]
+        keyID: [UInt8],
+        features: UInt8 = 0x01
     ) throws -> [UInt8] {
-        
+
         // Build hashed subpackets
         var hashedSubpackets = Data()
         
@@ -659,6 +767,12 @@ class Ed25519KeyGenerator {
         
         // Key flags (subpacket type 27): certify (0x01) + sign (0x02)
         hashedSubpackets.append(buildSubpacket(type: 27, data: [0x03]))
+        
+        // Primary User ID (subpacket type 25). 8.3.0: the lone identity is
+        // flagged from the start, as V6KeyGenerator already does, so a later
+        // non-primary identity cannot become primary on a keyserver by being
+        // the most recent self-certification (planning 3.3 c).
+        hashedSubpackets.append(buildSubpacket(type: 25, data: [0x01]))
         
         // Preferred symmetric algorithms (subpacket type 11): AES256, AES192, AES128
         hashedSubpackets.append(buildSubpacket(type: 11, data: [9, 8, 7]))
@@ -669,21 +783,23 @@ class Ed25519KeyGenerator {
         // Preferred compression (subpacket type 22): ZLIB, BZip2, ZIP
         hashedSubpackets.append(buildSubpacket(type: 22, data: [2, 3, 1]))
         
-        // Features (subpacket type 30): MDC (0x01)
-        hashedSubpackets.append(buildSubpacket(type: 30, data: [0x01]))
-        
+        // Features (subpacket type 30): MDC (0x01); 0x09 (MDC + SEIPDv2) only
+        // for the v4 interop shape with an RFC 9980 algorithm 35 subkey (8.3.0,
+        // 4.3). Classical and LibrePGP keys must not advertise SEIPDv2.
+        hashedSubpackets.append(buildSubpacket(type: 30, data: [features]))
+
         // Key expiration if set (subpacket type 9)
         if let expInterval = expirationInterval {
             let expSeconds = UInt32(expInterval)
             hashedSubpackets.append(buildSubpacket(type: 9, data: expSeconds.bigEndianBytes))
         }
-        
+
         // Build unhashed subpackets
         var unhashedSubpackets = Data()
-        
+
         // Issuer key ID (subpacket type 16)
         unhashedSubpackets.append(buildSubpacket(type: 16, data: keyID))
-        
+
         // Compute signature hash
         let hashData = buildCertificationHashData(
             primaryKeyBody: primaryKeyBody,
@@ -743,17 +859,24 @@ class Ed25519KeyGenerator {
         subkeyBody: [UInt8],
         creationTime: UInt32,
         keyID: [UInt8],
-        subkeyIsV5: Bool = false
+        subkeyIsV5: Bool = false,
+        expirationInterval: TimeInterval? = nil
     ) throws -> [UInt8] {
-        
+
         var hashedSubpackets = Data()
-        
+
         // Signature creation time
         hashedSubpackets.append(buildSubpacket(type: 2, data: creationTime.bigEndianBytes))
-        
+
         // Key flags: encrypt communications (0x04) + encrypt storage (0x08)
         hashedSubpackets.append(buildSubpacket(type: 27, data: [0x0C]))
-        
+
+        // Key expiration (subpacket type 9), when the caller dates the subkey
+        // (the v4 algorithm 35 graft, 8.3.0 (4.3), matching Android).
+        if let expInterval = expirationInterval {
+            hashedSubpackets.append(buildSubpacket(type: 9, data: UInt32(expInterval).bigEndianBytes))
+        }
+
         var unhashedSubpackets = Data()
         unhashedSubpackets.append(buildSubpacket(type: 16, data: keyID))
         
@@ -1083,7 +1206,7 @@ class Ed25519KeyGenerator {
         try await card.writeKeyFingerprint(slot: .decryption, subkey.fingerprint)
 
         // --- PW1 (signing): self-signatures, produced by the card's sign key ---
-        let userIDBytes = Array("\(name) <\(email)>".utf8)
+        let userIDBytes = Array(UserIDFormat.compose(name: name, email: email).utf8)
 
         try await card.verify(pin: userPIN, mode: .signing)
         let certSig = try await buildCardCertificationSignature(

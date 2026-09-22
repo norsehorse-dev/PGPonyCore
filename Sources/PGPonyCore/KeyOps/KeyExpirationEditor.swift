@@ -70,12 +70,13 @@ enum KeyExpirationEditor {
         case missingArmoredPublicKey
         case noPrimaryKeyPacket
         case expiryBeforeCreation
+        case noLiveUserID
         case underlying(Error)
 
         var errorDescription: String? {
             switch self {
             case .notAKeyPair:
-                return "Editing expiration requires the private key — this is a public-only key."
+                return "Editing expiration requires the private key; this is a public-only key."
             case .unsupportedAlgorithm:
                 return "Expiration editing supports Ed25519 keys and RSA or Ed25519 hardware keys. For a software RSA or v6 key, use GnuPG."
             case .missingArmoredPublicKey:
@@ -84,6 +85,8 @@ enum KeyExpirationEditor {
                 return "Could not locate the primary public-key packet in this key."
             case .expiryBeforeCreation:
                 return "The chosen expiration date is before the key was created."
+            case .noLiveUserID:
+                return String(localized: "Every User ID on this key is revoked, so there is no identity to carry a new expiration date.")
             case .underlying(let e):
                 return e.localizedDescription
             }
@@ -153,7 +156,7 @@ enum KeyExpirationEditor {
             let result = try V6KeyGenerator.editV6Expiration(
                 publicKeyData: pubData,
                 secretKeyData: secretRing,
-                primarySigningKey: primary.privateKey,
+                primarySigner: V6SignatureKey(primary),
                 primaryFingerprint: Array(primary.fingerprint.suffix(32)),
                 signingSubkey: signSub?.privateKey,
                 signingSubkeyFingerprint: signSub.map { Array($0.fingerprint.suffix(32)) },
@@ -252,6 +255,11 @@ enum KeyExpirationEditor {
                 guard isSelfIssued(sig, primaryFP20: primaryFP20) else { break }
                 if sig.signatureType == 0x13, ctx == .uid, let i = uids.indices.last {
                     uids[i].certSubpackets = sig.hashedSubpackets
+                    let t = sig.creationTime ?? .distantPast
+                    if uids[i].latestCert.map({ t >= $0 }) ?? true { uids[i].latestCert = t }
+                } else if sig.signatureType == 0x30, ctx == .uid, let i = uids.indices.last {
+                    let t = sig.creationTime ?? .distantPast
+                    if uids[i].latestRevocation.map({ t >= $0 }) ?? true { uids[i].latestRevocation = t }
                 } else if sig.signatureType == 0x18, ctx == .subkey, let j = subs.indices.last {
                     subs[j].bindingSubpackets = sig.hashedSubpackets
                     if let kf = sig.hashedSubpackets.first(where: { $0.type == 27 })?.data,
@@ -262,6 +270,12 @@ enum KeyExpirationEditor {
                         // signing subkey; this guard is for imported keys.
                         subs[j].isSign = true
                     }
+                } else if sig.signatureType == 0x28, ctx == .subkey, let j = subs.indices.last {
+                    // 8.3.0 (4.6): a revoked subkey keeps its old binding. A
+                    // fresh, newer binding would read as a re-certification to
+                    // a verifier that lets a newer self-signature override a
+                    // soft revocation (Sequoia does), resurrecting the subkey.
+                    subs[j].isRevoked = true
                 }
             default:
                 break
@@ -272,9 +286,14 @@ enum KeyExpirationEditor {
         let nowBytes = u32be(UInt32(Date().timeIntervalSince1970))
         let issuerFPData: [UInt8] = [4] + primaryFP20          // type-33 v4 form
 
-        // 4. Generate one fresh 0x13 cert per user ID (relative to PRIMARY creation).
-        var newCerts: [[UInt8]] = []
-        for u in uids {
+        // 4. Generate one fresh 0x13 cert per live user ID (relative to PRIMARY
+        //    creation). Revoked user IDs keep their old cert and revocation.
+        //    With none live there is nowhere to carry the primary's expiration.
+        guard uids.isEmpty || uids.contains(where: { !$0.isRevoked }) else {
+            throw EditError.noLiveUserID
+        }
+        var newCerts: [Int: [UInt8]] = [:]
+        for (i, u) in uids.enumerated() where !u.isRevoked {
             let expiryBytes = try relativeExpiry(expiresAt: expiresAt, creation: primaryCreation)
             let hashed = certSubpackets(
                 creationBytes: nowBytes,
@@ -290,13 +309,14 @@ enum KeyExpirationEditor {
                 unhashedSubpackets: buildSubpacket(type: 16, data: issuerKeyID),
                 sign: sign
             )
-            newCerts.append(packet)
+            newCerts[i] = packet
         }
 
         // 5. Generate one fresh 0x18 binding per (non-signing) subkey, relative to
-        //    that SUBKEY's own creation time. Signing subkeys are skipped (left as-is).
+        //    that SUBKEY's own creation time. Signing subkeys and revoked subkeys
+        //    are skipped (left as-is).
         var newBindings: [Int: [UInt8]] = [:]
-        for (j, s) in subs.enumerated() where !s.isSign {
+        for (j, s) in subs.enumerated() where !s.isSign && !s.isRevoked {
             let expiryBytes = try relativeExpiry(expiresAt: expiresAt, creation: s.creation)
             let hashed = bindingSubpackets(
                 creationBytes: nowBytes,
@@ -347,6 +367,18 @@ enum KeyExpirationEditor {
     private struct UidEntry {
         let body: [UInt8]
         var certSubpackets: [OpenPGPPacketParser.ParsedSubpacket]
+        /// 8.3.0 build 4: newest self-issued 0x13 and 0x30 times. A UID whose
+        /// newest self-revocation is at least as new as its newest self-cert is
+        /// revoked, and keeps its old cert: a fresh 0x13 would be newer than
+        /// the revocation and read as a re-certification (the same
+        /// resurrection the subkey path already avoids for 0x28).
+        var latestCert: Date? = nil
+        var latestRevocation: Date? = nil
+        var isRevoked: Bool {
+            guard let latestRevocation else { return false }
+            guard let latestCert else { return true }
+            return latestRevocation >= latestCert
+        }
     }
 
     private struct SubEntry {
@@ -354,6 +386,8 @@ enum KeyExpirationEditor {
         let creation: UInt32
         var bindingSubpackets: [OpenPGPPacketParser.ParsedSubpacket]
         var isSign: Bool
+        /// 8.3.0 (4.6): carries a self-issued 0x28; its binding is left as is.
+        var isRevoked = false
     }
 
     /// True if a signature's issuer is the primary key (so it's a self-signature
@@ -497,7 +531,7 @@ enum KeyExpirationEditor {
     /// bindings — is preserved byte-for-byte in its body and re-framed new-format.
     private static func spliceRing(
         packets: [ParsedPacket],
-        newCerts: [[UInt8]],
+        newCerts: [Int: [UInt8]],
         newBindings: [Int: [UInt8]],
         primaryFP20: [UInt8]
     ) -> [UInt8] {
@@ -524,12 +558,13 @@ enum KeyExpirationEditor {
                     out += buildNewFormatPacket(tag: pkt.tag, body: pkt.body)
                     break
                 }
-                if sig.signatureType == 0x13, ctx == .uid, uidIdx >= 0, uidIdx < newCerts.count {
+                if sig.signatureType == 0x13, ctx == .uid, let replacement = newCerts[uidIdx] {
                     // Emit the regenerated cert once per UID and drop any superseded
                     // extras, so a source key carrying multiple self-certs doesn't
-                    // produce a duplicate self-signature in the output.
+                    // produce a duplicate self-signature in the output. A revoked
+                    // UID has no entry and falls through with its certs as they were.
                     if certEmittedFor.insert(uidIdx).inserted {
-                        out += newCerts[uidIdx]
+                        out += replacement
                     }
                 } else if sig.signatureType == 0x18, ctx == .subkey, let replacement = newBindings[subIdx] {
                     if bindingEmittedFor.insert(subIdx).inserted {
@@ -580,7 +615,15 @@ enum KeyExpirationEditor {
         }
         let bitLen = UInt16(bytes.count * 8 - leadingZeros)
         var out: [UInt8] = [UInt8((bitLen >> 8) & 0xFF), UInt8(bitLen & 0xFF)]
-        out.append(contentsOf: bytes)
+        // RFC 4880 3.2: the value carries no leading zero octets, so its byte
+        // count matches ceil(bitLen / 8). Appending the full input here left
+        // an Ed25519 R or S with a high zero octet self-inconsistent, and a
+        // reader misaligned on the next MPI: roughly one v4 self-cert, UID
+        // cert or expiration re-cert in 128 failed to verify (gpg included).
+        // Same fix as SigningService.mpiEncode and CardSigner.mpiEncode.
+        var value = bytes
+        while value.first == 0 { value.removeFirst() }
+        out.append(contentsOf: value)
         return out
     }
 

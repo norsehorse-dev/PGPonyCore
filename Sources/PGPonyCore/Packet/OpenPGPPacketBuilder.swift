@@ -187,11 +187,14 @@ enum PacketBuilderError: LocalizedError {
 
 /// Parsed Cv25519 recipient key info needed for encryption
 struct Cv25519Recipient {
-    let subkeyPublicKey: [UInt8]     // 32-byte raw X25519 public key
+    let subkeyPublicKey: [UInt8]     // 32-byte raw X25519 public key, or a NIST point 0x04 || X || Y (8.3.0)
     let subkeyFingerprint: [UInt8]   // 20-byte V4 fingerprint of encryption subkey
     let subkeyID: [UInt8]            // 8-byte key ID (last 8 of fingerprint)
     let kdfHashID: UInt8             // From KDF params (usually SHA-256 = 8)
     let kdfCipherID: UInt8           // From KDF params (usually AES-128 = 7)
+    /// 8.3.0 (NIST C): algorithm 18 alone cannot tell Cv25519 from a NIST
+    /// curve; the recipient carries which, and the PKESK builder routes on it.
+    var curve: ECCurve = .cv25519
 }
 
 /// An RSA recipient (the encryption-capable (sub)key) for a v3 PKESK. The session
@@ -200,6 +203,16 @@ struct RSARecipient {
     let keyID: [UInt8]      // 8-byte key ID of the encryption (sub)key
     let modulus: [UInt8]    // RSA modulus n, big-endian
     let exponent: [UInt8]   // RSA public exponent e, big-endian
+    /// 20-octet v4 fingerprint of the encryption (sub)key; a v6 PKESK (8.3.0,
+    /// 4.4) addresses the key by it. Empty when the caller has only the key ID.
+    let fingerprint: [UInt8]
+
+    init(keyID: [UInt8], modulus: [UInt8], exponent: [UInt8], fingerprint: [UInt8] = []) {
+        self.keyID = keyID
+        self.modulus = modulus
+        self.exponent = exponent
+        self.fingerprint = fingerprint
+    }
 }
 
 // MARK: - Ed25519 Signing Info
@@ -209,6 +222,13 @@ struct Ed25519SigningInfo {
     let privateKey: Curve25519.Signing.PrivateKey   // CryptoKit signing key
     let keyID: [UInt8]                               // 8-byte key ID of primary key
     let fingerprint: [UInt8]                         // 20-byte fingerprint of primary key
+    /// 8.3.0 (planning 4.1): set when the unlocked key is an RFC 9980
+    /// composite ML-DSA + EdDSA primary (algorithm 30 or 31). `privateKey` is
+    /// then its EdDSA half; this carries the ML-DSA seed and the composite
+    /// public material. Every v6 signature builder reads the pair through
+    /// `V6SignatureKey(info)`, so the callers that thread an
+    /// Ed25519SigningInfo through encrypt-and-sign need no change.
+    var composite: CompositeSigningInfo? = nil
 }
 
 // MARK: - RSA Signing Info
@@ -221,6 +241,15 @@ struct RSASigningInfo {
     let keyID: [UInt8]           // 8-byte key ID of the signing (sub)key
     let fingerprint: [UInt8]     // 20-byte v4 fingerprint of the signing (sub)key
     let privateKey: SecKey
+}
+
+/// 8.3.0 (NIST D): an unlocked ECDSA key on a NIST curve, the third shape a
+/// v4 signature can be made with.
+struct ECDSASigningInfo {
+    let curve: NISTCurve
+    let scalar: [UInt8]          // big-endian, as read off the MPI
+    let keyID: [UInt8]
+    let fingerprint: [UInt8]     // 20-byte v4 fingerprint
 }
 
 // MARK: - OpenPGP Packet Builder
@@ -395,7 +424,8 @@ class OpenPGPPacketBuilder {
             recipientPublicKey: recipient.subkeyPublicKey,
             recipientFingerprint: recipient.subkeyFingerprint,
             kdfHashID: recipient.kdfHashID,
-            kdfCipherID: recipient.kdfCipherID
+            kdfCipherID: recipient.kdfCipherID,
+            curve: recipient.curve
         )
 
         var body: [UInt8] = []
@@ -564,9 +594,13 @@ class OpenPGPPacketBuilder {
                     throw PacketBuilderError.sessionKeyGenerationFailed
                 }
                 let fp = Array(signer.fingerprint.prefix(32))
-                let onePassSig = buildOnePassSignaturePacketV6(sigType: 0x00, salt: sigSalt, fingerprint: fp)
+                // 8.3.0 (4.1): a composite ML-DSA + EdDSA primary signs here
+                // too; the algorithm octet and signature come from the signer.
+                let v6Signer = V6SignatureKey(signer)
+                let onePassSig = buildOnePassSignaturePacketV6(sigType: 0x00, salt: sigSalt, fingerprint: fp,
+                                                               pubAlgo: v6Signer.publicKeyAlgorithm)
                 let signaturePacket = try buildBinarySignaturePacketV6(
-                    signingKey: signer.privateKey,
+                    signer: v6Signer,
                     fingerprint: fp,
                     literalBody: plaintext,
                     salt: sigSalt
@@ -601,11 +635,12 @@ class OpenPGPPacketBuilder {
         }
 
         // Build prefix: blockSize random bytes + repeat last 2
-        var prefix = [UInt8](repeating: 0, count: blockSize)
+        var prefix: [UInt8]
         if let injectedPrefix, injectedPrefix.count == blockSize {
             prefix = injectedPrefix
         } else {
-            _ = SecRandomCopyBytes(kSecRandomDefault, blockSize, &prefix)
+            // 8.3.0 (section 5, audit 6): a failed RNG is an error, not zeros.
+            prefix = try SecureRandom.bytes(blockSize)
         }
         prefix.append(prefix[blockSize - 2])
         prefix.append(prefix[blockSize - 1])
@@ -643,10 +678,14 @@ class OpenPGPPacketBuilder {
 
     // MARK: - v6 PKESK + SEIPDv2 (RFC 9580) — Phase V6-C
 
-    /// SEIPDv2 chunk size byte: actual chunk = 2^(byte + 6) bytes (here 4096).
+    /// SEIPDv2 chunk size byte: actual chunk = 2^(byte + 6) bytes (here 64 KiB).
     /// v8.1.0 §3a — visibility widened so the streaming v2 writer and reader
     /// use the same constants rather than a second copy of them.
-    static let seipdV2ChunkSizeByte: UInt8 = 0x06
+    /// 8.3.0 (K11): 0x06 (4 KiB) to 0x0A (64 KiB), the value Android writes,
+    /// so the two apps produce identical message sizes. Readers honour
+    /// whatever the packet declares, so anything already encrypted still
+    /// opens. The large-file path keeps its own 4 MiB octet (LargeFileCrypto).
+    static let seipdV2ChunkSizeByte: UInt8 = 0x0A
     static let aeadOCB: UInt8 = 2
 
     /// RFC 9580 §5.1.6 — encrypt a session key to an X25519 recipient.
@@ -713,6 +752,102 @@ class OpenPGPPacketBuilder {
         return buildNewFormatPacket(tag: 1, body: Data(body))
     }
 
+    // MARK: - v6 PKESKs for v4 keys, v3 PKESK for v6 X25519 (8.3.0, planning 4.4)
+
+    /// RFC 9580 5.1.2 with a version 4 target: a v6 PKESK for a v4 Cv25519
+    /// (ECDH, algorithm 18) key, the form a message with a post-quantum
+    /// co-recipient uses for its classical recipients (Android 4.5.x emits the
+    /// same). The RFC 6637 KDF and key wrap are the v3 packet's; the header
+    /// carries the 20-octet fingerprint and the wrapped block carries no
+    /// algorithm octet (RFC 9580 11.5).
+    /// Layout: version(6) | size(21) | keyVersion(4) | fingerprint(20) |
+    ///         algo(18) | MPI(ephemeral) | len(1) | wrapped_session_key
+    private static func buildV6ECDHPKESKPacket(
+        sessionKey: [UInt8],
+        recipient: Cv25519Recipient
+    ) throws -> Data {
+        guard recipient.subkeyFingerprint.count == 20 else {
+            throw PacketBuilderError.invalidKeyData("v6 ECDH PKESK needs a 20-byte v4 fingerprint")
+        }
+        let ecdhResult = try Cv25519ECDHService.encryptSessionKey(
+            sessionKey: sessionKey,
+            sessionAlgorithmID: 0,
+            recipientPublicKey: recipient.subkeyPublicKey,
+            recipientFingerprint: recipient.subkeyFingerprint,
+            kdfHashID: recipient.kdfHashID,
+            kdfCipherID: recipient.kdfCipherID,
+            includesAlgorithmID: false,
+            curve: recipient.curve
+        )
+        var body: [UInt8] = [6, 21, 4]
+        body.append(contentsOf: recipient.subkeyFingerprint)
+        body.append(18)
+        let ephBits = UInt16(ecdhResult.ephemeralPublicKey.count * 8 - countLeadingZeroBits(ecdhResult.ephemeralPublicKey))
+        body.append(UInt8((ephBits >> 8) & 0xFF))
+        body.append(UInt8(ephBits & 0xFF))
+        body.append(contentsOf: ecdhResult.ephemeralPublicKey)
+        body.append(UInt8(ecdhResult.wrappedSessionKey.count))
+        body.append(contentsOf: ecdhResult.wrappedSessionKey)
+        return buildNewFormatPacket(tag: 1, body: Data(body))
+    }
+
+    /// RFC 9580 5.1.2 / 5.1.3 with a version 4 target: a v6 PKESK for a v4 RSA
+    /// key. The block is sessionKey || checksum(2), no algorithm octet, PKCS#1
+    /// v1.5 encrypted to the modulus and stored as one MPI.
+    /// Layout: version(6) | size(21) | keyVersion(4) | fingerprint(20) |
+    ///         algo(1) | MPI(m^e mod n)
+    private static func buildV6RSAPKESKPacket(
+        sessionKey: [UInt8],
+        recipient: RSARecipient
+    ) throws -> Data {
+        guard recipient.fingerprint.count == 20 else {
+            throw PacketBuilderError.invalidKeyData("v6 PKESK for an RSA key needs its 20-byte fingerprint")
+        }
+        var block: [UInt8] = sessionKey
+        var sum = 0
+        for b in sessionKey { sum = (sum + Int(b)) & 0xFFFF }
+        block.append(UInt8((sum >> 8) & 0xFF))
+        block.append(UInt8(sum & 0xFF))
+        let ct = try rsaEncryptPKCS1(plaintext: block, modulus: recipient.modulus, exponent: recipient.exponent)
+        var body: [UInt8] = [6, 21, 4]
+        body.append(contentsOf: recipient.fingerprint)
+        body.append(1)
+        let bits = UInt16(ct.count * 8 - countLeadingZeroBits(ct))
+        body.append(UInt8((bits >> 8) & 0xFF))
+        body.append(UInt8(bits & 0xFF))
+        body.append(contentsOf: ct)
+        return buildNewFormatPacket(tag: 1, body: Data(body))
+    }
+
+    /// RFC 9580 5.1.1 / 5.1.6: a v3 PKESK for a v6 X25519 key, used when a v6
+    /// key shares a SEIPDv1 message with v4 keys (the container is chosen per
+    /// message, and a v4 recipient cannot read SEIPDv2). Same HKDF and key
+    /// wrap as the v6 packet; in v3 the size-prefixed field starts with the
+    /// symmetric algorithm octet.
+    /// Layout: version(3) | keyID(8) | algo(25) | ephemeral(32) | size(1) |
+    ///         cipher(1) | wrapped_session_key
+    private static func buildV3X25519PKESKPacket(
+        sessionKey: [UInt8],
+        sessionAlgorithmID: UInt8,
+        recipient: Cv25519Recipient
+    ) throws -> Data {
+        guard recipient.subkeyFingerprint.count == 32 else {
+            throw PacketBuilderError.invalidKeyData("v3 X25519 PKESK is for a v6 key (32-byte fingerprint)")
+        }
+        let (ephemeral, wrapped) = try encryptV6X25519SessionKey(
+            sessionKey: sessionKey,
+            recipientX25519PublicKey: recipient.subkeyPublicKey
+        )
+        var body: [UInt8] = [3]
+        body.append(contentsOf: recipient.subkeyID)
+        body.append(25)
+        body.append(contentsOf: ephemeral)
+        body.append(UInt8(wrapped.count + 1))
+        body.append(sessionAlgorithmID)
+        body.append(contentsOf: wrapped)
+        return buildNewFormatPacket(tag: 1, body: Data(body))
+    }
+
     // MARK: - Composite (RFC 9980, algorithms 35/36) Encrypt
 
     /// A recipient's RFC 9980 composite encryption subkey, parsed from its v6
@@ -721,7 +856,7 @@ class OpenPGPPacketBuilder {
     /// 768-only era and holds the X448 point (56 octets) for the 1024 suite;
     /// renaming it would churn every call site for no wire-level gain.
     struct CompositeRecipient {
-        let subkeyFingerprint: [UInt8]  // 32-byte v6 fingerprint of the subkey
+        let subkeyFingerprint: [UInt8]  // 32-byte v6 fingerprint of the subkey, or 20-byte v4 SHA-1 (8.3.0, 4.3)
         let x25519Public: [UInt8]       // ECC public: 32 (X25519) or 56 (X448)
         let mlkemPublic: [UInt8]        // ML-KEM public: 1184 (768) or 1568 (1024)
         let suite: CompositeSuite
@@ -740,7 +875,8 @@ class OpenPGPPacketBuilder {
     /// inverse of OpenPGPPacketParser's composite decrypt path, and the wire
     /// format Sequoia (sq) produces and consumes for the 768 suite. The 1024
     /// layout is identical apart from the algorithm id and sizes, as
-    /// interop-proven on Android against gpg 2.5.x.
+    /// interop-proven on Android against gpg 2.5.x. 8.3.0 (4.4): the one
+    /// recipient case of `buildMultiRecipientMessage`.
     static func buildCompositeEncryptedMessage(
         plaintext: Data,
         recipient: CompositeRecipient,
@@ -748,51 +884,166 @@ class OpenPGPPacketBuilder {
         filename: String? = nil,
         armor: Bool = true
     ) throws -> Data {
-        guard recipient.subkeyFingerprint.count == 32 else {
-            throw PacketBuilderError.invalidKeyData("composite PKESK needs a 32-byte fingerprint")
-        }
+        try buildMultiRecipientMessage(
+            plaintext: plaintext, recipients: [.composite(recipient)],
+            signingInfo: signingInfo, filename: filename, armor: armor)
+    }
 
-        // AES-256 session key (the v6 ecosystem rejects AES-128 there by policy).
-        var sessionKey = [UInt8](repeating: 0, count: 32)
-        guard SecRandomCopyBytes(kSecRandomDefault, 32, &sessionKey) == errSecSuccess else {
-            throw PacketBuilderError.sessionKeyGenerationFailed
-        }
+    /// The composite session key plus its built v6 PKESK, factored out so the
+    /// streaming large-file path can emit the identical recipient packet as
+    /// `buildCompositeEncryptedMessage` and then stream the SEIPD v2 body itself.
+    struct CompositeEnvelope {
+        let sessionKey: [UInt8]
+        let pkesk: Data
+    }
 
-        // Composite KEM → 32-octet KEK, then RFC 3394 key-wrap the session key.
+    /// Encapsulate a fresh AES-256 session key to a composite recipient and build
+    /// the v6 PKESK (algorithm 35/36). Byte-for-byte the same recipient packet
+    /// `buildCompositeEncryptedMessage` produces.
+    static func buildCompositeSessionKeyEnvelope(recipient: CompositeRecipient) throws -> CompositeEnvelope {
+        let envelope = try buildMultiRecipientEnvelope(recipients: [.composite(recipient)])
+        return CompositeEnvelope(sessionKey: envelope.sessionKey, pkesk: envelope.recipientPackets)
+    }
+
+    /// v6 PKESK, algorithm 35/36: fingerprint header, then the
+    /// algorithm-specific fields at the suite's sizes:
+    /// ecdhCipherText || mlkemCipherText || len(1) || wrappedSessionKey.
+    private static func buildCompositePKESKPacket(
+        sessionKey: [UInt8],
+        recipient: CompositeRecipient
+    ) throws -> Data {
+        // 8.3.0 (4.3): the PKESK stays v6 (SEIPDv2 pairing), but the target key
+        // version octet and fingerprint follow the recipient's own key version:
+        // 6 with a 32-octet fingerprint, or 4 with the 20-octet SHA-1 of a v4
+        // algorithm 35 subkey (RFC 9580 5.1). Android reads both.
+        guard recipient.subkeyFingerprint.count == 32 || recipient.subkeyFingerprint.count == 20 else {
+            throw PacketBuilderError.invalidKeyData("composite PKESK needs a 32-byte v6 or 20-byte v4 fingerprint")
+        }
+        let targetKeyVersion: UInt8 = recipient.subkeyFingerprint.count == 32 ? 6 : 4
+        // Composite KEM to a 32-octet KEK, then RFC 3394 key-wrap the session key.
         let enc = try CompositeKEMService.encapsulate(
             mlkemPublicKey: Data(recipient.mlkemPublic),
             ecdhPublicKey: Data(recipient.x25519Public),
             suite: recipient.suite
         )
         let wrapped = try AESKeyWrap.wrap(plaintext: sessionKey, kek: Array(enc.kek))  // 40 octets
-
-        // v6 PKESK, algorithm 35/36: fingerprint header, then the
-        // algorithm-specific fields at the suite's sizes:
-        // ecdhCipherText ‖ mlkemCipherText ‖ len(1) ‖ wrappedSessionKey.
         var body: [UInt8] = []
         body.append(6)                                        // PKESK version 6
-        body.append(33)                                       // size of (keyVersion + fingerprint)
-        body.append(6)                                        // target key version
-        body.append(contentsOf: recipient.subkeyFingerprint)  // 32-byte v6 fingerprint
+        body.append(UInt8(1 + recipient.subkeyFingerprint.count))  // size of (keyVersion + fingerprint): 33 or 21
+        body.append(targetKeyVersion)                         // target key version: 6 or 4
+        body.append(contentsOf: recipient.subkeyFingerprint)  // 32-byte v6 or 20-byte v4 fingerprint
         body.append(recipient.suite.algId)                    // public-key algorithm: 35 or 36
         body.append(contentsOf: Array(enc.ecdhCipherText))    // V (32 or 56)
         body.append(contentsOf: Array(enc.mlkemCipherText))   // ML-KEM ciphertext (1088 or 1568)
         body.append(UInt8(wrapped.count))                     // size of wrapped session key (40)
         body.append(contentsOf: wrapped)                      // wrapped session key
-        let pkesk = buildNewFormatPacket(tag: 1, body: Data(body))
+        return buildNewFormatPacket(tag: 1, body: Data(body))
+    }
 
-        let seipd2 = try buildSEIPDv2Packet(
-            plaintext: Array(plaintext),
-            sessionKey: sessionKey,
-            cipherAlgorithmID: 9,          // AES-256
-            signingInfo: signingInfo,
-            filename: filename
-        )
+    // MARK: - Multi-recipient envelope (8.3.0, planning 4.4)
 
-        var message = Data()
-        message.append(pkesk)
-        message.append(seipd2)
+    /// One recipient of a message whose set includes a post-quantum key.
+    /// Android 4.5.x's rule, followed here so the two apps produce the same
+    /// shapes: the container is SEIPDv2 (AES-256, OCB) when any recipient is an
+    /// IETF composite or every recipient is a v6 key, and SEIPDv1 (AES-256 CFB
+    /// with MDC) otherwise. In SEIPDv2 every key gets a v6 PKESK (35/36 for a
+    /// composite, 25 for v6 X25519, 18 and 1 in v6 form for v4 Cv25519 and
+    /// RSA); in SEIPDv1 the v3 forms. A LibrePGP key gets its v3 algo-8 PKESK
+    /// in either container, the only form GnuPG defines for it.
+    enum EnvelopeRecipient {
+        case composite(CompositeRecipient)
+        case x25519V6(Cv25519Recipient)
+        case ecdhV4(Cv25519Recipient)
+        case rsa(RSARecipient)
+        case librePGP(LibrePGPEncryptService.Recipient)
 
+        var isComposite: Bool {
+            if case .composite = self { return true }
+            return false
+        }
+        var isV6Key: Bool {
+            switch self {
+            case .composite, .x25519V6: return true
+            case .ecdhV4, .rsa, .librePGP: return false
+            }
+        }
+    }
+
+    /// One AES-256 session key wrapped once per recipient. The session key is
+    /// generated here so the in-memory and streaming paths share the packet
+    /// builder and cannot drift.
+    static func buildMultiRecipientEnvelope(recipients: [EnvelopeRecipient]) throws -> SessionKeyEnvelope {
+        guard !recipients.isEmpty else { throw PacketBuilderError.noRecipients }
+        let isV6 = recipients.contains { $0.isComposite } || recipients.allSatisfy { $0.isV6Key }
+        // AES-256 in both containers: the v6 ecosystem rejects AES-128, and the
+        // LibrePGP KEK derivation binds the cipher id, so one value everywhere.
+        let cipherID: UInt8 = 9
+        var sessionKey = [UInt8](repeating: 0, count: 32)
+        guard SecRandomCopyBytes(kSecRandomDefault, 32, &sessionKey) == errSecSuccess else {
+            throw PacketBuilderError.sessionKeyGenerationFailed
+        }
+        var packets = Data()
+        for recipient in recipients {
+            switch recipient {
+            case .composite(let r):
+                packets.append(try buildCompositePKESKPacket(sessionKey: sessionKey, recipient: r))
+            case .x25519V6(let r):
+                if isV6 {
+                    packets.append(try buildV6PKESKPacket(sessionKey: sessionKey, recipient: r))
+                } else {
+                    packets.append(try buildV3X25519PKESKPacket(sessionKey: sessionKey, sessionAlgorithmID: cipherID, recipient: r))
+                }
+            case .ecdhV4(let r):
+                if isV6 {
+                    packets.append(try buildV6ECDHPKESKPacket(sessionKey: sessionKey, recipient: r))
+                } else {
+                    packets.append(try buildPKESKPacket(sessionKey: sessionKey, sessionAlgorithmID: cipherID, recipient: r))
+                }
+            case .rsa(let r):
+                if isV6 {
+                    packets.append(try buildV6RSAPKESKPacket(sessionKey: sessionKey, recipient: r))
+                } else {
+                    packets.append(try buildRSAPKESKPacket(sessionKey: sessionKey, sessionAlgorithmID: cipherID, recipient: r))
+                }
+            case .librePGP(let r):
+                packets.append(Data(try LibrePGPEncryptService.buildPKESK(
+                    recipient: r, sessionKey: sessionKey, sessionKeyAlgo: cipherID)))
+            }
+        }
+        return SessionKeyEnvelope(sessionKey: sessionKey, cipherID: cipherID, isV6: isV6, recipientPackets: packets)
+    }
+
+    /// PKESKs from `buildMultiRecipientEnvelope`, then one encrypted body:
+    /// SEIPDv2 for a v6 envelope, SEIPDv1 otherwise.
+    static func buildMultiRecipientMessage(
+        plaintext: Data,
+        recipients: [EnvelopeRecipient],
+        signingInfo: Ed25519SigningInfo? = nil,
+        prebuiltSignature: (packet: [UInt8], keyID: [UInt8])? = nil,
+        filename: String? = nil,
+        armor: Bool = true
+    ) throws -> Data {
+        let envelope = try buildMultiRecipientEnvelope(recipients: recipients)
+        var message = envelope.recipientPackets
+        if envelope.isV6 {
+            message.append(try buildSEIPDv2Packet(
+                plaintext: Array(plaintext),
+                sessionKey: envelope.sessionKey,
+                cipherAlgorithmID: envelope.cipherID,
+                signingInfo: signingInfo,
+                prebuiltSignature: prebuiltSignature,
+                filename: filename
+            ))
+        } else {
+            message.append(try buildSEIPDPacket(
+                plaintext: Array(plaintext),
+                sessionKey: envelope.sessionKey,
+                sessionAlgorithmID: envelope.cipherID,
+                signingInfo: signingInfo,
+                prebuiltSignature: prebuiltSignature,
+                filename: filename
+            ))
+        }
         if armor {
             let armored = armorMessage(message)
             return armored.data(using: .utf8) ?? message
@@ -828,9 +1079,13 @@ class OpenPGPPacketBuilder {
                     throw PacketBuilderError.sessionKeyGenerationFailed
                 }
                 let fp = Array(signer.fingerprint.prefix(32))
-                let onePassSig = buildOnePassSignaturePacketV6(sigType: 0x00, salt: sigSalt, fingerprint: fp)
+                // 8.3.0 (4.1): a composite ML-DSA + EdDSA primary signs here
+                // too; the algorithm octet and signature come from the signer.
+                let v6Signer = V6SignatureKey(signer)
+                let onePassSig = buildOnePassSignaturePacketV6(sigType: 0x00, salt: sigSalt, fingerprint: fp,
+                                                               pubAlgo: v6Signer.publicKeyAlgorithm)
                 let signaturePacket = try buildBinarySignaturePacketV6(
-                    signingKey: signer.privateKey,
+                    signer: v6Signer,
                     fingerprint: fp,
                     literalBody: plaintext,
                     salt: sigSalt
@@ -1053,13 +1308,14 @@ class OpenPGPPacketBuilder {
     private static func buildOnePassSignaturePacketV6(
         sigType: UInt8,
         salt: [UInt8],
-        fingerprint: [UInt8]
+        fingerprint: [UInt8],
+        pubAlgo: UInt8 = 27
     ) -> [UInt8] {
         var body: [UInt8] = []
         body.append(6)            // version 6
         body.append(sigType)      // 0x00 = binary document
         body.append(8)            // hash algo: SHA-256
-        body.append(27)           // pub algo: Ed25519 (native)
+        body.append(pubAlgo)      // pub algo: 27 Ed25519 (native), 30/31 composite (8.3.0, 4.1)
         body.append(UInt8(salt.count))
         body.append(contentsOf: salt)
         body.append(contentsOf: fingerprint)  // 32-byte issuer fingerprint
@@ -1072,13 +1328,16 @@ class OpenPGPPacketBuilder {
     /// SigningService.signDetachedEd25519v6 but returns a raw tag-2 packet (not
     /// armored) and signs the raw literal body (no canonicalization).
     private static func buildBinarySignaturePacketV6(
-        signingKey: Curve25519.Signing.PrivateKey,
+        signer: V6SignatureKey,
         fingerprint: [UInt8],
         literalBody: [UInt8],
         salt: [UInt8]
     ) throws -> [UInt8] {
         let v6FP = Array(fingerprint.prefix(32))
         let creationTime = UInt32(Date().timeIntervalSince1970)
+        // 8.3.0 (4.1): 27 for Ed25519, 30/31 for a composite ML-DSA + EdDSA
+        // key; both sign the same SHA-256 digest with a 16-octet salt.
+        let pubAlgo = signer.publicKeyAlgorithm
 
         // Hashed subpackets: creation time (2) + issuer fingerprint (33, v6 = 6||fp).
         var hashedSubpackets: [UInt8] = []
@@ -1096,9 +1355,9 @@ class OpenPGPPacketBuilder {
         var unhashedSubpackets: [UInt8] = []
         unhashedSubpackets.append(contentsOf: buildSignatureSubpacket(type: 16, data: Array(v6FP.prefix(8))))
 
-        // rawHashedPortion: 6 | sigType | algo(27) | hash(8) | hashedLen(4) | hashed
+        // rawHashedPortion: 6 | sigType | algo | hash(8) | hashedLen(4) | hashed
         let sigType: UInt8 = 0x00
-        var rawHashedPortion: [UInt8] = [6, sigType, 27, 8]
+        var rawHashedPortion: [UInt8] = [6, sigType, pubAlgo, 8]
         let hashedLen32 = UInt32(hashedSubpackets.count)
         rawHashedPortion.append(UInt8((hashedLen32 >> 24) & 0xFF))
         rawHashedPortion.append(UInt8((hashedLen32 >> 16) & 0xFF))
@@ -1120,20 +1379,19 @@ class OpenPGPPacketBuilder {
         hashInput.append(UInt8( totalHashed4        & 0xFF))
 
         let digestBytes = Array(SHA256.hash(data: hashInput))
-        let signature: Data
+        let sigBytes: [UInt8]
         do {
-            signature = try signingKey.signature(for: Data(digestBytes))
+            sigBytes = try signer.sign(digest: digestBytes)
         } catch {
-            throw PacketBuilderError.signingFailed(error.localizedDescription)
+            throw PacketBuilderError.signingFailed((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
         }
-        let sigBytes = Array(signature)
-        guard sigBytes.count == 64 else {
-            throw PacketBuilderError.signingFailed("v6 Ed25519 signature must be 64 bytes, got \(sigBytes.count)")
+        guard sigBytes.count == signer.signatureLength else {
+            throw PacketBuilderError.signingFailed("v6 signature must be \(signer.signatureLength) bytes, got \(sigBytes.count)")
         }
 
-        // Packet body: 6 | sigType | 27 | 8 | hashedLen(4) | hashed | unhashedLen(4) |
-        //              unhashed | hashPrefix(2) | saltLen(1) | salt | sig(64)
-        var sigBody: [UInt8] = [6, sigType, 27, 8]
+        // Packet body: 6 | sigType | algo | 8 | hashedLen(4) | hashed | unhashedLen(4) |
+        //              unhashed | hashPrefix(2) | saltLen(1) | salt | sig
+        var sigBody: [UInt8] = [6, sigType, pubAlgo, 8]
         sigBody.append(UInt8((hashedLen32 >> 24) & 0xFF))
         sigBody.append(UInt8((hashedLen32 >> 16) & 0xFF))
         sigBody.append(UInt8((hashedLen32 >> 8) & 0xFF))
@@ -1149,7 +1407,7 @@ class OpenPGPPacketBuilder {
         sigBody.append(digestBytes[1])
         sigBody.append(UInt8(salt.count))
         sigBody.append(contentsOf: salt)
-        sigBody.append(contentsOf: sigBytes)   // native 64-byte Ed25519 sig (no MPI)
+        sigBody.append(contentsOf: sigBytes)   // native signature value (no MPI)
 
         return buildNewFormatPacketBytes(tag: 2, body: sigBody)
     }

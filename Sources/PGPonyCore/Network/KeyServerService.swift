@@ -70,10 +70,91 @@ class KeyServerService {
         return server.baseURL
     }
 
+    // MARK: - 8.3.0 (planning 6.2): custom servers, HKP and sanitized errors
+
+    /// "<host>: check your connection" in place of URLSession's description,
+    /// which names internal error domains and codes.
+    private func connectionError(_ error: Error, on server: KeyServer) -> KeyServerError {
+        if let e = error as? KeyServerError { return e }
+        return .networkError(String(localized: "\(server.host): check your connection"))
+    }
+
+    /// True for the transport failures that mean the request never got an
+    /// answer, as opposed to an answer we did not like.
+    private func isConnectionFailure(_ error: Error) -> Bool {
+        if error is KeyServerError { return false }
+        let ns = error as NSError
+        return ns.domain == NSURLErrorDomain
+    }
+
+    /// HKP lookup (RFC 4880 draft-shaw-openpgp-hkp): GET /pks/lookup with
+    /// op=get and options=mr; the body is the armored key.
+    func hkpLookup(_ query: String, on server: KeyServer) async throws -> String {
+        try OfflineMode.requireOnline()
+        let search = query.hasPrefix("0x") || query.contains("@") ? query : "0x" + query
+        let encoded = search.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? search
+        guard let url = URL(string: "\(baseURL(for: server))/pks/lookup?op=get&options=mr&search=\(encoded)") else {
+            throw KeyServerError.searchFailed("Invalid URL")
+        }
+        do {
+            let (data, response) = try await session().data(from: url)
+            guard let http = response as? HTTPURLResponse else { throw KeyServerError.invalidResponse }
+            switch http.statusCode {
+            case 200:
+                guard let armored = String(data: data, encoding: .utf8),
+                      armored.contains("-----BEGIN PGP PUBLIC KEY BLOCK-----") else {
+                    throw KeyServerError.noResults
+                }
+                return armored
+            case 404:
+                throw KeyServerError.noResults
+            default:
+                throw KeyServerError.searchFailed("Server returned status \(http.statusCode)")
+            }
+        } catch {
+            throw connectionError(error, on: server)
+        }
+    }
+
+    /// HKP add: POST /pks/add with keytext=<armored>. One retry on a dropped
+    /// connection (Android RC5). No verification tokens exist on HKP, so the
+    /// outcome reports nothing to verify.
+    func hkpAdd(_ armoredKey: String, on server: KeyServer) async throws -> UploadVerifyOutcome {
+        try OfflineMode.requireOnline()
+        guard let url = URL(string: "\(baseURL(for: server))/pks/add") else {
+            throw KeyServerError.uploadFailed("Invalid URL")
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._*")
+        let encoded = armoredKey.addingPercentEncoding(withAllowedCharacters: allowed)?
+            .replacingOccurrences(of: "%20", with: "+") ?? armoredKey
+        request.httpBody = Data("keytext=\(encoded)".utf8)
+        var lastError: Error?
+        for attempt in 0..<2 {
+            do {
+                let (data, response) = try await session().data(for: request)
+                guard let http = response as? HTTPURLResponse else { throw KeyServerError.invalidResponse }
+                guard (200...299).contains(http.statusCode) else {
+                    throw KeyServerError.uploadFailed(Self.uploadFailureText(status: http.statusCode, body: data))
+                }
+                return UploadVerifyOutcome(verificationRequested: [], verificationFailed: [], hadUnverified: false)
+            } catch {
+                lastError = error
+                if attempt == 0, isConnectionFailure(error) { continue }
+                throw connectionError(error, on: server)
+            }
+        }
+        throw connectionError(lastError ?? KeyServerError.invalidResponse, on: server)
+    }
+
     // MARK: - Search by Email (per-server)
 
     /// Search for a public key by email address on a specific server.
     func searchByEmail(_ email: String, on server: KeyServer) async throws -> String {
+        try OfflineMode.requireOnline()
         let encodedEmail = email.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? email
         let urlString = "\(baseURL(for: server))/vks/v1/by-email/\(encodedEmail)"
 
@@ -100,9 +181,16 @@ class KeyServerService {
                 throw KeyServerError.searchFailed("Server returned status \(httpResponse.statusCode)")
             }
         } catch let error as KeyServerError {
+            // 8.3.0 (6.2): a custom server may speak HKP only.
+            if server.isCustom, case .noResults = error {
+                return try await hkpLookup(email, on: server)
+            }
             throw error
         } catch {
-            throw KeyServerError.networkError(error.localizedDescription)
+            if server.isCustom, isConnectionFailure(error) {
+                return try await hkpLookup(email, on: server)
+            }
+            throw connectionError(error, on: server)
         }
     }
 
@@ -114,6 +202,7 @@ class KeyServerService {
     /// dispatch to the right endpoint, and give a clear error for inputs that
     /// are too short to be either.
     func searchByFingerprint(_ fingerprint: String, on server: KeyServer) async throws -> String {
+        try OfflineMode.requireOnline()
         let cleanFingerprint = fingerprint
             .replacingOccurrences(of: " ", with: "")
             .replacingOccurrences(of: "0x", with: "", options: .caseInsensitive)
@@ -166,9 +255,16 @@ class KeyServerService {
                 throw KeyServerError.searchFailed("Server returned status \(httpResponse.statusCode)")
             }
         } catch let error as KeyServerError {
+            // 8.3.0 (6.2): a custom server may speak HKP only.
+            if server.isCustom, case .noResults = error {
+                return try await hkpLookup(cleanFingerprint, on: server)
+            }
             throw error
         } catch {
-            throw KeyServerError.networkError(error.localizedDescription)
+            if server.isCustom, isConnectionFailure(error) {
+                return try await hkpLookup(cleanFingerprint, on: server)
+            }
+            throw connectionError(error, on: server)
         }
     }
 
@@ -210,8 +306,7 @@ class KeyServerService {
             }
 
             guard httpResponse.statusCode == 200 else {
-                let errorMsg = String(data: data, encoding: .utf8) ?? "Unknown error"
-                throw KeyServerError.uploadFailed("Status \(httpResponse.statusCode): \(errorMsg)")
+                throw KeyServerError.uploadFailed(Self.uploadFailureText(status: httpResponse.statusCode, body: data))
             }
 
             // Parse JSON response. Hagrid returns:
@@ -226,21 +321,21 @@ class KeyServerService {
             }
 
             var unpublishedEmails: [String] = []
-            if let statusDict = json["status"] as? [String: String] {
-                for (email, emailStatus) in statusDict where emailStatus == "unpublished" {
-                    unpublishedEmails.append(email)
-                }
+            let statusDict = (json["status"] as? [String: String]) ?? [:]
+            for (email, emailStatus) in statusDict where emailStatus == "unpublished" {
+                unpublishedEmails.append(email)
             }
 
             return UploadResult(
                 token: token,
                 requiresVerification: !unpublishedEmails.isEmpty,
-                emailsToVerify: unpublishedEmails
+                emailsToVerify: unpublishedEmails,
+                statusByEmail: statusDict
             )
         } catch let error as KeyServerError {
             throw error
         } catch {
-            throw KeyServerError.networkError(error.localizedDescription)
+            throw connectionError(error, on: server)
         }
     }
 
@@ -287,9 +382,22 @@ class KeyServerService {
     /// failure does NOT throw, because the key already uploaded successfully — it
     /// is reported in the outcome so the UI can tell the user to retry.
     func uploadAndRequestVerification(_ armoredKey: String, to server: KeyServer) async throws -> UploadVerifyOutcome {
-        let result = try await uploadPublicKey(armoredKey, to: server)
+        try OfflineMode.requireOnline()
+        let result: UploadResult
+        do {
+            result = try await uploadPublicKey(armoredKey, to: server)
+        } catch {
+            // 8.3.0 (6.2, Android RC5): a custom server that does not answer
+            // the VKS probe, or answers it with a 404 or 405, gets the HKP add
+            // instead of an abort. The built-ins speak VKS; their errors stand.
+            guard server.isCustom, Self.vksProbeFailed(error) else {
+                throw connectionError(error, on: server)
+            }
+            return try await hkpAdd(armoredKey, on: server)
+        }
         guard result.requiresVerification else {
-            return UploadVerifyOutcome(verificationRequested: [], verificationFailed: [], hadUnverified: false)
+            return UploadVerifyOutcome(verificationRequested: [], verificationFailed: [], hadUnverified: false,
+                                       statusByEmail: result.statusByEmail)
         }
         var requested: [String] = []
         var failed: [String] = []
@@ -304,8 +412,22 @@ class KeyServerService {
         return UploadVerifyOutcome(
             verificationRequested: requested,
             verificationFailed: failed,
-            hadUnverified: true
+            hadUnverified: true,
+            statusByEmail: result.statusByEmail
         )
+    }
+
+    /// The VKS upload failures that mean "this server has no VKS endpoint":
+    /// a connection failure, or a 404 / 405 on /vks/v1/upload.
+    private static func vksProbeFailed(_ error: Error) -> Bool {
+        if let e = error as? KeyServerError {
+            if case .uploadFailed(let msg) = e {
+                return msg.hasPrefix("Status 404") || msg.hasPrefix("Status 405") || msg.hasPrefix("Status 501")
+            }
+            if case .networkError = e { return true }
+            return false
+        }
+        return (error as NSError).domain == NSURLErrorDomain
     }
 
     // MARK: - Cross-server lookup
@@ -405,20 +527,9 @@ class KeyServerService {
         try await lookupAcrossServers(fingerprint, by: .fingerprint)
     }
 
-    /// Upload to keys.openpgp.org (original default target).
-    func uploadPublicKey(_ armoredKey: String) async throws -> UploadResult {
-        try await uploadPublicKey(armoredKey, to: .openPGPOrg)
-    }
-
-    /// Request verification on keys.openpgp.org (original default target).
-    func requestVerification(token: String, email: String) async throws {
-        try await requestVerification(token: token, email: email, on: .openPGPOrg)
-    }
-
-    /// Upload + request-verify against keys.openpgp.org (original default target).
-    func uploadAndRequestVerification(_ armoredKey: String) async throws -> UploadVerifyOutcome {
-        try await uploadAndRequestVerification(armoredKey, to: .openPGPOrg)
-    }
+    // 8.3.0 (planning 3.2): the single-server upload wrappers that targeted
+    // keys.openpgp.org alone are gone with the Exchange tab's legacy upload;
+    // every upload now goes through PublishSheet, per selected server.
 }
 
 // MARK: - Result Types
@@ -427,10 +538,15 @@ struct UploadResult {
     let token: String
     let requiresVerification: Bool
     let emailsToVerify: [String]
+    /// 8.3.0 (3.3 e): the server's status per address as returned by the
+    /// upload ("published", "pending", "unpublished", "revoked").
+    var statusByEmail: [String: String] = [:]
 }
 
-/// v7.1.0 (Batuhan) — outcome of uploadAndRequestVerification, with a single
-/// user-facing summary so both upload screens show the same explanation.
+/// v7.1.0 (Batuhan) — outcome of uploadAndRequestVerification. 8.3.0: the
+/// per-address status map rides along so PublishSheet can say what each
+/// server did with each address; the keys.openpgp.org-specific summary
+/// message retired with the Exchange tab's single-server upload.
 struct UploadVerifyOutcome {
     /// Addresses the server was successfully asked to email a verification link to.
     let verificationRequested: [String]
@@ -438,25 +554,26 @@ struct UploadVerifyOutcome {
     let verificationFailed: [String]
     /// True when the key had at least one address that needed verification.
     let hadUnverified: Bool
+    /// The server's status per address, from the upload response.
+    var statusByEmail: [String: String] = [:]
+}
 
-    /// What to show the user after a successful upload.
-    var userMessage: String {
-        if !hadUnverified {
-            return String(localized: "Your key is uploaded and already published on keys.openpgp.org.")
+// MARK: - Upload failure text (8.3.0, 9.5)
+
+extension KeyServerService {
+    /// 8.3.0 (9.5): a VKS server (Hagrid, keys.pgpony.app) answers a rejected
+    /// upload with `{"error": "..."}`. Show that sentence; fall back to the
+    /// status and a short body only when there is no such field.
+    static func uploadFailureText(status: Int, body: Data) -> String {
+        if let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+           let message = (json["error"] as? String) ?? (json["message"] as? String),
+           !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return String(localized: "The server rejected the upload: \(message.trimmingCharacters(in: .whitespacesAndNewlines))")
         }
-        if !verificationRequested.isEmpty {
-            let list = verificationRequested.joined(separator: ", ")
-            let base = String(
-                format: String(localized: "Uploaded. Check %@ for a verification link from keys.openpgp.org and confirm it to make your key searchable by email. Until then it's findable only by its full fingerprint."),
-                list
-            )
-            guard !verificationFailed.isEmpty else { return base }
-            let failList = verificationFailed.joined(separator: ", ")
-            return base + "\n\n" + String(
-                format: String(localized: "A verification request couldn't be sent for %@. Try uploading again."),
-                failList
-            )
+        let text = String(data: body, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if text.isEmpty {
+            return String(localized: "The server rejected the upload (status \(status)).")
         }
-        return String(localized: "Your key uploaded, but the verification email couldn't be requested. Try again. Until your address is verified, the key is findable only by its full fingerprint.")
+        return "Status \(status): \(text.prefix(200))"
     }
 }

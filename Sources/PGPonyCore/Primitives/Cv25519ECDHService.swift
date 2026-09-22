@@ -80,29 +80,47 @@ class Cv25519ECDHService {
         recipientPublicKey: [UInt8],
         recipientFingerprint: [UInt8],
         kdfHashID: UInt8 = sha256ID,
-        kdfCipherID: UInt8 = aes128ID
+        kdfCipherID: UInt8 = aes128ID,
+        includesAlgorithmID: Bool = true,
+        curve: ECCurve = .cv25519
     ) throws -> ECDHEncryptedSessionKey {
 
-        // 1. Generate ephemeral X25519 keypair
-        let ephemeralKey = Curve25519.KeyAgreement.PrivateKey()
-        let ephemeralPublicBytes = Array(ephemeralKey.publicKey.rawRepresentation)
+        // 1. + 2. Ephemeral keypair and shared secret. 8.3.0 (NIST B): on a
+        // NIST curve the recipient key and the ephemeral key are SEC 1
+        // points (0x04 || X || Y) and the shared secret is the X coordinate;
+        // the KDF below then takes that curve's OID (NIST A).
+        let ephemeralPublicBytes: [UInt8]
+        let sharedSecretBytes: [UInt8]
+        let curveOID: [UInt8]
+        if let nist = curve.nistCurve {
+            let ephemeral = NISTECDHService.generateEphemeral(curve: nist)
+            ephemeralPublicBytes = ephemeral.point
+            do {
+                sharedSecretBytes = try NISTECDHService.sharedSecret(curve: nist, scalar: ephemeral.scalar, peerPoint: recipientPublicKey)
+            } catch {
+                throw ECDHError.keyAgreementFailed(error.localizedDescription)
+            }
+            curveOID = nist.oid
+        } else {
+            let ephemeralKey = Curve25519.KeyAgreement.PrivateKey()
+            ephemeralPublicBytes = Array(ephemeralKey.publicKey.rawRepresentation)
 
-        // 2. Compute shared secret
-        let recipientPubKey: Curve25519.KeyAgreement.PublicKey
-        do {
-            recipientPubKey = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: recipientPublicKey)
-        } catch {
-            throw ECDHError.invalidPublicKey
+            let recipientPubKey: Curve25519.KeyAgreement.PublicKey
+            do {
+                recipientPubKey = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: recipientPublicKey)
+            } catch {
+                throw ECDHError.invalidPublicKey
+            }
+
+            let sharedSecret: SharedSecret
+            do {
+                sharedSecret = try ephemeralKey.sharedSecretFromKeyAgreement(with: recipientPubKey)
+            } catch {
+                throw ECDHError.keyAgreementFailed(error.localizedDescription)
+            }
+            sharedSecretBytes = sharedSecret.withUnsafeBytes { Array($0) }
+            curveOID = Cv25519ECDHService.cv25519OID
         }
-
-        let sharedSecret: SharedSecret
-        do {
-            sharedSecret = try ephemeralKey.sharedSecretFromKeyAgreement(with: recipientPubKey)
-        } catch {
-            throw ECDHError.keyAgreementFailed(error.localizedDescription)
-        }
-
-        let sharedSecretBytes = sharedSecret.withUnsafeBytes { Array($0) }
 
         // 3. Derive KEK via RFC 6637 §7 KDF
         let kekSize = try keySize(for: kdfCipherID)
@@ -112,16 +130,18 @@ class Cv25519ECDHService {
         )
         let kek = try deriveKEK(
             sharedSecret: sharedSecretBytes,
-            curveOID: Cv25519ECDHService.cv25519OID,
+            curveOID: curveOID,
             kdfParams: kdfParams,
             fingerprint: recipientFingerprint,
             keySize: kekSize,
             hashID: kdfHashID
         )
 
-        // 4. Build plaintext for wrapping: algorithm ID + session key + 2-byte checksum
+        // 4. Build plaintext for wrapping: algorithm ID + session key + 2-byte checksum.
+        //    8.3.0 (4.4): a v6 PKESK (RFC 9580 11.5) carries no algorithm octet;
+        //    the cipher is declared by the SEIPDv2 packet instead.
         var wrappingInput: [UInt8] = []
-        wrappingInput.append(sessionAlgorithmID)
+        if includesAlgorithmID { wrappingInput.append(sessionAlgorithmID) }
         wrappingInput.append(contentsOf: sessionKey)
         let checksum = sessionKey.reduce(UInt16(0)) { ($0 &+ UInt16($1)) }
         wrappingInput.append(UInt8((checksum >> 8) & 0xFF))
@@ -138,8 +158,9 @@ class Cv25519ECDHService {
             throw ECDHError.sessionKeyWrapFailed(error.localizedDescription)
         }
 
-        // Ephemeral public key with 0x40 prefix (OpenPGP Cv25519 encoding)
-        let ephemeralEncoded: [UInt8] = [0x40] + ephemeralPublicBytes
+        // Ephemeral public key with 0x40 prefix (OpenPGP Cv25519 encoding); a
+        // NIST point is already in its SEC 1 form 0x04 || X || Y (8.3.0, NIST B).
+        let ephemeralEncoded: [UInt8] = curve.nistCurve == nil ? [0x40] + ephemeralPublicBytes : ephemeralPublicBytes
 
         return ECDHEncryptedSessionKey(
             ephemeralPublicKey: ephemeralEncoded,
@@ -165,8 +186,30 @@ class Cv25519ECDHService {
         recipientPrivateKey: [UInt8],
         recipientFingerprint: [UInt8],
         kdfHashID: UInt8 = sha256ID,
-        kdfCipherID: UInt8 = aes128ID
+        kdfCipherID: UInt8 = aes128ID,
+        includesAlgorithmID: Bool = true,
+        curve: ECCurve = .cv25519
     ) throws -> (algorithmID: UInt8, sessionKey: [UInt8]) {
+
+        // 8.3.0 (NIST B): a NIST subkey agrees on its own curve; the KDF and
+        // unwrap are the same RFC 6637 steps with that curve's OID.
+        if let nist = curve.nistCurve {
+            let shared: [UInt8]
+            do {
+                shared = try NISTECDHService.sharedSecret(curve: nist, scalar: recipientPrivateKey, peerPoint: ephemeralPublicKey)
+            } catch {
+                throw ECDHError.keyAgreementFailed(error.localizedDescription)
+            }
+            return try sessionKeyFromSharedSecret(
+                sharedSecret: shared,
+                wrappedSessionKey: wrappedSessionKey,
+                recipientFingerprint: recipientFingerprint,
+                kdfHashID: kdfHashID,
+                kdfCipherID: kdfCipherID,
+                includesAlgorithmID: includesAlgorithmID,
+                curveOID: nist.oid
+            )
+        }
 
         // 1. Parse ephemeral public key (strip 0x40 prefix)
         var ephemeralRaw = ephemeralPublicKey
@@ -206,7 +249,8 @@ class Cv25519ECDHService {
             wrappedSessionKey: wrappedSessionKey,
             recipientFingerprint: recipientFingerprint,
             kdfHashID: kdfHashID,
-            kdfCipherID: kdfCipherID
+            kdfCipherID: kdfCipherID,
+            includesAlgorithmID: includesAlgorithmID
         )
     }
 
@@ -219,10 +263,12 @@ class Cv25519ECDHService {
         wrappedSessionKey: [UInt8],
         recipientFingerprint: [UInt8],
         kdfHashID: UInt8 = sha256ID,
-        kdfCipherID: UInt8 = aes128ID
+        kdfCipherID: UInt8 = aes128ID,
+        includesAlgorithmID: Bool = true,
+        curveOID: [UInt8] = Cv25519ECDHService.cv25519OID
     ) throws -> (algorithmID: UInt8, sessionKey: [UInt8]) {
 
-        // 3. Derive KEK
+        // 3. Derive KEK (8.3.0, NIST A: with the recipient key's own curve OID)
         let kekSize = try keySize(for: kdfCipherID)
         let kdfParams = buildKDFParams(
             kdfHashID: kdfHashID,
@@ -230,7 +276,7 @@ class Cv25519ECDHService {
         )
         let kek = try deriveKEK(
             sharedSecret: sharedSecret,
-            curveOID: Cv25519ECDHService.cv25519OID,
+            curveOID: curveOID,
             kdfParams: kdfParams,
             fingerprint: recipientFingerprint,
             keySize: kekSize,
@@ -253,8 +299,13 @@ class Cv25519ECDHService {
         // Strip PKCS5 padding
         let unpadded = pkcs5Unpad(unwrapped)
 
-        let algorithmID = unpadded[0]
-        let sessionKey = Array(unpadded[1..<(unpadded.count - 2)])
+        // 8.3.0 (4.4): a v6 PKESK payload carries no algorithm octet (RFC 9580
+        // 11.5); the cipher comes from the SEIPDv2 header, reported here as 0.
+        guard unpadded.count >= (includesAlgorithmID ? 4 : 3) else {
+            throw ECDHError.invalidWrappedData
+        }
+        let algorithmID: UInt8 = includesAlgorithmID ? unpadded[0] : 0
+        let sessionKey = Array(unpadded[(includesAlgorithmID ? 1 : 0)..<(unpadded.count - 2)])
         let checksumHi = unpadded[unpadded.count - 2]
         let checksumLo = unpadded[unpadded.count - 1]
         let expectedChecksum = UInt16(checksumHi) << 8 | UInt16(checksumLo)
@@ -312,11 +363,16 @@ class Cv25519ECDHService {
         hashInput.append(contentsOf: sharedSecret)
         hashInput.append(contentsOf: param)
 
+        // 8.3.0 (NIST A): SHA-384 and SHA-512 too. GnuPG pairs P-384 with
+        // SHA-384 and P-521 with SHA-512 (both with an AES-256 KEK).
         let digest: [UInt8]
         switch hashID {
         case sha256ID:
-            let hash = SHA256.hash(data: hashInput)
-            digest = Array(hash)
+            digest = Array(SHA256.hash(data: hashInput))
+        case 9:
+            digest = Array(SHA384.hash(data: hashInput))
+        case 10:
+            digest = Array(SHA512.hash(data: hashInput))
         default:
             throw ECDHError.unsupportedAlgorithm(hashID)
         }
@@ -333,11 +389,28 @@ class Cv25519ECDHService {
     }
 
     /// Get the key size in bytes for an OpenPGP symmetric algorithm
+    /// The KEK length, in bytes, for a symmetric algorithm ID appearing in a
+    /// recipient's ECDH KDF parameters.
+    ///
+    /// RFC 6637 wraps the session key with AES Key Wrap (RFC 3394) no matter
+    /// which symmetric algorithm the recipient's KDF parameters name; that field
+    /// only fixes the KEK length. So a non-AES value here is not an algorithm we
+    /// have to implement — it just says how many key bytes to derive, and AES
+    /// Key Wrap then runs on the resulting 16-, 24-, or 32-byte KEK as usual.
+    /// Rejecting these outright (the old behaviour) meant PGPony could neither
+    /// encrypt to nor decrypt from any key whose ECDH subkey specified Twofish
+    /// or Camellia, stopping with "Unsupported symmetric algorithm ID: 10" the
+    /// moment such a contact's key was used. GnuPG and Sequoia both size the KEK
+    /// this way and AES-wrap, so accepting them is what keeps interop working.
     static func keySize(for algorithmID: UInt8) throws -> Int {
         switch algorithmID {
-        case 7: return 16   // AES-128
-        case 8: return 24   // AES-192
-        case 9: return 32   // AES-256
+        case 7:  return 16   // AES-128
+        case 8:  return 24   // AES-192
+        case 9:  return 32   // AES-256
+        case 10: return 32   // Twofish-256
+        case 11: return 16   // Camellia-128
+        case 12: return 24   // Camellia-192
+        case 13: return 32   // Camellia-256
         default: throw ECDHError.unsupportedAlgorithm(algorithmID)
         }
     }

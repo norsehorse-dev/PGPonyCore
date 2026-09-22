@@ -12,11 +12,13 @@
 // The S2K-derived key is used directly as the session key (there is no
 // encrypted-session-key field), exactly as `gpg --symmetric` produces.
 //
-// On DECRYPT, PGPony reads both:
+// On DECRYPT, PGPony reads all three:
 //   - v4 SKESK (S2K modes 0 / 1 / 3)  -> SEIPDv1 (CFB + MDC)
+//   - v5 SKESK (LibrePGP, S2K + AEAD) -> tag 20 AEAD Encrypted Data (OCB)
 //   - v6 SKESK (Argon2id)             -> SEIPDv2 (AES-OCB)
-// so it can open classic gpg -c output as well as any v6 messages produced by
-// earlier builds.
+// so it can open classic gpg -c output, the `gpg -c --force-aead` output of
+// GnuPG 2.2.8 through 2.5.x (8.3.0, field report against a 2.5.22 file), and
+// any v6 messages produced by earlier builds.
 //
 // New code here is confined to the v4 SKESK build/parse. The S2K derivation,
 // the SEIPD bodies, packet parsing, and armoring are all reused from existing,
@@ -132,34 +134,48 @@ enum SymmetricEncryption {
         }
         let opened = try openSKESK(body: skesk.body, passphrase: passphrase)
 
-        guard let seipdPacket = packets.first(where: { $0.tag == 18 }) else {
-            throw SymmetricEncryptionError.noSEIPD
-        }
-        let seipd = try OpenPGPPacketParser.parseSEIPD(body: seipdPacket.body)
-
         let inner: [UInt8]
-        do {
-            switch seipd.version {
-            case 1:
-                inner = try OpenPGPPacketParser.decryptSEIPD(
-                    encryptedData: seipd.encryptedData,
-                    sessionKey: opened.sessionKey,
-                    algorithmID: opened.cipherAlgo
-                )
-            case 2:
-                inner = try OpenPGPPacketParser.decryptSEIPDv2(
-                    seipd: seipd,
-                    sessionKey: opened.sessionKey
-                )
-            default:
-                throw SymmetricEncryptionError.unsupportedSEIPDVersion(seipd.version)
+        if let aeadPacket = packets.first(where: { $0.tag == 20 }) {
+            // `gpg -c --force-aead` (GnuPG 2.2.8 through 2.5.x) pairs a v5
+            // SKESK with a LibrePGP AEAD Encrypted Data packet (tag 20), the
+            // same body the PKESK paths already decrypt for AEAD messages
+            // addressed to a key. The v5 unwrap above is authenticated, so a
+            // wrong passphrase has already been reported there; a failure here
+            // is a damaged body or an AEAD mode this build lacks (EAX), and
+            // its own message is the useful one.
+            inner = try OpenPGPPacketParser.decryptAEADEncryptedData(
+                body: aeadPacket.body,
+                sessionKey: opened.sessionKey
+            )
+        } else {
+            guard let seipdPacket = packets.first(where: { $0.tag == 18 }) else {
+                throw SymmetricEncryptionError.noSEIPD
             }
-        } catch let e as SymmetricEncryptionError {
-            throw e
-        } catch {
-            // A v4 SKESK is not authenticated, so a wrong passphrase surfaces as
-            // an MDC / decryption failure at this step rather than earlier.
-            throw SymmetricEncryptionError.wrongPassphrase
+            let seipd = try OpenPGPPacketParser.parseSEIPD(body: seipdPacket.body)
+
+            do {
+                switch seipd.version {
+                case 1:
+                    inner = try OpenPGPPacketParser.decryptSEIPD(
+                        encryptedData: seipd.encryptedData,
+                        sessionKey: opened.sessionKey,
+                        algorithmID: opened.cipherAlgo
+                    )
+                case 2:
+                    inner = try OpenPGPPacketParser.decryptSEIPDv2(
+                        seipd: seipd,
+                        sessionKey: opened.sessionKey
+                    )
+                default:
+                    throw SymmetricEncryptionError.unsupportedSEIPDVersion(seipd.version)
+                }
+            } catch let e as SymmetricEncryptionError {
+                throw e
+            } catch {
+                // A v4 SKESK is not authenticated, so a wrong passphrase surfaces as
+                // an MDC / decryption failure at this step rather than earlier.
+                throw SymmetricEncryptionError.wrongPassphrase
+            }
         }
 
         let innerPackets = try OpenPGPPacketParser.parsePackets(data: inner)
@@ -194,6 +210,8 @@ enum SymmetricEncryption {
         switch version {
         case 4:
             return try openV4SKESK(body: body, passphrase: passphrase)
+        case 5:
+            return try openV5SKESK(body: body, passphrase: passphrase)
         case 6:
             let key = try openV6SKESK(body: body, passphrase: passphrase)
             // v6 pairs with SEIPDv2, which carries its own cipher; this value is
@@ -254,6 +272,105 @@ enum SymmetricEncryption {
             keySize: keySize
         )
         return (sessionKey, cipherAlgo)
+    }
+
+    // Reads a LibrePGP v5 SKESK, the packet GnuPG writes for `gpg -c
+    // --force-aead` (2.2.8 through 2.5.x). Layout, per LibrePGP section 5.3:
+    //   version(5) | cipher | aead | S2K specifier | nonce (15 for OCB, 16 for
+    //   EAX) | encrypted session key (cipher key length) | auth tag (16)
+    // The S2K output is the key-encryption key as it is (no HKDF step, which
+    // is the v6 difference), and the associated data is the four header
+    // octets 0xC3 | 0x05 | cipher | aead. The packet after it is a tag 20
+    // AEAD Encrypted Data packet, which decrypt() hands to the parser's
+    // existing tag 20 routine. Verified against a gpg 2.5.22 file (AES-256,
+    // OCB, S2K type 3 with SHA-256); see SymmetricAEADv5Tests.
+    private static func openV5SKESK(body: [UInt8], passphrase: String) throws
+        -> (sessionKey: [UInt8], cipherAlgo: UInt8) {
+        var off = 0
+        func need(_ n: Int, _ what: String) throws {
+            guard off + n <= body.count else {
+                throw SymmetricEncryptionError.malformedSKESK("truncated \(what)")
+            }
+        }
+
+        try need(4, "header")
+        off += 1                                  // version (5)
+        let cipherAlgo = body[off]; off += 1
+        let aeadAlgo = body[off]; off += 1
+        let s2kType = body[off]; off += 1
+        let keySize = try cipherKeySize(cipherAlgo)
+
+        let kek: [UInt8]
+        switch s2kType {
+        case 0, 1, 3:                              // Simple / Salted / Iterated+salted
+            try need(1, "S2K hash")
+            let hashAlgo = body[off]; off += 1
+            var salt: [UInt8] = []
+            var codedCount: UInt8 = 0
+            if s2kType != 0 {
+                try need(8, "S2K salt")
+                salt = Array(body[off..<off + 8]); off += 8
+            }
+            if s2kType == 3 {
+                try need(1, "S2K count")
+                codedCount = body[off]; off += 1
+            }
+            // CORE SEAM: the app calls PGPService.s2kDeriveKey; S2K.deriveKey is the same loop.
+            kek = S2K.deriveKey(
+                passphrase: passphrase,
+                salt: salt,
+                s2kType: s2kType,
+                hashAlgo: hashAlgo,
+                codedCount: codedCount,
+                keySize: keySize
+            )
+        case 4:                                    // Argon2: salt(16) | t | p | m
+            try need(19, "Argon2 S2K")
+            let salt = Array(body[off..<off + 16]); off += 16
+            let t = Int(body[off]); off += 1
+            let p = Int(body[off]); off += 1
+            let m = Int(body[off]); off += 1
+            kek = try Argon2Service.deriveKey(
+                passphrase: passphrase,
+                salt: salt,
+                iterations: t,
+                parallelism: p,
+                memoryExponent: m,
+                hashLength: keySize
+            )
+        default:
+            throw SymmetricEncryptionError.malformedSKESK("unsupported S2K type \(s2kType) in a v5 SKESK")
+        }
+
+        let nonceLen = AEADService.nonceSize(for: aeadAlgo)
+        guard nonceLen > 0 else {
+            throw SymmetricEncryptionError.malformedSKESK("unknown AEAD algorithm \(aeadAlgo)")
+        }
+        try need(nonceLen, "nonce")
+        let nonce = Array(body[off..<off + nonceLen]); off += nonceLen
+
+        try need(keySize + AEADService.tagSize, "encrypted session key")
+        let encKey = Array(body[off..<off + keySize]); off += keySize
+        let tag = Array(body[off..<off + AEADService.tagSize]); off += AEADService.tagSize
+
+        let aad: [UInt8] = [0xC3, 0x05, cipherAlgo, aeadAlgo]
+        do {
+            let sessionKey = try AEADService.decrypt(
+                ciphertext: encKey,
+                tag: tag,
+                key: kek,
+                nonce: nonce,
+                aeadAlgo: aeadAlgo,
+                associatedData: aad
+            )
+            return (sessionKey, cipherAlgo)
+        } catch AEADError.unsupportedAlgorithm(let a) {
+            // An AEAD mode this build cannot do (EAX) is a capability gap, not
+            // a wrong passphrase; say so instead of asking for it again.
+            throw AEADError.unsupportedAlgorithm(a)
+        } catch {
+            throw SymmetricEncryptionError.wrongPassphrase
+        }
     }
 
     // Reads a legacy v6 SKESK (Argon2id) that earlier PGPony builds produced.

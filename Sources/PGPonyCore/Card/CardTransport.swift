@@ -221,20 +221,36 @@ enum CardTransportAvailability {
 
 // MARK: - Copy (core subset)
 
-/// CORE SEAM: the two transport-aware strings the card layer itself needs.
+/// CORE SEAM: the transport-aware strings the card layer itself needs.
 ///
 /// The app's full `CardConnectionCopy` — button titles, icon names, the
 /// transport picker flag, the PIN-prompt OTP hint and the `LocalizedStringKey`
 /// variants SwiftUI's `Text` takes — is presentation and stays in the app. Only
-/// these two are reachable from `OpenPGPCardService` (the CoreNFC sheet message
-/// and the transport-correct wording of a dropped connection), so only these two
-/// cross the boundary, verbatim.
+/// these are reachable from `OpenPGPCardService` (the CoreNFC sheet message, the
+/// in-session NFC status lines, and the transport-correct wording of a dropped
+/// connection), so only these cross the boundary, verbatim.
 enum CardConnectionCopy {
 
     /// Message for the system NFC sheet. Ignored on a wired session, which has
     /// no system UI — so this only ever renders when NFC is genuinely in play.
     static var connectPrompt: String {
-        String(localized: "Hold your hardware key near the top of your iPhone.")
+        // 8.3.0 (9.1, the CubicS3 tester): name the spot and the hold. The
+        // NFC antenna is the top edge behind the camera bar, the coupling
+        // window is small, and moving the key mid-session is what turns a
+        // working tap into a generic failure.
+        String(localized: "Hold your hardware key flat against the top edge of your iPhone, behind the camera bar, and keep it still until the checkmark appears.")
+    }
+
+    /// 8.3.0 (9.1): the line every in-session status carries on NFC, so the
+    /// "working" states keep saying the one thing that matters.
+    static var holdStillLine: String {
+        String(localized: "Keep the key still against the top edge.")
+    }
+
+    /// 8.3.0 (9.1): the status shown the moment the tag is read, before the
+    /// PIN check and the operation, so the user knows to stop moving.
+    static var keyFoundStatus: String {
+        String(localized: "Key found. Keep it still while PGPony works…")
     }
 
     /// Pick the wording that matches the transport actually in use.

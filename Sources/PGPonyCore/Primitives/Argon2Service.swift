@@ -77,6 +77,11 @@ class Argon2Service {
         guard m >= 3 else { throw Argon2Error.invalidParameters("memory exponent must be >= 3 (8 KiB)") }
         guard hashLength >= 4 else { throw Argon2Error.hashLengthTooShort }
         guard salt.count == 16 else { throw Argon2Error.invalidParameters("salt must be 16 bytes") }
+        // 8.3.0 hardening (finding 1): the parameters come off the wire and
+        // are honored before the passphrase is checked, so the memory ask is
+        // bounded here, at the one seam every SKESK and secret-key unlock
+        // goes through, before a single block is allocated.
+        try SecurityLimits.enforceArgon2Policy(passes: t, parallelism: p, memoryExponent: m)
 
         // Number of 1 KiB blocks. Must be at least 8*p (RFC 9106 §3.1).
         var memoryBlocks = memorySizeKiB

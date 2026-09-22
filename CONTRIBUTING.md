@@ -18,6 +18,10 @@ wrong in the cryptography or protocol handling.
 
 - **Never commit secrets.** No private keys, no real PINs, no tokens, no personal data —
   not in code, tests, fixtures, or commit messages.
+  One recorded exception: `NISTCurveInteropTests.swift` (PR #4) carries the secret
+  subkeys of three throwaway GnuPG keys generated for that file alone, unprotected and
+  on `@example.invalid` User IDs, because a decrypt test needs them. Anything like it
+  needs the same justification in the file header.
 - Keep contributions to the **crypto/protocol core**; app behavior lives in the
   (closed) apps and isn't changed here.
 - By submitting a contribution you agree it is licensed under

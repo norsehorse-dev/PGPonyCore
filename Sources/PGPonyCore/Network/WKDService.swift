@@ -90,7 +90,18 @@ final class WKDService {
     /// Tries advanced (openpgpkey.<domain>) first, then direct (<domain>).
     /// Returns a result containing the armored key text and which WKD method succeeded.
     /// Throws `WKDError.notFound` if neither method returns a key.
+    /// 8.3.0 (planning 6.4): the lookup-only switch on the key-server list.
+    /// Default on; offline mode still overrides.
+    static let lookupEnabledKey = "pgpony_wkd_lookup_enabled"
+
+    static var isLookupEnabled: Bool {
+        UserDefaults.standard.object(forKey: lookupEnabledKey) == nil
+            ? true : UserDefaults.standard.bool(forKey: lookupEnabledKey)
+    }
+
     func lookup(email: String) async throws -> WKDLookupResult {
+        guard Self.isLookupEnabled else { throw WKDError.notFound }
+        try OfflineMode.requireOnline()
         guard let (localpart, domain) = parseEmail(email) else {
             throw WKDError.invalidEmail
         }

@@ -22,20 +22,23 @@
 // needed at test time) and their user IDs are all @example.invalid. Nothing
 // here is, or ever was, a live secret.
 //
-// WHAT PASSES TODAY — everything below the "Recognition" mark. These pin the
-// behaviour ECCurveOID.swift already provides, plus the two facts that make
-// the operational work more than a type swap:
+// 8.3.0: the operational work landed, so the two tests that were XCTSkips
+// now assert what they named (ECDSA verify and ECDH decrypt on all three
+// curves), and the recognition tests pin the new labels: a NIST key is
+// .nistP256 / .nistP384 / .nistP521 rather than .otherEC, and the three
+// curves are no longer recognition-only (brainpool still is).
+//
+// The recognition tests also pin the two facts that made the operational
+// work more than a type swap:
 //   * the curve check is load-bearing for algo 18, because a NIST ECDH subkey
 //     and a Cv25519 subkey share that algorithm ID; and
 //   * the RFC 6637 KDF parameters are curve-specific (SHA-256/384/512 and
 //     AES-128/192/256), so a deriveKEK that only branches SHA-256 cannot
 //     serve P-384 or P-521.
 //
-// WHAT IS SKIPPED — the two operational tests. They are `XCTSkip` rather than
-// assertions because the APIs they need do not exist yet: decryption is typed
-// `[Cv25519DecryptionKey]`, whose `privateKey` field is a 32-byte X25519
-// scalar, and a P-521 scalar is 66 bytes — it cannot be represented, let alone
-// rejected. Each skip records the assertion it should become.
+// Until 8.3.0 the two operational tests were skipped: decryption was typed
+// `[Cv25519DecryptionKey]` with a 32-byte X25519 scalar, and a P-521 scalar is
+// 66 bytes. The key now carries its curve and a scalar of the curve's size.
 
 import XCTest
 @testable import PGPonyCore
@@ -185,26 +188,30 @@ a832bf582946b5
         }
     }
 
-    /// All six packets classify as `.otherEC` rather than falling back to RSA
-    /// (algo 19 -> nil) or being mislabeled Cv25519 (algo 18).
-    func testNISTKeysClassifyAsOtherEC() {
-        let bodies = [p256PrimaryBody, p256SubkeyBody,
-                      p384PrimaryBody, p384SubkeyBody,
-                      p521PrimaryBody, p521SubkeyBody]
-        for body in bodies {
-            XCTAssertEqual(KeyAlgorithm.from(keyPacketBody: [UInt8](body)), .otherEC)
+    /// All six packets classify by their curve (8.3.0) rather than falling
+    /// back to RSA (algo 19 -> nil) or being mislabeled Cv25519 (algo 18).
+    func testNISTKeysClassifyByCurve() {
+        let cases: [(Data, KeyAlgorithm)] = [
+            (p256PrimaryBody, .nistP256), (p256SubkeyBody, .nistP256),
+            (p384PrimaryBody, .nistP384), (p384SubkeyBody, .nistP384),
+            (p521PrimaryBody, .nistP521), (p521SubkeyBody, .nistP521),
+        ]
+        for (body, expected) in cases {
+            XCTAssertEqual(KeyAlgorithm.from(keyPacketBody: [UInt8](body)), expected)
         }
     }
 
-    /// The three NIST curves are recognition-only today; this is the flag that
-    /// should flip (per curve, not wholesale) when the operational work lands.
-    /// brainpool stays recognition-only — CryptoKit has no brainpool.
-    func testNISTCurvesAreRecognitionOnly() {
+    /// The three NIST curves are operational as of 8.3.0; brainpool stays
+    /// recognition-only (CryptoKit has no brainpool).
+    func testNISTCurvesAreOperational() {
         for curve in [ECCurve.nistP256, .nistP384, .nistP521] {
-            XCTAssertTrue(curve.isRecognitionOnly, "\(curve.displayName) is not operational yet")
+            XCTAssertFalse(curve.isRecognitionOnly, "\(curve.displayName) is operational")
         }
         for curve in [ECCurve.cv25519, .ed25519Legacy, .x25519, .ed25519] {
             XCTAssertFalse(curve.isRecognitionOnly)
+        }
+        for curve in [ECCurve.brainpoolP256r1, .brainpoolP384r1, .brainpoolP512r1] {
+            XCTAssertTrue(curve.isRecognitionOnly, "\(curve.displayName) stays recognition-only")
         }
     }
 
@@ -215,7 +222,7 @@ a832bf582946b5
     func testCurveCheckIsLoadBearingForAlgo18() {
         XCTAssertEqual(KeyAlgorithm.from(algorithmID: 18, keyVersion: 4), .ed25519,
                        "algo 18 by itself still means Cv25519")
-        XCTAssertEqual(KeyAlgorithm.from(keyPacketBody: [UInt8](p521SubkeyBody)), .otherEC,
+        XCTAssertEqual(KeyAlgorithm.from(keyPacketBody: [UInt8](p521SubkeyBody)), .nistP521,
                        "the curve OID is what tells the two apart")
     }
 
@@ -283,29 +290,66 @@ a832bf582946b5
         }
     }
 
-    // MARK: - Operational (skipped until the 8.3.0 work lands)
+    // MARK: - Operational (8.3.0)
 
-    /// Should become: verify `p521DetachedSig` over `signedDocument` with the
-    /// ECDSA primary in `p521PrimaryBody` and assert it returns true, then the
-    /// same for P-256 and P-384. GnuPG reports a good signature for all three.
-    func testECDSAVerify() throws {
-        throw XCTSkip("""
-            No ECDSA verify entry point yet — verifyEd25519Signature is the only \
-            EC verifier, and the signature switch defaults algo 19 to \
-            unverifiable. Vectors for all three curves are in this file.
-            """)
+    /// The public point of a v4 EC key packet: version, time, algorithm, OID,
+    /// then the point as an MPI (0x04 || x || y).
+    private func point(ofKeyPacket body: Data) throws -> [UInt8] {
+        let b = [UInt8](body)
+        let oidLength = Int(b[6])
+        var off = 7 + oidLength
+        let bits = Int(b[off]) << 8 | Int(b[off + 1]); off += 2
+        let length = (bits + 7) / 8
+        return Array(b[off..<(off + length)])
     }
 
-    /// Should become: decrypt each `*EncryptedMessage` with the matching
-    /// `*SecretSubkeyBody` and assert the plaintext is `expectedPlaintext`.
-    /// GnuPG returns exactly that for all three.
+    /// GnuPG's detached signatures verify with each primary's ECDSA key, and
+    /// a changed document does not.
+    func testECDSAVerify() throws {
+        let cases: [(String, Data, Data)] = [
+            ("P-256", p256PrimaryBody, p256DetachedSig),
+            ("P-384", p384PrimaryBody, p384DetachedSig),
+            ("P-521", p521PrimaryBody, p521DetachedSig),
+        ]
+        for (name, primary, sig) in cases {
+            let parsed = try OpenPGPPacketParser.parseSignaturePacket(body: [UInt8](sig))
+            let publicPoint = try point(ofKeyPacket: primary)
+            XCTAssertTrue(try OpenPGPPacketParser.verifyEd25519Signature(
+                signature: parsed, document: signedDocument, publicKey: publicPoint), "\(name) verifies")
+            XCTAssertFalse(try OpenPGPPacketParser.verifyEd25519Signature(
+                signature: parsed, document: signedDocument + [0x0A], publicKey: publicPoint), "\(name) altered document")
+        }
+    }
+
+    /// GnuPG's encrypted messages decrypt with each unprotected secret subkey
+    /// (S2K usage 0: the scalar MPI, then a two-octet checksum).
     func testECDHDecrypt() throws {
-        throw XCTSkip("""
-            No NIST ECDH decrypt path yet — decryptMessage takes \
-            [Cv25519DecryptionKey], whose privateKey is a 32-byte X25519 scalar. \
-            A P-521 scalar is 66 bytes, so the key cannot be represented at all. \
-            Vectors for all three curves are in this file.
-            """)
+        let cases: [(String, Data, Data, ECCurve)] = [
+            ("P-256", p256SecretSubkeyBody, p256EncryptedMessage, .nistP256),
+            ("P-384", p384SecretSubkeyBody, p384EncryptedMessage, .nistP384),
+            ("P-521", p521SecretSubkeyBody, p521EncryptedMessage, .nistP521),
+        ]
+        for (name, secret, message, curve) in cases {
+            let b = [UInt8](secret)
+            let oidLength = Int(b[6])
+            var off = 7 + oidLength
+            let pointBits = Int(b[off]) << 8 | Int(b[off + 1]); off += 2 + (pointBits + 7) / 8
+            let kdfLength = Int(b[off])
+            let kdfHash = b[off + 2], kdfCipher = b[off + 3]
+            off += 1 + kdfLength
+            let publicBody = Array(b[0..<off])
+            XCTAssertEqual(b[off], 0, "\(name): unprotected"); off += 1
+            let scalarBits = Int(b[off]) << 8 | Int(b[off + 1]); off += 2
+            let scalar = Array(b[off..<(off + (scalarBits + 7) / 8)])
+            let fingerprint = OpenPGPPacketParser.computeV4Fingerprint(packetBody: publicBody)
+            let key = Cv25519DecryptionKey(
+                subkeyID: Array(fingerprint.suffix(8)), subkeyFingerprint: fingerprint,
+                privateKey: scalar, kdfHashID: kdfHash, kdfCipherID: kdfCipher, curve: curve)
+            let contents = try OpenPGPPacketParser.decryptMessageReturningInnerPackets(
+                messageData: message, decryptionKeys: [key])
+            // GnuPG was fed the plaintext by echo, so the literal ends in "\n".
+            XCTAssertEqual(String(decoding: contents.literalData, as: UTF8.self), expectedPlaintext + "\n", name)
+        }
     }
 
     private static func hex(_ s: String) -> Data {

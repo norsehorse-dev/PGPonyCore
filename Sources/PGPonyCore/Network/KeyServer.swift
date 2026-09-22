@@ -33,9 +33,21 @@ struct KeyServer: Codable, Identifiable, Equatable {
     var isPublish: Bool         // a publish target
     var order: Int              // lookup/publish priority (lower first)
     var isBuiltIn: Bool         // the two defaults: toggle/reorder only, no delete
+    // 8.3.0 (planning 6.2): a custom server keeps the scheme and port the
+    // user gave (hkp:// maps to http on 11371). Nil on the built-ins and on
+    // every entry saved before 8.3.0, which decode as https with no port.
+    var scheme: String? = nil
+    var port: Int? = nil
 
-    /// Clearnet base, e.g. "https://keys.openpgp.org".
-    var baseURL: String { "https://\(host)" }
+    /// Clearnet base, e.g. "https://keys.openpgp.org" or "http://hkp.example:11371".
+    var baseURL: String {
+        let s = scheme ?? "https"
+        if let port { return "\(s)://\(host):\(port)" }
+        return "\(s)://\(host)"
+    }
+
+    /// Where the entry came from, for a footer line.
+    var isCustom: Bool { !isBuiltIn }
 
     /// True when this server is known to likely reject the given key algorithm,
     /// so the publish UI can warn before uploading (and explain a failure).
@@ -47,7 +59,7 @@ struct KeyServer: Codable, Identifiable, Equatable {
     func mayNotAccept(_ algorithm: KeyAlgorithm) -> Bool {
         guard host == "keys.openpgp.org" else { return false }
         switch algorithm {
-        case .rsa2048, .rsa4096, .ed25519:
+        case .rsa2048, .rsa3072, .rsa4096, .rsa8192, .ed25519:
             return false
         default:
             return true   // v6, PQC (ML-KEM), LibrePGP: unconfirmed / unsupported
@@ -145,5 +157,86 @@ enum KeyServerRegistry {
     /// Reset to the two factory defaults.
     static func resetToDefaults() {
         save(defaults)
+    }
+
+    // MARK: - Custom servers (8.3.0, planning 6.2)
+
+    struct NormalizedServer: Equatable {
+        let scheme: String
+        let host: String
+        let port: Int?
+    }
+
+    /// The pure normalizer behind the Add Key Server form. Accepts a bare
+    /// host, scheme://host and scheme://host:port; maps hkps:// to https and
+    /// hkp:// to http on 11371; keeps http and https with an optional port;
+    /// rejects any other scheme, a path or query, credentials, and a dotless
+    /// host without an explicit port (a bare word is a typo more often than a
+    /// LAN name). Returns nil for anything it will not take.
+    static func normalize(_ input: String) -> NormalizedServer? {
+        var text = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, !text.contains(" ") else { return nil }
+        var scheme = "https"
+        var impliedPort: Int? = nil
+        if let range = text.range(of: "://") {
+            let given = text[..<range.lowerBound].lowercased()
+            switch given {
+            case "https", "hkps": scheme = "https"
+            case "http": scheme = "http"
+            case "hkp": scheme = "http"; impliedPort = 11371
+            default: return nil
+            }
+            text = String(text[range.upperBound...])
+        }
+        if text.hasSuffix("/") { text.removeLast() }
+        guard !text.isEmpty, !text.contains("/"), !text.contains("?"), !text.contains("@"), !text.contains("#") else { return nil }
+        var host = text
+        var port: Int? = impliedPort
+        if let colon = text.lastIndex(of: ":") {
+            let portText = text[text.index(after: colon)...]
+            guard let p = Int(portText), (1...65535).contains(p) else { return nil }
+            port = p
+            host = String(text[..<colon])
+        }
+        host = host.lowercased()
+        guard !host.isEmpty, !host.hasPrefix("."), !host.hasSuffix("."), !host.contains(":") else { return nil }
+        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyz0123456789-.")
+        guard host.unicodeScalars.allSatisfy({ allowed.contains($0) }) else { return nil }
+        if !host.contains("."), port == nil { return nil }
+        if scheme == "https", port == 443 { port = nil }
+        if scheme == "http", port == 80 { port = nil }
+        return NormalizedServer(scheme: scheme, host: host, port: port)
+    }
+
+    /// Add a custom server at the end of the list. Returns nil when the URL
+    /// does not normalize or the host is already listed.
+    @discardableResult
+    static func addCustom(name: String, url: String) -> KeyServer? {
+        guard let n = normalize(url) else { return nil }
+        var list = load()
+        guard !list.contains(where: { $0.host == n.host && $0.port == n.port }) else { return nil }
+        let label = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let server = KeyServer(
+            id: UUID(),
+            name: label.isEmpty ? n.host : label,
+            host: n.host,
+            onionHost: nil,
+            isEnabled: true,
+            isLookup: true,
+            isPublish: true,
+            order: list.count,
+            isBuiltIn: false,
+            scheme: n.scheme,
+            port: n.port
+        )
+        list.append(server)
+        save(list)
+        return server
+    }
+
+    /// Remove a custom server; the built-ins cannot be removed.
+    static func removeCustom(id: UUID) {
+        let list = load().filter { $0.id != id || $0.isBuiltIn }
+        save(list)
     }
 }

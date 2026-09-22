@@ -38,6 +38,12 @@
 // `com.apple.security.smartcard` entitlement and iOS/iPadOS 16+.
 
 import Foundation
+import LocalAuthentication
+import Security
+
+/// CORE SEAM: the app observes UIApplication.protectedDataWillBecomeUnavailableNotification;
+/// the core names the same notification by its string so it imports no UIKit.
+private let protectedDataWillBecomeUnavailable = Notification.Name("UIApplicationProtectedDataWillBecomeUnavailable")
 
 // MARK: - Public surface
 
@@ -212,7 +218,7 @@ enum OpenPGPCardError: LocalizedError {
             return String(localized: "No USB-C hardware key detected. Plug your key in and try again.")
         case .noCardDetected:
             if CardTransportAvailability.isUSBSmartCardAvailable {
-                return String(localized: "No card detected. If your key is USB-C only — like a YubiKey 5C — it can't be tapped. Plug it into the USB-C port instead.")
+                return String(localized: "No card detected. If your key is USB-C only, like a YubiKey 5C, it can't be tapped. Plug it into the USB-C port instead.")
             }
             return String(localized: "No card detected. Check that your key supports NFC and hold it flat against the top of your iPhone. USB-C-only keys such as the YubiKey 5C can't be tapped.")
         case .noTransportAvailable:
@@ -224,13 +230,13 @@ enum OpenPGPCardError: LocalizedError {
         case .unexpectedStatus(let sw1, let sw2):
             return String(format: "The card returned an unexpected status (0x%02X%02X).", sw1, sw2)
         case .pinBlocked:
-            return String(localized: "This PIN is blocked — the card refused it too many times. Unblock it with your admin PIN (PW3) or your reset code. Your keys are not lost.")
+            return String(localized: "This PIN is blocked: the card refused it too many times. Unblock it with your admin PIN (PW3) or your reset code. Your keys are not lost.")
         case .wrongPIN(let n):
             // #25 — the count is the difference between an annoyance and a
             // blocked card, so it escalates instead of staying flat.
             switch n {
             case .some(1):
-                return String(localized: "Incorrect PIN. Only 1 attempt remains — if it fails, this key's PIN will be blocked. Double-check before trying again.")
+                return String(localized: "Incorrect PIN. Only 1 attempt remains; if it fails, this key's PIN will be blocked. Double-check before trying again.")
             case .some(let n):
                 return String(localized: "Incorrect PIN. \(n) attempts remaining before this key's PIN is blocked.")
             case .none:
@@ -238,9 +244,9 @@ enum OpenPGPCardError: LocalizedError {
             }
         case .pinCheckInterrupted(let lastKnown):
             if let lastKnown {
-                return String(localized: "The connection dropped while your PIN was being checked, so the result is unknown — if the PIN was wrong, the attempt was still counted. Before this try, \(lastKnown) attempts remained. Reconnect and the current count will be shown.")
+                return String(localized: "The connection dropped while your PIN was being checked, so the result is unknown. If the PIN was wrong, the attempt was still counted. Before this try, \(lastKnown) attempts remained. Reconnect and the current count will be shown.")
             }
-            return String(localized: "The connection dropped while your PIN was being checked, so the result is unknown — if the PIN was wrong, the attempt was still counted. Reconnect and the current count will be shown.")
+            return String(localized: "The connection dropped while your PIN was being checked, so the result is unknown. If the PIN was wrong, the attempt was still counted. Reconnect and the current count will be shown.")
         case .storedPINUnavailable:
             return String(localized: "No PIN is remembered for this key. Enter its PIN once and it can be remembered.")
         case .malformedResponse:
@@ -251,11 +257,11 @@ enum OpenPGPCardError: LocalizedError {
             // v8.1.0: was NFC wording unconditionally. A tester on USB-C was
             // told to hold his key against the phone and tap.
             return CardConnectionCopy.prompt(
-                nfc: String(localized: "The card connection dropped before the operation finished. Hold your key steady against the top of your iPhone and tap to try again."),
+                nfc: String(localized: "The key moved out of range before the operation finished, so it was not completed. Hold the key flat and still against the top edge of your iPhone, behind the camera bar, and tap again."),
                 usb: String(localized: "The card connection dropped before the operation finished. Check the key is firmly in the USB-C port and try again.")
             )
         case .changeNotCommitted:
-            return "The card reported the PIN change but the new PIN didn't verify — it may not have saved. Hold the key steady and try again."
+            return "The card reported the PIN change but the new PIN didn't verify, so it may not have saved. Hold the key steady and try again."
         case .pinTooLong(let maximum):
             return String(localized: "That PIN is longer than this card accepts (maximum \(maximum) characters). It wasn't sent, so no attempt was used.")
         case .kdfUnsupported:
@@ -352,6 +358,12 @@ final class OpenPGPCardService {
         self.transport = resolved
 
         try await resolved.connect(alertMessage: alertMessage)
+        // 8.3.0 (9.1): the coupling worked; say so at once and ask for the
+        // hold, since the applet select, the PIN check and the operation all
+        // still need the key exactly where it is.
+        if resolved.kind == .nfc {
+            resolved.updateStatus(CardConnectionCopy.keyFoundStatus)
+        }
         try await selectOpenPGPApplet()
         // #24 — identify the card before any PIN can be needed. One GET DATA;
         // a card that won't answer simply gets no PIN-cache participation.
@@ -462,7 +474,14 @@ final class OpenPGPCardService {
     /// Update system-provided progress UI mid-session (e.g. "Signing…"). A
     /// no-op on a wired session; PGPony's own UI carries progress there.
     func updateAlert(_ message: String) {
-        transport?.updateStatus(message)
+        // 8.3.0 (9.1): on NFC every progress line carries the hold reminder,
+        // so "Signing…" reads as "Signing… Keep the key still against the top
+        // edge." A wired session shows PGPony's own UI and gets the bare text.
+        if transport?.kind == .nfc, !message.contains(CardConnectionCopy.holdStillLine) {
+            transport?.updateStatus(message + "\n" + CardConnectionCopy.holdStillLine)
+        } else {
+            transport?.updateStatus(message)
+        }
     }
 
     /// Close the session. On success the system shows a checkmark; on failure the
@@ -619,6 +638,9 @@ final class OpenPGPCardService {
         // §4b — derived on a KDF card, raw otherwise. Never `Array(pin.utf8)`
         // directly: that is the bug that burned the Jul 30 reporter's attempts.
         let pinBytes = try pinPayload(pin, reference: mode.kdfReference)
+        // 8.3.0 (9.1): the PIN check is the first step that spends anything
+        // if the key moves; name it, with the hold.
+        updateAlert(String(localized: "Checking the PIN…"))
         let apdu = APDU(
             instructionClass: 0x00, instructionCode: 0x20,
             p1Parameter: 0x00, p2Parameter: mode.p2,
@@ -1266,16 +1288,21 @@ final class CardPINCache {
         case oneMinute
         case fiveMinutes
         case fifteenMinutes
+        /// 8.3.0 (9.4, Android 4.3.0 "until the phone locks"): held until
+        /// iOS reports the device locking (protected data becoming
+        /// unavailable), not by a timer. Ends with the process too.
+        case untilDeviceLocks
         case untilCleared     // until manual clear (or a wrong-PIN clear)
 
         /// Seconds of validity, or nil for "until manually cleared", or 0 for never.
         var seconds: TimeInterval? {
             switch self {
-            case .never:          return 0
-            case .oneMinute:      return 60
-            case .fiveMinutes:    return 300
-            case .fifteenMinutes: return 900
-            case .untilCleared:   return nil
+            case .never:            return 0
+            case .oneMinute:        return 60
+            case .fiveMinutes:      return 300
+            case .fifteenMinutes:   return 900
+            case .untilDeviceLocks: return nil
+            case .untilCleared:     return nil
             }
         }
 
@@ -1292,9 +1319,13 @@ final class CardPINCache {
             // implementation never had. The behaviour is deliberate (a PIN on
             // disk alongside a key on the card collapses two factors into one),
             // so the label changed rather than the storage.
+            case .untilDeviceLocks: return String(localized: "Until the phone locks")
             case .untilCleared:   return String(localized: "Until PGPony quits")
             }
         }
+
+        /// Whether a held secret is cleared when the device locks (9.4).
+        var endsOnDeviceLock: Bool { self == .untilDeviceLocks }
     }
 
     private static let modeKey = "pgpony_pin_cache_mode"
@@ -1302,6 +1333,79 @@ final class CardPINCache {
     static var mode: Mode {
         get { Mode(rawValue: UserDefaults.standard.string(forKey: modeKey) ?? "") ?? .never }
         set { UserDefaults.standard.set(newValue.rawValue, forKey: modeKey) }
+    }
+
+    // 8.3.0 (9.2, the 8.0.1 / 8.1.0 testers' pair):
+    //
+    // "Remember card PIN does not survive a full quit." It never could, by
+    // the v8.1.0 §3c decision that a PIN on disk beside a key on the card
+    // collapses two factors into one. What changed is the second factor: a
+    // PIN kept across restarts is stored in the Keychain behind its own
+    // user-presence access control (Face ID / Touch ID, passcode fallback),
+    // this device only, never synced. Reading it back costs an authentication
+    // every time the in-memory copy is gone, so the card and the PIN still
+    // do not travel together. Opt-in, and only with "Until PGPony quits".
+    //
+    // "Face ID for the security-key PIN without the app-wide lock." A remembered
+    // PIN (memory or Keychain) is used only after a fresh biometric check when
+    // this is on; a typed PIN is never gated.
+    static let persistKey = "pgpony_pin_cache_persist"
+    static let biometricKey = "pgpony_pin_cache_biometric"
+
+    /// Keep the remembered PIN in the Keychain across restarts (9.2).
+    static var persistsAcrossRestarts: Bool {
+        get { UserDefaults.standard.bool(forKey: persistKey) }
+        set { UserDefaults.standard.set(newValue, forKey: persistKey) }
+    }
+
+    /// Require Face ID / Touch ID before a remembered PIN is used (9.2).
+    static var requiresBiometric: Bool {
+        get { UserDefaults.standard.bool(forKey: biometricKey) }
+        set { UserDefaults.standard.set(newValue, forKey: biometricKey) }
+    }
+
+    /// Whether the persisted tier is in effect: opted in and on the one
+    /// duration it makes sense for.
+    static var persistenceActive: Bool { persistsAcrossRestarts && mode == .untilCleared }
+
+    /// The one entry point the card flows use before opening a session:
+    /// is there a remembered PIN this card may use without a prompt? It
+    /// restores the Keychain copy (one system authentication) when memory
+    /// is empty, and runs the Face ID gate when that is required. Called
+    /// BEFORE the NFC session starts, because a system prompt during a tag
+    /// session ends the session. False means "ask the user".
+    @MainActor
+    func rememberedPINIsUsable() async -> Bool {
+        guard Self.mode != .never else { return false }
+        var authenticatedByKeychain = false
+        if !hasLiveEntry {
+            guard Self.persistenceActive else { return false }
+            let restored = await Task.detached(priority: .userInitiated) { CardPINKeychain.loadAll() }.value
+            guard !restored.isEmpty else { return false }
+            queue.sync {
+                for (serial, pin) in restored where entries[serial] == nil {
+                    entries[serial] = Entry(pin: pin, expiry: nil, storedAt: Date())
+                }
+            }
+            authenticatedByKeychain = true
+        }
+        if Self.requiresBiometric && !authenticatedByKeychain {
+            return await Self.authenticate(reason: String(localized: "Use the remembered hardware key PIN"))
+        }
+        return true
+    }
+
+    /// Face ID / Touch ID with passcode fallback. False on any failure or
+    /// cancel, which the caller turns into the ordinary PIN prompt.
+    static func authenticate(reason: String) async -> Bool {
+        let context = LAContext()
+        var error: NSError?
+        guard context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &error) else { return false }
+        return await withCheckedContinuation { cont in
+            context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason) { ok, _ in
+                cont.resume(returning: ok)
+            }
+        }
     }
 
     // v8.1.0 build 3 (#24) — keyed by card serial, because a single global PIN
@@ -1326,6 +1430,18 @@ final class CardPINCache {
         // cleared the PIN before it could be used). The didEnterBackground
         // observer was removed so the chosen duration is the sole time boundary.
         // PW1 only, held in memory only, gone on app termination.
+        //
+        // 8.3.0 (9.4): "Until the phone locks" is the one boundary that is
+        // neither a timer nor the process: iOS posts this when the device
+        // locks (protected data goes away), which is exactly the moment a
+        // held secret should not outlive. Backgrounding still does nothing.
+        NotificationCenter.default.addObserver(
+            forName: protectedDataWillBecomeUnavailable,
+            object: nil, queue: nil
+        ) { [weak self] _ in
+            guard let self, Self.mode.endsOnDeviceLock else { return }
+            self.clear()
+        }
     }
 
     /// Live, read-only snapshot for the Settings countdown. Never mutates the
@@ -1334,6 +1450,7 @@ final class CardPINCache {
         case off                                // mode is "Ask every time"
         case empty                              // caching on, nothing held right now
         case untilCleared                       // held, no time limit
+        case untilDeviceLocks                   // held until the device locks (8.3.0, 9.4)
         case counting(remaining: TimeInterval)  // held, clears in `remaining` seconds
     }
 
@@ -1349,7 +1466,7 @@ final class CardPINCache {
             if let expiry = latest.expiry {
                 return .counting(remaining: expiry.timeIntervalSinceNow)
             }
-            return .untilCleared
+            return Self.mode.endsOnDeviceLock ? .untilDeviceLocks : .untilCleared
         }
     }
 
@@ -1389,6 +1506,10 @@ final class CardPINCache {
             guard mode != .never, !pin.isEmpty, let serial, !serial.isEmpty else { return }
             let expiry = mode.seconds.flatMap { $0 > 0 ? Date().addingTimeInterval($0) : nil }
             entries[serial] = Entry(pin: pin, expiry: expiry, storedAt: Date())
+            // 8.3.0 (9.2): the persisted tier, only for "Until PGPony quits".
+            if Self.persistenceActive {
+                CardPINKeychain.save(pin, forSerial: serial)
+            }
         }
     }
 
@@ -1400,16 +1521,29 @@ final class CardPINCache {
         queue.sync {
             if let serial, !serial.isEmpty {
                 entries.removeValue(forKey: serial)
+                CardPINKeychain.remove(forSerial: serial)
             } else {
                 entries.removeAll()
+                CardPINKeychain.removeAll()
             }
         }
     }
 
-    /// Wipe every remembered PIN immediately.
+    /// Wipe every remembered PIN immediately, the Keychain copy included.
     func clear() {
         queue.sync {
             entries.removeAll()
+            CardPINKeychain.removeAll()
+        }
+    }
+
+    /// Turn the persisted tier on or off. Turning it off removes the Keychain
+    /// copies at once; turning it on keeps what is already held in memory
+    /// (the next accepted PIN is written).
+    func setPersistsAcrossRestarts(_ on: Bool) {
+        queue.sync {
+            Self.persistsAcrossRestarts = on
+            if !on { CardPINKeychain.removeAll() }
         }
     }
 
@@ -1434,17 +1568,97 @@ final class CardPINCache {
     func setMode(_ newMode: Mode) {
         queue.sync {
             Self.mode = newMode
+            // 8.3.0 (9.2): the Keychain tier exists only under "Until PGPony
+            // quits"; any other duration drops it.
+            if newMode != .untilCleared { CardPINKeychain.removeAll() }
             guard !entries.isEmpty else { return }
             switch newMode {
             case .never:
                 entries.removeAll()
-            case .untilCleared:
+            case .untilCleared, .untilDeviceLocks:
                 for key in entries.keys { entries[key]?.expiry = nil }
             default:
                 let expiry = newMode.seconds.flatMap { $0 > 0 ? Date().addingTimeInterval($0) : nil }
                 for key in entries.keys { entries[key]?.expiry = expiry }
             }
         }
+    }
+}
+
+// MARK: - Keychain tier of the card-PIN cache (8.3.0, 9.2)
+
+/// The user PIN of a card, keyed by its serial, as a Keychain item behind
+/// user-presence access control: reading it costs a Face ID / Touch ID (or
+/// passcode) prompt from the system every time. This-device-only, never
+/// synced, never exported in a backup. PW1 only, like the memory cache.
+enum CardPINKeychain {
+    private static let service = "app.pgpony.cardpin"
+
+    private static var accessControl: SecAccessControl? {
+        SecAccessControlCreateWithFlags(nil, kSecAttrAccessibleWhenUnlockedThisDeviceOnly, .userPresence, nil)
+    }
+
+    static func save(_ pin: String, forSerial serial: String) {
+        guard let access = accessControl, let data = pin.data(using: .utf8) else { return }
+        remove(forSerial: serial)
+        let add: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: serial,
+            kSecAttrLabel as String: "PGPony hardware key PIN",
+            kSecAttrAccessControl as String: access,
+            kSecValueData as String: data,
+        ]
+        let status = SecItemAdd(add as CFDictionary, nil)
+        if status != errSecSuccess {
+            pgpDebugLog("DEBUG CardPINKeychain: save failed (\(status))")
+        }
+    }
+
+    /// Every stored PIN by serial. One system authentication covers the
+    /// call; an empty result means nothing stored, or the prompt declined.
+    static func loadAll() -> [String: String] {
+        let context = LAContext()
+        context.localizedReason = String(localized: "Unlock the remembered hardware key PIN")
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecMatchLimit as String: kSecMatchLimitAll,
+            kSecReturnAttributes as String: true,
+            kSecReturnData as String: true,
+            kSecUseAuthenticationContext as String: context,
+        ]
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        guard status == errSecSuccess, let items = result as? [[String: Any]] else {
+            if status != errSecItemNotFound { pgpDebugLog("DEBUG CardPINKeychain: load failed (\(status))") }
+            return [:]
+        }
+        var out: [String: String] = [:]
+        for item in items {
+            guard let serial = item[kSecAttrAccount as String] as? String,
+                  let data = item[kSecValueData as String] as? Data,
+                  let pin = String(data: data, encoding: .utf8), !pin.isEmpty else { continue }
+            out[serial] = pin
+        }
+        return out
+    }
+
+    static func remove(forSerial serial: String) {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: serial,
+        ]
+        SecItemDelete(query as CFDictionary)
+    }
+
+    static func removeAll() {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+        ]
+        SecItemDelete(query as CFDictionary)
     }
 }
 
@@ -1486,12 +1700,22 @@ final class PassphraseCache {
     }
     private var entries: [String: Entry] = [:]
     private let queue = DispatchQueue(label: "app.pgpony.passphrasecache")
-    private init() {}
+    private init() {
+        // 8.3.0 (9.4): "Until the phone locks", the same boundary as the PIN cache.
+        NotificationCenter.default.addObserver(
+            forName: protectedDataWillBecomeUnavailable,
+            object: nil, queue: nil
+        ) { [weak self] _ in
+            guard let self, Self.mode.endsOnDeviceLock else { return }
+            self.clear()
+        }
+    }
 
     enum CacheState: Equatable {
         case off
         case empty
         case untilCleared
+        case untilDeviceLocks
         case counting(remaining: TimeInterval)
     }
 
@@ -1505,7 +1729,7 @@ final class PassphraseCache {
             if let expiry = latest.expiry {
                 return .counting(remaining: expiry.timeIntervalSinceNow)
             }
-            return .untilCleared
+            return Self.mode.endsOnDeviceLock ? .untilDeviceLocks : .untilCleared
         }
     }
 
@@ -1561,7 +1785,7 @@ final class PassphraseCache {
             switch newMode {
             case .never:
                 entries.removeAll()
-            case .untilCleared:
+            case .untilCleared, .untilDeviceLocks:
                 for key in entries.keys { entries[key]?.expiry = nil }
             default:
                 let expiry = newMode.seconds.flatMap { $0 > 0 ? Date().addingTimeInterval($0) : nil }

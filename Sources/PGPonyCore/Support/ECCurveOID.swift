@@ -48,16 +48,22 @@ enum ECCurve: Equatable {
         }
     }
 
-    /// True for the curves PGPony can only recognize, not operate on. The four
-    /// Curve25519/448 OIDs are the ones PGPony actually uses.
+    /// True for the curves PGPony can only recognize, not operate on: the
+    /// brainpool family (CryptoKit has no brainpool). The Curve25519/448
+    /// OIDs are the ones PGPony generates, and since 8.3.0 (NIST A to E) the
+    /// three NIST prime curves decrypt, encrypt, verify and sign on CryptoKit.
     var isRecognitionOnly: Bool {
         switch self {
-        case .ed25519Legacy, .cv25519, .ed25519, .x25519, .ed448, .x448:
+        case .ed25519Legacy, .cv25519, .ed25519, .x25519, .ed448, .x448,
+             .nistP256, .nistP384, .nistP521:
             return false
         default:
             return true
         }
     }
+
+    /// 8.3.0: the NIST curve this is, when it is one.
+    var nistCurve: NISTCurve? { NISTCurve(self) }
 
     private static let table: [(oid: [UInt8], curve: ECCurve)] = [
         ([0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07], .nistP256),

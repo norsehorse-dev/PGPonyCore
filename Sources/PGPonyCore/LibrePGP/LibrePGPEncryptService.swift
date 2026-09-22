@@ -82,6 +82,14 @@ enum LibrePGPEncryptService {
                         publicKeyData: [UInt8],
                         filename: String? = nil,
                         signingInfo: Ed25519SigningInfo? = nil) throws -> [UInt8] {
+        let recipient = try findRecipient(publicKeyData: publicKeyData)
+        return try encrypt(plaintext: plaintext, recipient: recipient, filename: filename, signingInfo: signingInfo)
+    }
+
+    /// The first v5 Kyber (algorithm 8) encryption subkey in a transferable
+    /// public key, parsed as a recipient. 8.3.0 (4.4): factored out so a
+    /// multi-recipient message can address a LibrePGP key next to others.
+    static func findRecipient(publicKeyData: [UInt8]) throws -> Recipient {
         let packets = try OpenPGPPacketParser.parsePackets(data: publicKeyData)
         // Scan key + subkey packets (public tag 14/6 and, defensively, secret
         // tag 7) for the v5 Kyber (algorithm 8) subkey. Capture the first parse
@@ -93,8 +101,7 @@ enum LibrePGPEncryptService {
             let algo = packet.body.count > 5 ? Int(packet.body[5]) : -1
             summary.append("t\(packet.tag)v\(ver)a\(algo)l\(packet.body.count)")
             do {
-                let recipient = try parseV5KyberSubkey(packetBody: packet.body)
-                return try encrypt(plaintext: plaintext, recipient: recipient, filename: filename, signingInfo: signingInfo)
+                return try parseV5KyberSubkey(packetBody: packet.body)
             } catch {
                 lastReason = (error as? Failure)?.errorDescription ?? "\(error)"
             }
@@ -103,15 +110,44 @@ enum LibrePGPEncryptService {
         throw Failure.malformedKey("no algorithm-8 subkey found. Saw packets: \(summary.joined(separator: ", ")). Last parse error: \(lastReason ?? "none")")
     }
 
-    /// Encrypt to an already-parsed recipient. Produces `PKESK(tag1) ‖ OCB-Data(tag20)`.
+    /// Encrypt to an already-parsed recipient. Produces `PKESK(tag1) | OCB-Data(tag20)`.
     static func encrypt(plaintext: [UInt8],
                         recipient: Recipient,
                         filename: String? = nil,
                         signingInfo: Ed25519SigningInfo? = nil) throws -> [UInt8] {
-        // 1. Random AES-256 session key.
-        let sessionKey = try randomBytes(32)
+        try encrypt(plaintext: plaintext, recipients: [recipient], filename: filename, signingInfo: signingInfo)
+    }
 
-        // 2. Composite KEM to the recipient's subkey → KEK (32 octets).
+    /// Several LibrePGP recipients of one message: a v3 algo-8 PKESK each,
+    /// sharing the session key, then the tag 20 body. gpg reads this shape
+    /// for any of the recipients. 8.3.0 (4.4).
+    static func encrypt(plaintext: [UInt8],
+                        recipients: [Recipient],
+                        filename: String? = nil,
+                        signingInfo: Ed25519SigningInfo? = nil) throws -> [UInt8] {
+        guard !recipients.isEmpty else { throw Failure.internalError("no recipients") }
+        // Random AES-256 session key, wrapped once per recipient.
+        let sessionKey = try randomBytes(32)
+        var out: [UInt8] = []
+        for recipient in recipients {
+            out += try buildPKESK(recipient: recipient, sessionKey: sessionKey, sessionKeyAlgo: sessionKeyAlgoAES256)
+        }
+        out += try buildTag20OCB(plaintext: plaintext,
+                                 sessionKey: sessionKey,
+                                 filename: filename,
+                                 signingInfo: signingInfo)
+        return out
+    }
+
+    /// Wrap `sessionKey` for one LibrePGP recipient and return its v3 PKESK:
+    /// composite KEM (ML-KEM encapsulation plus a fresh ECC ephemeral on the
+    /// suite's curve, combined with GnuPG's KMAC256), RFC 3394 key wrap, then
+    /// the packet. `sessionKeyAlgo` is bound into the KEK, so it must be the
+    /// cipher the body is encrypted with. 8.3.0 (4.4): also used by the
+    /// multi-recipient envelope when a LibrePGP key shares a message with
+    /// composite or classical keys.
+    static func buildPKESK(recipient: Recipient, sessionKey: [UInt8], sessionKeyAlgo: UInt8) throws -> [UInt8] {
+        // 1. Composite KEM to the recipient's subkey → KEK (32 octets).
         //    ML-KEM encaps + fresh ECC ephemeral on the suite's curve;
         //    combine via GnuPG's KMAC256.
         let suite = recipient.suite
@@ -146,24 +182,19 @@ enum LibrePGPEncryptService {
             eccPublic: recipient.eccPublic,
             mlkemShared: [UInt8](mlkemSS),
             mlkemCipherText: [UInt8](mlkemCT),
-            sessionKeyAlgo: sessionKeyAlgoAES256,
+            sessionKeyAlgo: sessionKeyAlgo,
             v5Fingerprint: recipient.v5Fingerprint,
             suite: suite)
 
-        // 3. AES-256 key-wrap (RFC 3394) the session key with the KEK.
+        // 2. AES-256 key-wrap (RFC 3394) the session key with the KEK.
         let wrapped = try AESKeyWrap.wrap(plaintext: sessionKey, kek: kek)   // 40 octets
 
-        // 4. Assemble the two packets.
-        let pkesk = buildV3PKESK(keyID: recipient.keyID,
-                                 eccCipherText: eccCT,
-                                 mlkemCipherText: [UInt8](mlkemCT),
-                                 sessionKeyAlgo: sessionKeyAlgoAES256,
-                                 wrappedKey: wrapped)
-        let ocb = try buildTag20OCB(plaintext: plaintext,
-                                    sessionKey: sessionKey,
-                                    filename: filename,
-                                    signingInfo: signingInfo)
-        return pkesk + ocb
+        // 3. The v3 PKESK.
+        return buildV3PKESK(keyID: recipient.keyID,
+                            eccCipherText: eccCT,
+                            mlkemCipherText: [UInt8](mlkemCT),
+                            sessionKeyAlgo: sessionKeyAlgo,
+                            wrappedKey: wrapped)
     }
 
     /// Derive the 32-octet composite KEK the way GnuPG's encrypt path does.

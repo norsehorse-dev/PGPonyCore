@@ -74,6 +74,11 @@ enum HTTPSessionFactory {
         if proxyActive {
             config.connectionProxyDictionary = socksProxyDictionary()
         }
+        // Offline mode: a single blocking interceptor on every session the app
+        // builds, so no code path (foreground, background refresh, or the share
+        // extension) can reach the network while it is on. It fails each request
+        // before a socket is opened. See `OfflineMode` below.
+        config.protocolClasses = [OfflineBlockingURLProtocol.self] + (config.protocolClasses ?? [])
         return URLSession(configuration: config)
     }
 
@@ -92,4 +97,69 @@ enum HTTPSessionFactory {
             "SOCKSPort": proxyPort,
         ]
     }
+}
+
+
+// MARK: - Offline mode
+
+/// A single switch that takes the whole app off the network.
+///
+/// Ported from PGPony Android (4.4.0). One persisted flag, off by default,
+/// stored in the App Group suite so every process — the app, its background
+/// refresh worker, and the share extension — reads the same value. Enforcement
+/// is centralized: `HTTPSessionFactory` installs `OfflineBlockingURLProtocol`
+/// on every session it builds, so a request fails immediately, before a socket
+/// is opened, rather than attempting a connection and timing out.
+enum OfflineMode {
+
+    /// Shared with the extension; matches `KeychainService.sharedAccessGroup`.
+    static let appGroup = "group.com.pgpony.shared"
+
+    /// The persisted flag's key. Bound directly from Settings via @AppStorage.
+    static let key = "pgpony_offline_mode"
+
+    /// The App Group defaults suite, so the flag is one value across processes.
+    static var store: UserDefaults {
+        UserDefaults(suiteName: appGroup) ?? .standard
+    }
+
+    /// Off by default: an existing user's connectivity does not change on update.
+    nonisolated static var isOn: Bool {
+        get { store.bool(forKey: key) }
+        set { store.set(newValue, forKey: key) }
+    }
+
+    struct OfflineError: LocalizedError {
+        var errorDescription: String? {
+            String(localized: "Offline mode is on, so PGPony isn't making any network requests. Turn it off in Settings under Security to look up or publish keys online.")
+        }
+    }
+
+    /// Fail fast with a clear message at a network entry point. The URLProtocol
+    /// below is the actual guarantee; this just produces a nicer error than a
+    /// generic request failure when a caller checks up front.
+    static func requireOnline() throws {
+        if isOn { throw OfflineError() }
+    }
+}
+
+/// The choke point. Installed on every session `HTTPSessionFactory` builds; when
+/// offline mode is on it claims every request and fails it in `startLoading`
+/// without opening a connection.
+final class OfflineBlockingURLProtocol: URLProtocol {
+
+    override class func canInit(with request: URLRequest) -> Bool {
+        // Only intercept while offline; otherwise requests proceed normally.
+        OfflineMode.isOn
+    }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest {
+        request
+    }
+
+    override func startLoading() {
+        client?.urlProtocol(self, didFailWithError: OfflineMode.OfflineError())
+    }
+
+    override func stopLoading() {}
 }

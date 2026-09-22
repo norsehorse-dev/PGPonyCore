@@ -14,6 +14,7 @@
 // Not performance-critical: it runs once per composite decryption.
 
 import Foundation
+import CryptoKit
 
 enum Keccak {
 
@@ -112,6 +113,46 @@ enum Keccak {
     static func sha3_512(_ input: [UInt8]) -> [UInt8] { sponge(input, domain: 0x06, outLen: 64, rate: 72) }
     static func shake256(_ input: [UInt8], outLen: Int) -> [UInt8] { sponge(input, domain: 0x1f, outLen: outLen) }
 
+    // MARK: - Incremental sponge (8.3.0, 4.1)
+
+    /// The same sponge as `sponge(_:domain:outLen:rate:)`, fed in pieces, so
+    /// SHA3 can hash a streamed file. RFC 9980 lets a composite ML-DSA
+    /// signature use SHA3-256 (12) or SHA3-512 (14), and the A.3 sample
+    /// signatures do.
+    struct Sponge {
+        private var st = [UInt64](repeating: 0, count: 25)
+        private var pt = 0
+        private let rate: Int
+
+        init(rate: Int) { self.rate = rate }
+
+        mutating func absorb(_ bytes: UnsafeRawBufferPointer) {
+            for b in bytes {
+                st[pt >> 3] ^= UInt64(b) << UInt64(8 * (pt & 7))
+                pt += 1
+                if pt == rate { Keccak.permute(&st); pt = 0 }
+            }
+        }
+
+        /// Pad and squeeze `outLen` octets. Leaves `self` untouched (a copy
+        /// is finalized), which is what CryptoKit's `finalize()` asks for.
+        func squeezed(domain: UInt8, outLen: Int) -> [UInt8] {
+            var st = self.st
+            st[pt >> 3] ^= UInt64(domain) << UInt64(8 * (pt & 7))
+            st[(rate - 1) >> 3] ^= UInt64(0x80) << UInt64(8 * ((rate - 1) & 7))
+            Keccak.permute(&st)
+            var out = [UInt8]()
+            out.reserveCapacity(outLen)
+            var op = 0
+            while out.count < outLen {
+                if op == rate { Keccak.permute(&st); op = 0 }
+                out.append(UInt8((st[op >> 3] >> UInt64(8 * (op & 7))) & 0xff))
+                op += 1
+            }
+            return out
+        }
+    }
+
     // MARK: - NIST SP 800-185 encodings
 
     /// left_encode(x): [n] || big-endian(x), n = byte length of x (min 1).
@@ -152,4 +193,26 @@ enum Keccak {
         let newX = bytePad(encodeString(key), rate) + data + rightEncode(outLen * 8)
         return cshake256(newX, outLen: outLen, functionName: Array("KMAC".utf8), customization: s)
     }
+}
+
+
+/// SHA3-256 as a CryptoKit `HashFunction`, so the streaming signature paths
+/// take it like SHA-256 (8.3.0, 4.1; OpenPGP hash algorithm 12).
+nonisolated struct SHA3_256: HashFunction {
+    typealias Digest = RawDigest32
+    static var blockByteCount: Int { 136 }
+    private var sponge = Keccak.Sponge(rate: 136)
+    init() {}
+    mutating func update(bufferPointer: UnsafeRawBufferPointer) { sponge.absorb(bufferPointer) }
+    func finalize() -> RawDigest32 { RawDigest32(sponge.squeezed(domain: 0x06, outLen: 32))! }
+}
+
+/// SHA3-512 as a CryptoKit `HashFunction` (OpenPGP hash algorithm 14).
+nonisolated struct SHA3_512: HashFunction {
+    typealias Digest = RawDigest64
+    static var blockByteCount: Int { 72 }
+    private var sponge = Keccak.Sponge(rate: 72)
+    init() {}
+    mutating func update(bufferPointer: UnsafeRawBufferPointer) { sponge.absorb(bufferPointer) }
+    func finalize() -> RawDigest64 { RawDigest64(sponge.squeezed(domain: 0x06, outLen: 64))! }
 }

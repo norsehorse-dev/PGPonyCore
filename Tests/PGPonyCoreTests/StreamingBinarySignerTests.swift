@@ -159,4 +159,90 @@ final class StreamingBinarySignerTests: XCTestCase {
         let parsed = try XCTUnwrap(try OpenPGPPacketParser.parsePackets(data: ops).first)
         XCTAssertEqual(parsed.tag, 4, "expected a one-pass signature packet")
     }
+
+    // MARK: - v6 detached sign + streaming verify (8.2.1)
+
+    /// A detached v6 signature (StreamingV6Signer's packet is exactly that) must
+    /// verify against the original file read from disk in chunks — the path a
+    /// large signed file's .sig takes now that the verify UI streams the original
+    /// instead of buffering it.
+    func testV6DetachedSignVerifiesStreamingFromDisk() throws {
+        let key = Curve25519.Signing.PrivateKey()
+        let fp = (0..<32).map { UInt8(($0 &* 11 &+ 5) & 0xFF) }
+        let data = payload(300_000)
+
+        let signer = try StreamingV6Signer(signingKey: key, fingerprint: fp, creationTime: creationTime)
+        var offset = 0
+        while offset < data.count {
+            let end = Swift.min(offset + 4_096, data.count)
+            signer.update(Array(data[offset..<end]))
+            offset = end
+        }
+        let sigPacket = try signer.finish()
+        let parsed = try XCTUnwrap(try OpenPGPPacketParser.parsePackets(data: sigPacket).first)
+        let sigInfo = try OpenPGPPacketParser.parseSignaturePacket(body: parsed.body)
+
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let file = dir.appendingPathComponent("original.bin")
+        try Data(data).write(to: file)
+
+        let ok = try OpenPGPPacketParser.verifyEd25519SignatureStreaming(
+            signature: sigInfo, fileAt: file, publicKey: Array(key.publicKey.rawRepresentation))
+        XCTAssertTrue(ok, "detached v6 signature must verify when the original is streamed from disk")
+
+        // A modified original must fail.
+        var bad = data
+        bad[0] = bad[0] &+ 1
+        let badFile = dir.appendingPathComponent("tampered.bin")
+        try Data(bad).write(to: badFile)
+        let bogus = try OpenPGPPacketParser.verifyEd25519SignatureStreaming(
+            signature: sigInfo, fileAt: badFile, publicKey: Array(key.publicKey.rawRepresentation))
+        XCTAssertFalse(bogus, "a modified original must fail streamed verification")
+    }
+
+    // MARK: - v6 streaming sign + verify (8.2.1)
+
+    /// The v6 counterpart of the round-trip above: StreamingV6Signer signs a
+    /// streamed document and StreamingBinaryVerifier (v6 path) verifies it. This
+    /// is the path a post-quantum key uses to sign a large file, and the reason a
+    /// signed FILE now shows its signer the way signed text always has.
+    func testV6StreamingSignAndVerify() throws {
+        let key = Curve25519.Signing.PrivateKey()
+        let data = payload(200_000)
+        let fp = (0..<32).map { UInt8(($0 &* 7 &+ 3) & 0xFF) }
+
+        // One signer instance: its OPS and its signature share the same salt.
+        let s = try StreamingV6Signer(signingKey: key, fingerprint: fp, creationTime: creationTime)
+        let ops = s.onePassPacket
+        var offset = 0
+        while offset < data.count {
+            let end = Swift.min(offset + 4_096, data.count)
+            s.update(Array(data[offset..<end]))
+            offset = end
+        }
+        let packet = try s.finish()
+
+        let parsed = try XCTUnwrap(try OpenPGPPacketParser.parsePackets(data: packet).first)
+        XCTAssertEqual(parsed.tag, 2, "expected a signature packet")
+        XCTAssertEqual(parsed.body.first, 6, "expected a v6 signature")
+
+        let verifier = try XCTUnwrap(StreamingBinaryVerifier(onePassBody: Array(ops.suffix(from: 2))))
+        verifier.update(data)
+        XCTAssertEqual(verifier.verify(signatureBody: parsed.body, publicKey: .ed25519(key.publicKey)), true,
+                       "v6 streamed signature must verify through the streaming verifier")
+
+        // Signer key ID is the leading 8 octets of the fingerprint.
+        XCTAssertEqual(verifier.signerKeyID, Array(fp.prefix(8)))
+
+        // A tampered document must NOT verify.
+        let v2 = try XCTUnwrap(StreamingBinaryVerifier(onePassBody: Array(ops.suffix(from: 2))))
+        var bad = data
+        bad[0] = bad[0] &+ 1
+        v2.update(bad)
+        XCTAssertNotEqual(v2.verify(signatureBody: parsed.body, publicKey: .ed25519(key.publicKey)), true,
+                          "a modified document must fail v6 verification")
+    }
 }

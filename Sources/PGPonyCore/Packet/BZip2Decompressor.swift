@@ -46,7 +46,10 @@ enum BZip2Decompressor {
     /// Decompress a complete bzip2 stream — the standard `.bz2` container:
     /// "BZh" + block-size digit, one or more compressed blocks, then the
     /// end-of-stream marker — to its original bytes.
-    static func decompress(_ input: [UInt8]) throws -> [UInt8] {
+    static func decompress(
+        _ input: [UInt8],
+        limit: Int = SecurityLimits.maxInMemoryPlaintextBytes
+    ) throws -> [UInt8] {
         var bits = BitReader(input)
 
         guard try bits.readBits(8) == UInt32(UInt8(ascii: "B")),
@@ -77,6 +80,10 @@ enum BZip2Decompressor {
             }
 
             let block = try decodeBlock(&bits, maxBlockBytes: maxBlockBytes)
+            // 8.3.0 hardening (finding 2): same ceiling as the zlib path.
+            guard output.count + block.count <= limit else {
+                throw SecurityLimitError.exceeded("compressed data inflates past \(limit >> 20) MiB")
+            }
             output.append(contentsOf: block)
         }
 
