@@ -4,7 +4,7 @@
 // SecurityLimitsTests.swift
 // PGPonyTests
 //
-// 8.3.0 hardening, planning section 5 findings 1 and 2: the pre-authentication
+// 8.3.0 hardening: the pre-authentication
 // resource ceilings. Argon2 parameters off the wire are bounded before any
 // block is allocated; Compressed Data packets are bounded in nesting depth and
 // in inflated bytes; a truncated deflate stream is an error, not a spin.
@@ -17,7 +17,7 @@ import zlib
 
 final class SecurityLimitsTests: XCTestCase {
 
-    // MARK: - Argon2 policy (finding 1)
+    // MARK: - Argon2 policy
 
     func testOwnAndCommonArgon2ParametersPass() throws {
         // PGPony's own v6 protection (V6KeyGenerator), and gpg / Sequoia defaults.
@@ -71,7 +71,7 @@ final class SecurityLimitsTests: XCTestCase {
         XCTAssertEqual(key.count, 32)
     }
 
-    // MARK: - Decompression (finding 2)
+    // MARK: - Decompression
 
     /// Raw DEFLATE (OpenPGP compression algorithm 1) of `count` zero bytes.
     private func rawDeflateZeros(_ count: Int) -> [UInt8] {

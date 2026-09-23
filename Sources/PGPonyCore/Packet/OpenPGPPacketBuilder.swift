@@ -625,7 +625,8 @@ class OpenPGPPacketBuilder {
             // The signature packet was built over this exact plaintext (sig type
             // 0x00) by CardSigner; we only need the matching one-pass packet so
             // the recipient knows a signature follows the literal data.
-            let onePassSig = buildOnePassSignaturePacket(keyID: pre.keyID, pubkeyAlgo: signaturePacketPubkeyAlgo(pre.packet))
+            let onePassSig = buildOnePassSignaturePacket(keyID: pre.keyID, pubkeyAlgo: signaturePacketPubkeyAlgo(pre.packet),
+                                                         hashAlgo: signaturePacketHashAlgo(pre.packet))
             innerPackets = onePassSig
             innerPackets.append(contentsOf: literalPacket)
             innerPackets.append(contentsOf: pre.packet)
@@ -639,7 +640,7 @@ class OpenPGPPacketBuilder {
         if let injectedPrefix, injectedPrefix.count == blockSize {
             prefix = injectedPrefix
         } else {
-            // 8.3.0 (section 5, audit 6): a failed RNG is an error, not zeros.
+            // 8.3.0 (hardening): a failed RNG is an error, not zeros.
             prefix = try SecureRandom.bytes(blockSize)
         }
         prefix.append(prefix[blockSize - 2])
@@ -1106,7 +1107,8 @@ class OpenPGPPacketBuilder {
                 innerPackets.append(contentsOf: signaturePacket)
             }
         } else if let pre = prebuiltSignature {
-            let onePassSig = buildOnePassSignaturePacket(keyID: pre.keyID, pubkeyAlgo: signaturePacketPubkeyAlgo(pre.packet))
+            let onePassSig = buildOnePassSignaturePacket(keyID: pre.keyID, pubkeyAlgo: signaturePacketPubkeyAlgo(pre.packet),
+                                                         hashAlgo: signaturePacketHashAlgo(pre.packet))
             innerPackets = onePassSig
             innerPackets.append(contentsOf: literalPacket)
             innerPackets.append(contentsOf: pre.packet)
@@ -1246,12 +1248,12 @@ class OpenPGPPacketBuilder {
     /// Build a v3 One-Pass Signature packet.
     /// This tells the recipient "a signature follows the literal data."
     /// RFC 4880 §5.4
-    static func buildOnePassSignaturePacket(keyID: [UInt8], pubkeyAlgo: UInt8 = 22) -> [UInt8] {
+    static func buildOnePassSignaturePacket(keyID: [UInt8], pubkeyAlgo: UInt8 = 22, hashAlgo: UInt8 = 8) -> [UInt8] {
         var body: [UInt8] = []
 
         body.append(3)            // Version 3
         body.append(0x00)         // Signature type: 0x00 = binary document
-        body.append(8)            // Hash algorithm: SHA-256
+        body.append(hashAlgo)     // Hash algorithm: SHA-256, or the curve's pairing for ECDSA (8.3.0 build 4)
         body.append(pubkeyAlgo)   // Public-key algorithm (22 = EdDSA, 1 = RSA)
         body.append(contentsOf: keyID)  // 8-byte signer key ID
         body.append(1)     // Nested flag: 1 = last one-pass packet (not nested)
@@ -1263,6 +1265,21 @@ class OpenPGPPacketBuilder {
     /// tag 2). Used so the One-Pass Signature that precedes a card-produced inline
     /// signature advertises the same algorithm (otherwise an RSA card signature
     /// would be wrapped in a OnePassSig claiming EdDSA, and verification fails).
+    /// 8.3.0 build 4: the hash algorithm byte of a v4 signature packet, so a
+    /// prebuilt ECDSA signature on P-384 (SHA-384) or P-521 (SHA-512) gets a
+    /// One-Pass Signature naming the hash its verifier must run.
+    static func signaturePacketHashAlgo(_ packet: [UInt8]) -> UInt8 {
+        guard packet.count >= 2 else { return 8 }
+        let l = packet[1]
+        let bodyStart: Int
+        if l < 192 { bodyStart = 2 }
+        else if l < 224 { bodyStart = 3 }
+        else if l == 255 { bodyStart = 5 }
+        else { bodyStart = 2 }
+        let hashIdx = bodyStart + 3   // body: version, sigtype, pubkeyalgo, [hashalgo]
+        return packet.count > hashIdx ? packet[hashIdx] : 8
+    }
+
     static func signaturePacketPubkeyAlgo(_ packet: [UInt8]) -> UInt8 {
         guard packet.count >= 2 else { return 22 }
         let l = packet[1]

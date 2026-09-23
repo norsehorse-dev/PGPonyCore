@@ -80,7 +80,7 @@ enum BZip2Decompressor {
             }
 
             let block = try decodeBlock(&bits, maxBlockBytes: maxBlockBytes)
-            // 8.3.0 hardening (finding 2): same ceiling as the zlib path.
+            // 8.3.0 hardening: same ceiling as the zlib path.
             guard output.count + block.count <= limit else {
                 throw SecurityLimitError.exceeded("compressed data inflates past \(limit >> 20) MiB")
             }

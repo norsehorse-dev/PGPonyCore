@@ -16,7 +16,7 @@ import Security
 import zlib
 import os
 
-// MARK: - 8.3.0 hardening: resource ceilings (planning section 5, findings 1 and 2)
+// MARK: - 8.3.0 hardening: resource ceilings
 
 /// Every ceiling the decrypt path enforces BEFORE it spends memory on
 /// attacker-controlled parameters, in one place so a bound can be tuned
@@ -27,7 +27,7 @@ import os
 /// crash or a jetsam kill. Core material: syncs to PGPonyCore.
 enum SecurityLimits {
 
-    // Argon2 (finding 1). An SKESK or a protected secret key names its own
+    // Argon2. An SKESK or a protected secret key names its own
     // Argon2 parameters, and the memory exponent is honored before the
     // passphrase is even checked, so a crafted m = 31 asks for 2 TiB up
     // front. PGPony's own output uses m = 14 (V6KeyGenerator), gpg and
@@ -44,18 +44,22 @@ enum SecurityLimits {
     /// process can still allocate before jetsam.
     static let argon2HeapFraction = 0.5
 
-    // Decompression (finding 2). A Compressed Data packet inflates in memory
+    // Decompression. A Compressed Data packet inflates in memory
     // with no relation between its size and its output, and the integrity
     // check runs only after the whole plaintext exists. Real messages carry
     // one compression layer (gpg never nests) and inflate a few times over.
 
     /// Nested Compressed Data packets tolerated (a legitimate message has 1).
-    static let maxDecompressionDepth = 4
-    /// Inflated bytes tolerated per compression layer on the in-memory path,
-    /// four times the 64 MB in-memory input cap. Android uses 128 MiB against
-    /// a JVM heap; iOS gets jetsam instead of an OutOfMemoryError, so the
-    /// ceiling is what stops a bomb, not a catch block.
-    static let maxInMemoryPlaintextBytes = 256 * 1024 * 1024
+    /// 8.3.0 (hardening): the same value as Android, so a message opens on
+    /// both or on neither.
+    static let maxDecompressionDepth = 8
+    /// Inflated bytes tolerated per message on the in-memory path, shared
+    /// across every compression layer and sibling (one budget per message).
+    /// 8.3.0 (hardening): 128 MiB, the same as Android and twice the 64 MB
+    /// in-memory input cap. iOS gets jetsam instead of an OutOfMemoryError,
+    /// and the Action extension runs under a far lower memory limit than the
+    /// app, so the ceiling is what stops a bomb, not a catch block.
+    static let maxInMemoryPlaintextBytes = 128 * 1024 * 1024
 
     /// Bytes the process can still allocate, per the kernel's jetsam
     /// accounting; falls back to a quarter of physical memory where the
@@ -103,7 +107,7 @@ enum SecurityLimitError: LocalizedError {
     }
 }
 
-/// 8.3.0 (section 5, audit 6): every random byte the app puts into key
+/// 8.3.0 (hardening): every random byte the app puts into key
 /// material, a salt, an IV, a nonce or a CFB prefix comes from here, and an
 /// RNG failure is never papered over with a zero-filled buffer. Throwing
 /// contexts get the error; the packet builders that cannot throw trap, since
@@ -186,6 +190,24 @@ struct ParsedPKESK {
     var symmetricAlgorithm: UInt8 = 0
 }
 
+/// The AEAD chunk size octet's bounds, shared by the in-memory parser and the
+/// streaming reader so the two cannot drift apart again. RFC 9580 caps a
+/// SEIPD v2 octet at 16 (4 MiB chunks); LibrePGP caps its tag 20 octet at 56.
+/// Above either, `1 << (octet + 6)` overflows and the chunk slicing traps.
+nonisolated enum AEADChunkBounds {
+    static let maxSEIPDv2Octet: UInt8 = 16
+    static let maxLibrePGPOctet: UInt8 = 56
+
+    static func isValidSEIPDv2(_ octet: UInt8) -> Bool { octet <= maxSEIPDv2Octet }
+    static func isValidLibrePGP(_ octet: UInt8) -> Bool { octet <= maxLibrePGPOctet }
+
+    /// `1 << (octet + 6)`, or nil when the octet is out of bounds for the format.
+    static func chunkSize(octet: UInt8, librePGP: Bool) -> Int? {
+        let valid = librePGP ? isValidLibrePGP(octet) : isValidSEIPDv2(octet)
+        return valid ? 1 << (Int(octet) + 6) : nil
+    }
+}
+
 struct ParsedSEIPD {
     let version: UInt8
     let encryptedData: [UInt8]
@@ -198,7 +220,9 @@ struct ParsedSEIPD {
     /// Computed chunk size in bytes for v2 and tag 20 (sentinel version 100)
     var chunkSize: Int {
         guard version == 2 || version == 100 else { return 0 }
-        return 1 << (Int(chunkSizeByte) + 6)
+        // The parser refuses an out-of-bounds octet; 0 here is a backstop, and
+        // the decrypt loops treat a chunk size of 0 as malformed.
+        return AEADChunkBounds.chunkSize(octet: chunkSizeByte, librePGP: version == 100) ?? 0
     }
 }
 
@@ -775,6 +799,9 @@ class OpenPGPPacketParser {
                 // A card-level failure here (wrong PIN, blocked PIN, NFC drop) is the
                 // real reason we can't proceed — not "this PKESK didn't match." Keep it
                 // so we surface it instead of the generic noMatchingKey below.
+                // A PIN failure is final: retrying on the next matching PKESK resends the
+                // same PIN and burns another PW1 attempt (8.3.0 hardening).
+                if OpenPGPPacketParser.isPINFailure(error) { throw error }
                 if firstCardError == nil { firstCardError = error }
                 continue
             }
@@ -817,6 +844,18 @@ class OpenPGPPacketParser {
         return plaintext
     }
 
+    /// Card errors after which no further VERIFY may be sent in this operation.
+    static func isPINFailure(_ error: Error) -> Bool {
+        guard let e = error as? OpenPGPCardError else { return false }
+        switch e {
+        case .wrongPIN, .pinBlocked, .pinCheckInterrupted, .storedPINUnavailable,
+             .sessionClosed, .connectionLost:
+            return true
+        default:
+            return false
+        }
+    }
+
     // MARK: - Session-key-only card recovery (large-file streaming, #21)
 
     /// Recover the session key on the card WITHOUT decrypting the body, so a
@@ -844,6 +883,9 @@ class OpenPGPPacketParser {
             do {
                 shared = try await provideSharedSecret(pkesk.ephemeralPublicKey)
             } catch {
+                // A PIN failure is final: retrying on the next matching PKESK resends the
+                // same PIN and burns another PW1 attempt (8.3.0 hardening).
+                if OpenPGPPacketParser.isPINFailure(error) { throw error }
                 if firstCardError == nil { firstCardError = error }
                 continue
             }
@@ -881,6 +923,9 @@ class OpenPGPPacketParser {
             do {
                 block = try await provideSessionKeyBlock(pkesk.rsaCipher)
             } catch {
+                // A PIN failure is final: retrying on the next matching PKESK resends the
+                // same PIN and burns another PW1 attempt (8.3.0 hardening).
+                if OpenPGPPacketParser.isPINFailure(error) { throw error }
                 if firstCardError == nil { firstCardError = error }
                 continue
             }
@@ -979,6 +1024,9 @@ class OpenPGPPacketParser {
             } catch {
                 // Card-level failure (wrong PIN, blocked PIN, NFC drop): surface it
                 // rather than masking it as noMatchingKey.
+                // A PIN failure is final: retrying on the next matching PKESK resends the
+                // same PIN and burns another PW1 attempt (8.3.0 hardening).
+                if OpenPGPPacketParser.isPINFailure(error) { throw error }
                 if firstCardError == nil { firstCardError = error }
                 continue
             }
@@ -1062,24 +1110,25 @@ class OpenPGPPacketParser {
     /// RSA messages wrap OnePassSig + Literal + Signature inside a Compressed
     /// packet, so a top-level tag-2 search would otherwise report "unsigned".
     static func flattenCompressedPackets(_ packets: [ParsedPacket], depth: Int = 0) -> [ParsedPacket] {
+        var budget = SecurityLimits.maxInMemoryPlaintextBytes
+        return flattenCompressedPackets(packets, depth: depth, budget: &budget)
+    }
+
+    /// One inflation budget for the whole message: every sibling and nested
+    /// Compressed Data packet draws from it, so N packets cannot each spend
+    /// the full per-layer ceiling.
+    private static func flattenCompressedPackets(_ packets: [ParsedPacket], depth: Int, budget: inout Int) -> [ParsedPacket] {
         var result: [ParsedPacket] = []
         for packet in packets {
             // 8.3.0 hardening: past the nesting ceiling the packet is kept
             // opaque rather than inflated; the inflation itself is capped
             // inside the decompressors and surfaces here as a nil.
             if packet.tag == 8, !packet.body.isEmpty, depth < SecurityLimits.maxDecompressionDepth {
-                let algo = packet.body[0]
-                let compressed = Array(packet.body[1...])
-                let decompressed: [UInt8]?
-                switch algo {
-                case 0: decompressed = compressed
-                case 1: decompressed = try? zlibDecompress(compressed, rawDeflate: true)
-                case 2: decompressed = try? zlibDecompress(compressed, rawDeflate: false)
-                case 3: decompressed = try? BZip2Decompressor.decompress(compressed)
-                default: decompressed = nil
-                }
-                if let dec = decompressed, let inner = try? parsePackets(data: dec) {
-                    result.append(contentsOf: flattenCompressedPackets(inner, depth: depth + 1))
+                if budget > 0,
+                   let dec = try? decompressCompressedBody(packet.body, limit: budget),
+                   let inner = try? parsePackets(data: dec) {
+                    budget -= dec.count
+                    result.append(contentsOf: flattenCompressedPackets(inner, depth: depth + 1, budget: &budget))
                     continue
                 }
             }
@@ -1220,6 +1269,13 @@ class OpenPGPPacketParser {
     /// Handles: tag 11 (literal data) directly, tag 8 (compressed data) by
     /// decompressing then re-parsing the inner packets.
     static func extractLiteralData(from packets: [ParsedPacket], depth: Int = 0) throws -> Data? {
+        var budget = SecurityLimits.maxInMemoryPlaintextBytes
+        return try extractLiteralData(from: packets, depth: depth, budget: &budget)
+    }
+
+    /// 8.3.0 hardening: nested layers share one inflation budget, so a chain
+    /// of Compressed Data packets cannot hold a full allowance per layer.
+    private static func extractLiteralData(from packets: [ParsedPacket], depth: Int, budget: inout Int) throws -> Data? {
         for packet in packets {
             switch packet.tag {
             case 11:
@@ -1232,8 +1288,13 @@ class OpenPGPPacketParser {
                 guard depth < SecurityLimits.maxDecompressionDepth else {
                     throw SecurityLimitError.exceeded("compressed data nested more than \(SecurityLimits.maxDecompressionDepth) levels deep")
                 }
-                let innerPackets = try parsePackets(data: decompressCompressedBody(packet.body))
-                return try extractLiteralData(from: innerPackets, depth: depth + 1)
+                guard budget > 0 else {
+                    throw SecurityLimitError.exceeded("compressed data inflates past \(SecurityLimits.maxInMemoryPlaintextBytes >> 20) MiB in total")
+                }
+                let inflated = try decompressCompressedBody(packet.body, limit: budget)
+                budget -= inflated.count
+                let innerPackets = try parsePackets(data: inflated)
+                return try extractLiteralData(from: innerPackets, depth: depth + 1, budget: &budget)
 
             default:
                 continue
@@ -1268,13 +1329,23 @@ class OpenPGPPacketParser {
     /// rather than a single opaque tag-8. gpg compresses inline-signed messages
     /// by default, so this is the common shape for a signed-only .asc.
     static func flattenMessagePackets(_ data: [UInt8], depth: Int = 0) throws -> [ParsedPacket] {
+        var budget = SecurityLimits.maxInMemoryPlaintextBytes
+        return try flattenMessagePackets(data, depth: depth, budget: &budget)
+    }
+
+    private static func flattenMessagePackets(_ data: [UInt8], depth: Int, budget: inout Int) throws -> [ParsedPacket] {
         var out: [ParsedPacket] = []
         for p in try parsePackets(data: data) {
             if p.tag == 8 {
                 guard depth < SecurityLimits.maxDecompressionDepth else {
                     throw SecurityLimitError.exceeded("compressed data nested more than \(SecurityLimits.maxDecompressionDepth) levels deep")
                 }
-                out.append(contentsOf: try flattenMessagePackets(decompressCompressedBody(p.body), depth: depth + 1))
+                guard budget > 0 else {
+                    throw SecurityLimitError.exceeded("compressed data inflates past \(SecurityLimits.maxInMemoryPlaintextBytes >> 20) MiB in total")
+                }
+                let dec = try decompressCompressedBody(p.body, limit: budget)
+                budget -= dec.count
+                out.append(contentsOf: try flattenMessagePackets(dec, depth: depth + 1, budget: &budget))
             } else {
                 out.append(p)
             }
@@ -1734,6 +1805,12 @@ class OpenPGPPacketParser {
             let cipher = body[1]
             let aead = body[2]
             let chunkByte = body[3]
+            // RFC 9580 5.13.2: the chunk size octet MUST be at most 16. Larger
+            // values make `chunkSize` wrap (1 << 63 is negative) and the chunk
+            // slicing below traps. The streaming reader already enforces this.
+            guard AEADChunkBounds.isValidSEIPDv2(chunkByte) else {
+                throw PacketParserError.invalidPacket("SEIPD v2 chunk size octet \(chunkByte) exceeds 16")
+            }
             let salt = Array(body[4..<36])
             let encData = Array(body[36...])
 
@@ -1784,6 +1861,11 @@ class OpenPGPPacketParser {
         let cipher = body[off]; off += 1
         let aead = body[off]; off += 1
         let chunkByte = body[off]; off += 1
+        // LibrePGP bounds the chunk size octet at 56; above it `chunkSize`
+        // overflows into a negative Int and the chunk slicing traps.
+        guard AEADChunkBounds.isValidLibrePGP(chunkByte) else {
+            throw PacketParserError.invalidPacket("AEAD chunk size octet \(chunkByte) exceeds 56")
+        }
 
         // Nonce size depends on AEAD algorithm
         let nonceLen = AEADService.nonceSize(for: aead)
@@ -1826,6 +1908,9 @@ class OpenPGPPacketParser {
         let aeadAlgo = seipd.aeadAlgorithm
         let baseNonce = seipd.salt  // Nonce stored in salt field by parseAEADEncryptedData
         let chunkSize = seipd.chunkSize
+        guard chunkSize > 0 else {
+            throw PacketParserError.invalidPacket("AEAD chunk size octet \(seipd.chunkSizeByte) out of range")
+        }
         let tagSize = AEADService.tagSize
         let encData = seipd.encryptedData
 
@@ -1892,7 +1977,7 @@ class OpenPGPPacketParser {
             if isLastDataChunk { break }
         }
 
-        // Verify final auth tag. 8.3.0 (section 5, audit 5): the final tag is
+        // Verify final auth tag. 8.3.0 (hardening): the final tag is
         // not optional; data that ends before it is an integrity failure, not
         // an empty or short message that happened to check out.
         guard offset + tagSize <= encData.count else {
@@ -1954,7 +2039,7 @@ class OpenPGPPacketParser {
         )
 
         // Verify prefix: bytes [bs-2] and [bs-1] should equal [bs] and [bs+1].
-        // 8.3.0 (section 5, finding 4): every failure from here to the end of
+        // 8.3.0 (hardening): every failure from here to the end of
         // the MDC check is the same error. A quick-check failure that reads
         // differently from an MDC failure is the classic CFB oracle; the check
         // still aborts early, it just says nothing about why.
@@ -1983,8 +2068,6 @@ class OpenPGPPacketParser {
         // Strip prefix (bs+2 bytes)
         let payload = Array(decrypted[(bs + 2)...])
         pgpDebugLog("DEBUG SEIPD: decrypted total=\(decrypted.count), payload=\(payload.count)")
-        pgpDebugLog("DEBUG SEIPD: payload first 20 bytes: \(payload.prefix(20).map { String(format: "%02x", $0) }.joined(separator: " "))")
-        pgpDebugLog("DEBUG SEIPD: payload last 30 bytes: \(payload.suffix(30).map { String(format: "%02x", $0) }.joined(separator: " "))")
 
         // Verify MDC (last 22 bytes: tag(1) + len(1) + sha1(20))
         guard payload.count >= 22 else {
@@ -2015,7 +2098,7 @@ class OpenPGPPacketParser {
         return Array(payload[0..<mdcOffset])
     }
 
-    /// 8.3.0 (section 5, audit 8): equality over a digest or checksum whose
+    /// 8.3.0 (hardening): equality over a digest or checksum whose
     /// value an attacker influences, without an early exit on the first
     /// differing byte. Shared by the MDC check and the secret-key unlock
     /// checks in PGPService.
@@ -2084,6 +2167,9 @@ class OpenPGPPacketParser {
 
         // Decrypt chunks
         let chunkSize = seipd.chunkSize
+        guard chunkSize > 0 else {
+            throw PacketParserError.invalidPacket("AEAD chunk size octet \(seipd.chunkSizeByte) out of range")
+        }
         let tagSize = AEADService.tagSize
         let encData = seipd.encryptedData
 
@@ -2152,7 +2238,7 @@ class OpenPGPPacketParser {
             if isLastChunk { break }
         }
 
-        // Verify final authentication tag. 8.3.0 (section 5, audit 5): the
+        // Verify final authentication tag. 8.3.0 (hardening): the
         // final tag is not optional; data that ends before it is an integrity
         // failure, not an empty or short message that happened to check out.
         guard offset + tagSize <= encData.count else {
@@ -2434,7 +2520,7 @@ class OpenPGPPacketParser {
             }
 
             let outputCount = buffer.count - Int(stream.avail_out)
-            // 8.3.0 hardening (finding 2): a small stream that keeps inflating
+            // 8.3.0 hardening: a small stream that keeps inflating
             // past the ceiling is a decompression bomb; stop before the next
             // 64 KiB lands rather than after the allocation fails.
             guard result.count + outputCount <= limit else {
@@ -2555,9 +2641,6 @@ class OpenPGPPacketParser {
             .replacingOccurrences(of: "\r", with: "")
         
         pgpDebugLog("DEBUG dearmor: \(base64Lines.count) base64 lines, joined length=\(base64String.count), cleaned length=\(cleaned.count)")
-        for (i, line) in base64Lines.enumerated() {
-            pgpDebugLog("DEBUG dearmor: line[\(i)] = '\(line)' (\(line.count) chars)")
-        }
         
         guard let data = Data(base64Encoded: cleaned) else {
             throw PacketParserError.invalidPacket("Failed to decode base64 armor")
@@ -3267,7 +3350,8 @@ class OpenPGPPacketParser {
     static func verifyEd25519Signature(
         signature: ParsedSignature,
         document: [UInt8],
-        publicKey: [UInt8]
+        publicKey: [UInt8],
+        compositeClassicalHalfWhenUnavailable: Bool = false
     ) throws -> Bool {
         // 8.3.0 (4.1): a composite ML-DSA + EdDSA signature (algorithm 30/31)
         // takes the composite public material (EdDSA || ML-DSA) and the
@@ -3379,7 +3463,8 @@ class OpenPGPPacketParser {
             // Both components over the digest; an uncheckable composite (no
             // ML-DSA on this OS, or Ed448) throws so the caller can say why.
             let outcome = CompositeSigVerifier.verify(suite: suite, compositePublic: publicKey,
-                                                      signature: sigBytes, digest: digestBytes)
+                                                      signature: sigBytes, digest: digestBytes,
+                                                      classicalHalfWhenUnavailable: compositeClassicalHalfWhenUnavailable)
             pgpDebugLog("DEBUG Composite Verify: \(outcome) (algo=\(signature.publicKeyAlgorithm))")
             return try outcome.asBool()
         }
@@ -3528,6 +3613,16 @@ class OpenPGPPacketParser {
     /// Extract R and S from EdDSA MPI-encoded signature data (v4 format).
     /// Returns concatenated 64 bytes (R || S).
     private static func extractEdDSAMPIs(from data: [UInt8]) throws -> [UInt8] {
+        // 8.3.0: PGPony 8.2.x and earlier could write an R or S with a zero
+        // high octet in full while declaring the shorter bit length (fixed in
+        // KeyExpirationEditor / SigningService / CardSigner). Exactly 68 octets
+        // is two 32-octet values each behind a 2-octet header, so read them by
+        // position: such a self-signature then still verifies here, and binding
+        // checks do not drop a subkey over the encoding alone.
+        if data.count == 68,
+           Int(data[0]) << 8 | Int(data[1]) <= 256, Int(data[34]) << 8 | Int(data[35]) <= 256 {
+            return Array(data[2..<34]) + Array(data[36..<68])
+        }
         var off = 0
 
         // R MPI

@@ -76,13 +76,19 @@ class KeyServerService {
     /// which names internal error domains and codes.
     private func connectionError(_ error: Error, on server: KeyServer) -> KeyServerError {
         if let e = error as? KeyServerError { return e }
+        if let proxy = error as? HTTPSessionFactory.ProxyUnreachable {
+            return .networkError(proxy.localizedDescription)
+        }
+        if (error as? URLError)?.code == .dataLengthExceedsMaximum {
+            return .networkError(String(localized: "\(server.host) sent more data than a key can hold"))
+        }
         return .networkError(String(localized: "\(server.host): check your connection"))
     }
 
     /// True for the transport failures that mean the request never got an
     /// answer, as opposed to an answer we did not like.
     private func isConnectionFailure(_ error: Error) -> Bool {
-        if error is KeyServerError { return false }
+        if error is KeyServerError || error is HTTPSessionFactory.ProxyUnreachable { return false }
         let ns = error as NSError
         return ns.domain == NSURLErrorDomain
     }
@@ -97,7 +103,7 @@ class KeyServerService {
             throw KeyServerError.searchFailed("Invalid URL")
         }
         do {
-            let (data, response) = try await session().data(from: url)
+            let (data, response) = try await HTTPSessionFactory.boundedData(session(), from: url)
             guard let http = response as? HTTPURLResponse else { throw KeyServerError.invalidResponse }
             switch http.statusCode {
             case 200:
@@ -135,7 +141,7 @@ class KeyServerService {
         var lastError: Error?
         for attempt in 0..<2 {
             do {
-                let (data, response) = try await session().data(for: request)
+                let (data, response) = try await HTTPSessionFactory.boundedData(session(), for: request)
                 guard let http = response as? HTTPURLResponse else { throw KeyServerError.invalidResponse }
                 guard (200...299).contains(http.statusCode) else {
                     throw KeyServerError.uploadFailed(Self.uploadFailureText(status: http.statusCode, body: data))
@@ -163,7 +169,7 @@ class KeyServerService {
         }
 
         do {
-            let (data, response) = try await session().data(from: url)
+            let (data, response) = try await HTTPSessionFactory.boundedData(session(), from: url)
 
             guard let httpResponse = response as? HTTPURLResponse else {
                 throw KeyServerError.invalidResponse
@@ -237,7 +243,7 @@ class KeyServerService {
         }
 
         do {
-            let (data, response) = try await session().data(from: url)
+            let (data, response) = try await HTTPSessionFactory.boundedData(session(), from: url)
 
             guard let httpResponse = response as? HTTPURLResponse else {
                 throw KeyServerError.invalidResponse
@@ -299,7 +305,7 @@ class KeyServerService {
         }
 
         do {
-            let (data, response) = try await session().data(for: request)
+            let (data, response) = try await HTTPSessionFactory.boundedData(session(), for: request)
 
             guard let httpResponse = response as? HTTPURLResponse else {
                 throw KeyServerError.invalidResponse
@@ -360,7 +366,7 @@ class KeyServerService {
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
         do {
-            let (_, response) = try await session().data(for: request)
+            let (_, response) = try await HTTPSessionFactory.boundedData(session(), for: request)
 
             guard let httpResponse = response as? HTTPURLResponse,
                   httpResponse.statusCode == 200 else {

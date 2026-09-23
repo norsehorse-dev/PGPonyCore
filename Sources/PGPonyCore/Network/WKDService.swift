@@ -16,8 +16,8 @@
 //
 // <hash> = zbase32(SHA1(lowercased(localpart)))
 //
-// The advanced method is tried first; if it fails (DNS, 404, network),
-// the direct method is tried as a fallback. The response is binary OpenPGP
+// The advanced method is tried first; the direct method is the fallback only
+// when the openpgpkey subdomain does not resolve (8.3.0). The response is binary OpenPGP
 // key data — NOT ASCII-armored — so callers must armor before importing.
 
 import Foundation
@@ -105,22 +105,94 @@ final class WKDService {
         guard let (localpart, domain) = parseEmail(email) else {
             throw WKDError.invalidEmail
         }
-        let hash = zbase32SHA1(localpart.lowercased())
+        // 8.3.0 (hardening): ASCII-only lowercasing, as GnuPG does. Unicode
+        // lowercasing changed non-ASCII local parts and those lookups missed.
+        let hash = zbase32SHA1(Self.asciiLowercased(localpart))
         let encodedLocalpart = localpart.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? localpart
+        let address = Self.asciiLowercased(localpart) + "@" + domain
 
-        // Advanced first
+        // Advanced first. The direct method is the fallback only when the
+        // openpgpkey subdomain does not exist (the draft's rule); a 404 or a
+        // failure from a host that does exist is an answer, not a reason to
+        // ask a second host.
         let advancedURL = "https://openpgpkey.\(domain)/.well-known/openpgpkey/\(domain)/hu/\(hash)?l=\(encodedLocalpart)"
-        if let data = await tryFetch(advancedURL), !data.isEmpty {
-            return WKDLookupResult(data: data, source: .wkdAdvanced)
+        switch await fetch(advancedURL) {
+        case .data(let data):
+            return WKDLookupResult(data: try Self.keepingOnly(address: address, in: data), source: .wkdAdvanced)
+        case .hostNotFound:
+            break
+        case .failed:
+            throw WKDError.notFound
         }
 
-        // Direct fallback
         let directURL = "https://\(domain)/.well-known/openpgpkey/hu/\(hash)?l=\(encodedLocalpart)"
-        if let data = await tryFetch(directURL), !data.isEmpty {
-            return WKDLookupResult(data: data, source: .wkdDirect)
+        if case .data(let data) = await fetch(directURL) {
+            return WKDLookupResult(data: try Self.keepingOnly(address: address, in: data), source: .wkdDirect)
         }
 
         throw WKDError.notFound
+    }
+
+    /// Lowercase A to Z only; every other character, including non-ASCII
+    /// letters, is left as typed (GnuPG's rule for the WKD hash).
+    static func asciiLowercased(_ s: String) -> String {
+        String(String.UnicodeScalarView(s.unicodeScalars.map { scalar in
+            (65...90).contains(scalar.value) ? Unicode.Scalar(scalar.value + 32)! : scalar
+        }))
+    }
+
+    /// 8.3.0 (hardening): a WKD host answers for one address. Keep the first
+    /// certificate's primary key, its subkeys and only the User IDs whose
+    /// address is the one asked for (with the signatures under each); drop
+    /// every other identity and any further certificate. No matching User ID
+    /// means the answer is not a key for this address.
+    static func keepingOnly(address: String, in data: Data) throws -> Data {
+        var raw = Array(data)
+        if let text = String(data: data, encoding: .utf8), text.contains("-----BEGIN PGP"),
+           let dearmored = try? OpenPGPPacketParser.dearmor(text) {
+            raw = Array(dearmored)
+        }
+        guard let packets = try? OpenPGPPacketParser.parsePackets(data: raw),
+              packets.first?.tag == 6 else {
+            throw WKDError.invalidResponse
+        }
+        var out: [UInt8] = []
+        var keep = true
+        var matched = false
+        var seenPrimary = false
+        for packet in packets {
+            switch packet.tag {
+            case 6:
+                if seenPrimary { break }
+                seenPrimary = true
+                keep = true
+            case 13:
+                let uid = String(decoding: packet.body, as: UTF8.self)
+                keep = asciiLowercased(Self.addressPart(of: uid)) == address
+                if keep { matched = true }
+            case 17:
+                keep = false
+            case 14:
+                keep = true
+            default:
+                break
+            }
+            if packet.tag == 6, out.count > 0 { break }
+            if keep {
+                out += OpenPGPPacketBuilder.buildNewFormatPacketBytes(tag: packet.tag, body: packet.body)
+            }
+        }
+        guard matched else { throw WKDError.notFound }
+        return Data(out)
+    }
+
+    /// The address inside a User ID: between the last "<" and ">" when
+    /// present, else the whole trimmed string.
+    private static func addressPart(of uid: String) -> String {
+        if let open = uid.lastIndex(of: "<"), let close = uid.lastIndex(of: ">"), open < close {
+            return String(uid[uid.index(after: open)..<close]).trimmingCharacters(in: .whitespaces)
+        }
+        return uid.trimmingCharacters(in: .whitespaces)
     }
 
     // =========================================================================
@@ -139,19 +211,28 @@ final class WKDService {
         return (parts[0], parts[1].lowercased())
     }
 
-    /// Try to fetch from a URL. Returns nil on any error (so caller can fall back).
-    private func tryFetch(_ urlString: String) async -> Data? {
-        guard let url = URL(string: urlString) else { return nil }
+    private enum FetchOutcome {
+        case data(Data)
+        /// The host name does not resolve: the one case the advanced method
+        /// falls back to the direct one.
+        case hostNotFound
+        case failed
+    }
+
+    private func fetch(_ urlString: String) async -> FetchOutcome {
+        guard let url = URL(string: urlString) else { return .failed }
         var request = URLRequest(url: url)
         request.setValue("application/octet-stream", forHTTPHeaderField: "Accept")
         do {
-            let (data, response) = try await session.data(for: request)
-            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-                return nil
+            let (data, response) = try await HTTPSessionFactory.boundedData(session, for: request)
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200, !data.isEmpty else {
+                return .failed
             }
-            return data
+            return .data(data)
+        } catch let error as URLError where error.code == .cannotFindHost || error.code == .dnsLookupFailed {
+            return .hostNotFound
         } catch {
-            return nil
+            return .failed
         }
     }
 

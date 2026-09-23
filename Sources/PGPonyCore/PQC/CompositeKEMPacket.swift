@@ -94,6 +94,9 @@ enum CompositeKEMPacket {
             throw Failure.malformed("unexpected public material length \(pubMatLen)")
         }
         var off = 10
+        guard off + pubMatLen <= body.count else {
+            throw Failure.malformed("public material truncated")
+        }
         let ecdhPublic = Array(body[off..<(off + suite.eccKeyBytes)])   // R
         off += pubMatLen                                                // skip full pubMat
 

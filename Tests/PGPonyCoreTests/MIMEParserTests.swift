@@ -6,12 +6,12 @@
 // Phase 1 of PGP/MIME multipart decrypt. These tests drive the pure-Swift
 // `MIMEParser` / `MIMEPresentation` against fixtures in Resources/mime/.
 //
-// The headline fixture, `dong_real.eml`, is FHYQ Dong's actual Thunderbird
-// PGP/MIME message (the decrypted bytes of his "carry both" report): nested
-// multipart/mixed wrapping a multipart/alternative (base64 text/plain that is
-// format=flowed, plus quoted-printable text/html) alongside a quoted-printable
-// application/pgp-keys attachment. The two synthetic fixtures cover shapes the
-// real one doesn't: two attachments with an RFC 2047 encoded-word filename, and
+// The headline fixture, `thunderbird_reply.eml`, is a synthetic message in
+// the exact shape of a Thunderbird PGP/MIME reply: nested multipart/mixed
+// wrapping a multipart/alternative (base64 text/plain that is format=flowed,
+// plus quoted-printable text/html) alongside a quoted-printable
+// application/pgp-keys attachment. The two other synthetic fixtures cover
+// shapes this one doesn't: two attachments with an RFC 2047 encoded-word filename, and
 // a multipart/signed wrapper whose signature part must not surface as a file.
 //
 // Resources/mime/ is dropped into the synchronized PGPonyTests folder, so the
@@ -38,45 +38,45 @@ final class MIMEParserTests: XCTestCase {
         String(decoding: data, as: UTF8.self)
     }
 
-    // MARK: - dong_real.eml (the real reported case)
+    // MARK: - thunderbird_reply.eml (the Thunderbird reply shape)
 
-    func testDongReal_parsesAsStructuredMultipart() throws {
-        let data = try loadFixture("dong_real")
+    func testThunderbirdReply_parsesAsStructuredMultipart() throws {
+        let data = try loadFixture("thunderbird_reply")
         guard let message = MIMEParser.parseMultipart(data) else {
-            return XCTFail("dong_real should parse as structured multipart")
+            return XCTFail("thunderbird_reply should parse as structured multipart")
         }
         XCTAssertEqual(message.root.contentType.mimeType, "multipart/mixed")
     }
 
-    func testDongReal_bodyIsPlainTextWithHTMLAlternative() throws {
-        let data = try loadFixture("dong_real")
+    func testThunderbirdReply_bodyIsPlainTextWithHTMLAlternative() throws {
+        let data = try loadFixture("thunderbird_reply")
         let p = try XCTUnwrap(MIMEParser.parseMultipart(data)).presentation
 
         let plain = try XCTUnwrap(p.plainText, "expected a decoded text/plain body")
         XCTAssertTrue(plain.hasPrefix("Hi NorseHorse,"), "flowed body should start with the greeting")
         XCTAssertTrue(plain.contains("Thanks again,"))
-        XCTAssertTrue(plain.contains("FHYQ"))
+        XCTAssertTrue(plain.contains("Sam"))
         XCTAssertTrue(plain.contains("\u{2014}"), "em dash should survive base64 + UTF-8 decode")
 
         let html = try XCTUnwrap(p.htmlText, "the alternative text/html part should be retained")
         XCTAssertTrue(html.contains("<body"))
     }
 
-    func testDongReal_notSigned() throws {
-        let data = try loadFixture("dong_real")
+    func testThunderbirdReply_notSigned() throws {
+        let data = try loadFixture("thunderbird_reply")
         let p = try XCTUnwrap(MIMEParser.parseMultipart(data)).presentation
         XCTAssertFalse(p.isSigned, "no multipart/signed or pgp-signature part is present")
     }
 
-    func testDongReal_pgpKeysAttachment() throws {
-        let data = try loadFixture("dong_real")
+    func testThunderbirdReply_pgpKeysAttachment() throws {
+        let data = try loadFixture("thunderbird_reply")
         let p = try XCTUnwrap(MIMEParser.parseMultipart(data)).presentation
 
         XCTAssertEqual(p.attachments.count, 1, "only the public-key part is an attachment")
         let att = try XCTUnwrap(p.attachments.first)
-        XCTAssertEqual(att.filename, "OpenPGP_0xCFE702FB746017E1_and_old_rev.asc")
+        XCTAssertEqual(att.filename, "OpenPGP_0xBC1F29B58622ED03.asc")
         XCTAssertEqual(att.mimeType, "application/pgp-keys")
-        XCTAssertEqual(att.byteCount, 2452, "quoted-printable decode is byte-exact")
+        XCTAssertEqual(att.byteCount, 640, "quoted-printable decode is byte-exact")
         XCTAssertTrue(text(att.data).hasPrefix("-----BEGIN PGP PUBLIC KEY BLOCK-----"))
         XCTAssertTrue(text(att.data).contains("-----END PGP PUBLIC KEY BLOCK-----"))
     }

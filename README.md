@@ -21,7 +21,9 @@ A self-contained OpenPGP implementation with **no third-party Swift dependencies
 system frameworks only (Foundation, CryptoKit, CommonCrypto, Security, CoreNFC, zlib)
 plus one pinned, vendored C library: [liboqs](https://github.com/open-quantum-safe/liboqs)
 (ML-KEM only), shipped as `Vendor/liboqs.xcframework` so the package builds out of the
-box and auditors see the exact binary the app links.
+box and auditors see the exact binary the app links. `Scripts/build-liboqs-ios.sh`
+rebuilds it from a pinned liboqs commit; `Vendor/LIBOQS.md` records the source, the
+build flags and the expected SHA-256 of each library.
 
 Added in 8.3.0: ML-DSA (for composite signatures) comes from CryptoKit's `MLDSA65`,
 which exists on iOS 26 and later only. Building needs the iOS 26 SDK (Xcode 26); on an
@@ -42,7 +44,7 @@ no such caveat and needs only CoreNFC.
 | **PQC** | ML-KEM via the vendored liboqs + composite-KEM packet handling (RFC 9980): ML-KEM-768 with X25519 (algorithm 35, on v6 and v4 keys) and ML-KEM-1024 with X448 (algorithm 36); composite ML-DSA-65 with Ed25519 signatures (algorithm 30: sign and verify, iOS 26) |
 | **LibrePGP** | LibrePGP (v5) encrypt / decrypt / combiner for GnuPG interop |
 | **KeyGen** | v6 key generation (RFC 9580), post-quantum and authentication subkeys on existing v6 keys |
-| **KeyOps** | software key-expiration editing: fresh self-certs/bindings, gpg-verifiable, revoked identities and subkeys left alone |
+| **KeyOps** | software key-expiration editing: fresh self-certs/bindings, gpg-verifiable, revoked identities and subkeys left alone; certificate binding verification (subkey bindings and back-signatures) for recipient selection |
 | **Card** | OpenPGP smartcard protocol — APDU command layer, PSO:CDS/DECIPHER, PIN, KDF-DO (00F9) derived PINs, on-card GEN, over a transport seam with NFC and USB-C implementations |
 | **Symmetric** | passphrase-only (`gpg -c`) encrypt/decrypt |
 | **Backup** | backup-code generation (the passphrase behind the encrypted keyring backup) |

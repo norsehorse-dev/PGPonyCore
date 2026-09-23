@@ -48,9 +48,12 @@ class Ed25519KeyGenerator {
     private static let s2kCipherAES128: UInt8 = 7
     private static let aes128BlockSize = 16
     private static let aes128KeySize = 16
-    // GnuPG default coded count = 0x60 → decoded = (16 + (0 & 15)) << ((0x60 >> 4) + 6)
-    // = 16 << 12 = 65536 bytes
-    private static let s2kCodedCount: UInt8 = 0x60
+    // 8.3.0 (hardening): 0xFF, 65,011,712 octets hashed, the top of the range
+    // gpg-agent calibrates to and what SymmetricEncryption already writes.
+    // 0x60 (65,536 octets) made an exported or backed-up key cheap to guess.
+    // Existing keys keep the count in their own S2K specifier until the
+    // passphrase changes; deriveS2KKey reads it from the packet.
+    private static let s2kCodedCount: UInt8 = 0xFF
 
     // MARK: - 7.1.1 Canonical Cv25519 Scalar Encoding
 
@@ -481,10 +484,10 @@ class Ed25519KeyGenerator {
         body.append(s2kCipherAES128)                      // AES-128
         body.append(s2kIteratedSalted)                    // S2K type 3
         body.append(s2kHashSHA256)                        // SHA-256
-        // 8.3.0 (section 5, audit 6): random or trap, never a zero salt / IV.
+        // 8.3.0 (hardening): random or trap, never a zero salt / IV.
         let salt = SecureRandom.bytesOrTrap(s2kSaltLength)
         body.append(contentsOf: salt)
-        body.append(s2kCodedCount)                        // 0x60 -> 65536 iterations
+        body.append(s2kCodedCount)                        // 0xFF -> 65,011,712 octets
         let iv = SecureRandom.bytesOrTrap(aes128BlockSize)
         body.append(contentsOf: iv)
 
@@ -602,11 +605,11 @@ class Ed25519KeyGenerator {
         result.append(s2kIteratedSalted)  // Type 3: Iterated+Salted
         result.append(s2kHashSHA256)       // Hash: SHA-256
         
-        // 8-byte random salt. 8.3.0 (section 5, audit 6): random or trap.
+        // 8-byte random salt. 8.3.0 (hardening): random or trap.
         let salt = SecureRandom.bytesOrTrap(s2kSaltLength)
         result.append(contentsOf: salt)
         
-        // Coded count byte (0x60 = 65536 iterations, GnuPG default)
+        // Coded count byte (s2kCodedCount, 0xFF since 8.3.0)
         result.append(s2kCodedCount)
         
         // Generate AES-128 key from passphrase via S2K
@@ -629,7 +632,7 @@ class Ed25519KeyGenerator {
         CC_SHA1(plaintext, CC_LONG(plaintext.count), &sha1Hash)
         plaintext.append(contentsOf: sha1Hash)
         
-        // Random IV for AES-128 CFB. 8.3.0 (section 5, audit 6): random or trap.
+        // Random IV for AES-128 CFB. 8.3.0 (hardening): random or trap.
         let iv = SecureRandom.bytesOrTrap(aes128BlockSize)
         result.append(contentsOf: iv)
         
@@ -672,12 +675,7 @@ class Ed25519KeyGenerator {
             }
             
             // Hash salt+passphrase repeatedly until count bytes processed
-            var bytesHashed = 0
-            while bytesHashed < count {
-                let chunk = min(saltedPass.count, count - bytesHashed)
-                CC_SHA256_Update(&ctx, Array(saltedPass[0..<chunk]), CC_LONG(chunk))
-                bytesHashed += chunk
-            }
+            S2KStream.feed(saltedPass, count: count) { bytes, n in CC_SHA256_Update(&ctx, bytes, CC_LONG(n)) }
             
             var hash = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
             CC_SHA256_Final(&hash, &ctx)
@@ -1427,5 +1425,33 @@ private extension UInt32 {
             UInt8((self >> 8) & 0xFF),
             UInt8(self & 0xFF)
         ]
+    }
+}
+
+// MARK: - S2K input stream (8.3.0)
+
+/// Feeds the iterated-salted S2K input (salt || passphrase, repeated and cut
+/// at `count` octets) to a hash in 64 KiB blocks. The per-repetition loop it
+/// replaces allocated an array for every 20-odd octets, which was tolerable
+/// at 65,536 octets and is not at 65,011,712 (coded count 0xFF, the v4 key
+/// default since 8.3.0). The block holds whole repetitions, so each block
+/// and any cut at its end continue the stream exactly where the last one
+/// stopped: the hashed octets are identical to the old loop's.
+nonisolated enum S2KStream {
+    static func feed(_ unit: [UInt8], count: Int, _ update: (UnsafeRawPointer, Int) -> Void) {
+        guard !unit.isEmpty, count > 0 else { return }
+        let repetitions = max(1, 65_536 / unit.count)
+        var block: [UInt8] = []
+        block.reserveCapacity(repetitions * unit.count)
+        for _ in 0..<repetitions { block.append(contentsOf: unit) }
+        block.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            var remaining = count
+            while remaining > 0 {
+                let n = min(remaining, raw.count)
+                update(base, n)
+                remaining -= n
+            }
+        }
     }
 }

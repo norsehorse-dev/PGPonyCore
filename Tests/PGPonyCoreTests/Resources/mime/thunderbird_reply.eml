@@ -1,0 +1,76 @@
+Content-Type: multipart/mixed; boundary="------------Q7pLm2vXc9RtYs4KdW8nHbJe";
+ protected-headers="v1"
+Subject: Re: ...
+From: Sam Example <sam@example.org>
+To: NorseHorse <norsehorse@example.org>
+Message-ID: <0f3c2a91-5b7e-4d1a-9c6e-2e8b4f1a7d30@example.org>
+References: <7a1e9c42-3d58-4b0f-8e21-6c9d0b5f2a17@example.org>
+In-Reply-To: <7a1e9c42-3d58-4b0f-8e21-6c9d0b5f2a17@example.org>
+
+--------------Q7pLm2vXc9RtYs4KdW8nHbJe
+Content-Type: multipart/mixed; boundary="------------T3fGh6JkLp0QwEr5TyUi8OaS"
+
+--------------T3fGh6JkLp0QwEr5TyUi8OaS
+Content-Type: multipart/alternative;
+ boundary="------------Z1xCv4BnM7aSdFg2HjKl9QwE"
+
+--------------Z1xCv4BnM7aSdFg2HjKl9QwE
+Content-Type: text/plain; charset=UTF-8; format=flowed
+Content-Transfer-Encoding: base64
+
+SGkgTm9yc2VIb3JzZSwNCg0KVGhhdCB3b3JrZWQg4oCUIGJvdGggdGhlIG1lc3NhZ2UgYW5k
+IHRoZSBrZXkgY2FtZSB0aHJvdWdoIGluIG9uZSANCnJlcGx5LCBhbmQgUEdQb255IHNob3dl
+ZCB0aGUgYXR0YWNobWVudCB1bmRlciB0aGUgdGV4dC4gSSBhbSBzZW5kaW5nIG15IA0KY3Vy
+cmVudCBrZXkgYWdhaW4gc28geW91IGhhdmUgaXQgbmV4dCB0byB0aGUgb2xkIHJldm9jYXRp
+b24uDQoNClRoYW5rcyBhZ2FpbiwNClNhbQ0KDQpPbiA2LzkvMjYgNDo0MuKAr1BNLCBOb3Jz
+ZUhvcnNlIHdyb3RlOg0KPiBDb3VsZCB5b3Ugc2VuZCB0aGUga2V5IGFuZCB0aGUgbWVzc2Fn
+ZSB0b2dldGhlcj8NCg==
+--------------Z1xCv4BnM7aSdFg2HjKl9QwE
+Content-Type: text/html; charset=UTF-8
+Content-Transfer-Encoding: quoted-printable
+
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv=3D"Content-Type" content=3D"text/html; charset=3DUTF-8=
+">
+  </head>
+  <body>
+    <p>Hi NorseHorse,</p>
+    <p>That worked =E2=80=94 both the message and the key came through in o=
+ne reply, and PGPony showed the attachment under the text. I am sending my =
+current key again so you have it next to the old revocation.</p>
+    <p>Thanks again,<br>
+      Sam</p>
+    <blockquote type=3D"cite">Could you send the key and the message togeth=
+er?</blockquote>
+  </body>
+</html>
+
+--------------Z1xCv4BnM7aSdFg2HjKl9QwE--
+
+--------------T3fGh6JkLp0QwEr5TyUi8OaS
+Content-Type: application/pgp-keys;
+ name="OpenPGP_0xBC1F29B58622ED03.asc"
+Content-Disposition: attachment;
+ filename="OpenPGP_0xBC1F29B58622ED03.asc"
+Content-Description: OpenPGP public key
+Content-Transfer-Encoding: quoted-printable
+
+-----BEGIN PGP PUBLIC KEY BLOCK-----
+
+mDMEarM7XxYJKwYBBAHaRw8BAQdAox8YR71l0sURGXfVgoOPUHIfbQcLSIJPNhcM
+90Dx0My0HVNhbSBFeGFtcGxlIDxzYW1AZXhhbXBsZS5vcmc+iJMEExYKADsWIQRG
++dqfnZgI1zxFpC68Hym1hiLtAwUCarM7XwIbAwULCQgHAgIiAgYVCgkICwIEFgID
+AQIeBwIXgAAKCRC8Hym1hiLtAwHiAQDwrA7kJ8SVcWWhSNmIVgfUej1BHhe0PtpP
+qWChMAvP6wEAjpux3zn0HTSbUztt4tqDAAtXa4eL7lBhY/KJ90QEZg64OARqsztf
+EgorBgEEAZdVAQUBAQdAS3kkT8wjFXQ8/dsmdt/Rjbnae1h4wBxAFScXKxc+7AcD
+AQgHiHgEGBYKACAWIQRG+dqfnZgI1zxFpC68Hym1hiLtAwUCarM7XwIbDAAKCRC8
+Hym1hiLtAwcEAQDY30YAIPFeSRLkZSS5tam+jRW4+9so9VKrjNJ2rxUfDQEA53Vq
+aL6BPpq+i8vUVpqZAuKYnkA2EX1Rnh++oEPwJgk=3D
+=3DDlkF
+-----END PGP PUBLIC KEY BLOCK-----
+
+--------------T3fGh6JkLp0QwEr5TyUi8OaS--
+
+--------------Q7pLm2vXc9RtYs4KdW8nHbJe--

@@ -44,6 +44,9 @@ import Security
 /// CORE SEAM: the app observes UIApplication.protectedDataWillBecomeUnavailableNotification;
 /// the core names the same notification by its string so it imports no UIKit.
 private let protectedDataWillBecomeUnavailable = Notification.Name("UIApplicationProtectedDataWillBecomeUnavailable")
+/// CORE SEAM: likewise UIApplication.didEnterBackgroundNotification, by its
+/// underlying name, for the opt-in clear-on-background policy.
+private let applicationDidEnterBackground = Notification.Name("UIApplicationDidEnterBackgroundNotification")
 
 // MARK: - Public surface
 
@@ -292,6 +295,13 @@ final class OpenPGPCardService {
     /// identify itself, in which case no cached PIN is ever used for it.
     private(set) var connectedSerialHex: String?
 
+    /// 8.3.0 (hardening): what a remembered PIN is bound to: the card's
+    /// serial, the three key fingerprints it reports, and whether it asks for
+    /// a KDF-derived PIN. A card that differs in any of them matches no
+    /// remembered entry and gets the ordinary prompt. Nil when the card would
+    /// not say, in which case nothing is remembered for it.
+    private(set) var connectedPINIdentity: String?
+
     /// Which transport this session actually ended up on — for UI that wants to
     /// say "connected over USB-C" rather than guessing.
     var activeTransportKind: CardTransportKind? { transport?.kind }
@@ -372,7 +382,29 @@ final class OpenPGPCardService {
         // propagates and fails the connect, which is correct: we would rather
         // not open a session than open one that might burn PW1 attempts.
         try await readKDFConfiguration()
+        connectedPINIdentity = await readPINIdentity()
         return self
+    }
+
+    /// 8.3.0 (hardening): serial, key fingerprints (DO C5 inside the
+    /// application related data) and KDF state, as `connectedPINIdentity`
+    /// describes. One GET DATA; any failure leaves the identity nil.
+    private func readPINIdentity() async -> String? {
+        guard let serial = connectedSerialHex, !serial.isEmpty, !kdfUnreadable else { return nil }
+        let apdu = APDU(
+            instructionClass: 0x00, instructionCode: 0xCA,
+            p1Parameter: 0x00, p2Parameter: 0x6E,
+            data: Data(), expectedResponseLength: 256
+        )
+        guard let (data, sw1, sw2) = try? await transmit(apdu), sw1 == 0x90, sw2 == 0x00,
+              let fingerprints = BERTLV.find(0x00C5, in: data), fingerprints.count >= 60 else { return nil }
+        return Self.pinIdentity(serial: serial, fingerprints: Array(fingerprints.prefix(60)),
+                                kdfEnabled: kdf?.isEnabled == true)
+    }
+
+    /// The identity string, split out so it can be tested without a card.
+    nonisolated static func pinIdentity(serial: String, fingerprints: [UInt8], kdfEnabled: Bool) -> String {
+        "\(serial)|\(fingerprints.map { String(format: "%02x", $0) }.joined())|kdf:\(kdfEnabled ? "on" : "off")"
     }
 
     /// v8.1.0 — §4b. Read the KDF data object (DO 00F9) and the PW status bytes
@@ -630,7 +662,7 @@ final class OpenPGPCardService {
     func verify(pin: String, mode: OpenPGPCardPIN) async throws {
         var pin = pin
         if pin.isEmpty {
-            guard let remembered = CardPINCache.shared.pin(forSerial: connectedSerialHex) else {
+            guard let remembered = CardPINCache.shared.pin(forSerial: connectedPINIdentity) else {
                 throw OpenPGPCardError.storedPINUnavailable
             }
             pin = remembered
@@ -1125,7 +1157,15 @@ final class OpenPGPCardService {
         }
 
         // 0x61xx: more data available; pull it with GET RESPONSE until 0x9000.
+        // 8.3.0 (hardening): bounded. A real card's largest answer (the
+        // application data, a 4096-bit key) is a few KiB in a handful of
+        // rounds, so the loop is bounded well above that.
+        var rounds = 0
         while sw1 == 0x61 {
+            rounds += 1
+            guard rounds <= 64, accumulated.count <= 64 * 1024 else {
+                throw OpenPGPCardError.malformedResponse
+            }
             let getResponse = APDU(
                 instructionClass: 0x00, instructionCode: 0xC0,
                 p1Parameter: 0x00, p2Parameter: 0x00,
@@ -1226,7 +1266,16 @@ final class OpenPGPCardService {
 enum BERTLV {
 
     /// Find the value of `tag` anywhere in `bytes`, recursing into constructed TLVs.
+    /// 8.3.0 (hardening): nesting is bounded; the OpenPGP card data is three
+    /// levels deep at most, so anything past eight is not a real card.
+    static let maxDepth = 8
+
     static func find(_ tag: UInt16, in bytes: [UInt8]) -> [UInt8]? {
+        find(tag, in: bytes, depth: 0)
+    }
+
+    private static func find(_ tag: UInt16, in bytes: [UInt8], depth: Int) -> [UInt8]? {
+        guard depth < maxDepth else { return nil }
         var i = 0
         while i < bytes.count {
             // Tag (1 or 2 bytes).
@@ -1258,7 +1307,7 @@ enum BERTLV {
                 return value
             }
             if constructed {
-                if let found = find(tag, in: value) { return found }
+                if let found = find(tag, in: value, depth: depth + 1) { return found }
             }
             i += length
         }
@@ -1266,7 +1315,19 @@ enum BERTLV {
     }
 }
 
-// MARK: - v7.1.0: Card user-PIN cache (Dong's request)
+/// 8.3.0 (hardening): both secret caches normally outlive a trip to the
+/// background, because sharing from Mail into PGPony backgrounds the app and
+/// a cleared cache would ask again mid-flow. Users who would rather trade that
+/// for a shorter window turn this on in Settings; off by default.
+enum SecretCacheBackgroundPolicy {
+    static let defaultsKey = "clearSecretsOnBackground"
+    static var clearsOnBackground: Bool {
+        get { UserDefaults.standard.bool(forKey: defaultsKey) }
+        set { UserDefaults.standard.set(newValue, forKey: defaultsKey) }
+    }
+}
+
+// MARK: - v7.1.0: Card user-PIN cache (a tester's request)
 
 /// Opt-in, in-memory cache for the OpenPGP card *user* PIN (PW1), so a user doing
 /// several card operations in one session isn't re-prompted every time.
@@ -1380,9 +1441,15 @@ final class CardPINCache {
         var authenticatedByKeychain = false
         if !hasLiveEntry {
             guard Self.persistenceActive else { return false }
-            let restored = await Task.detached(priority: .userInitiated) { CardPINKeychain.loadAll() }.value
+            var restored = await Task.detached(priority: .userInitiated) { CardPINKeychain.loadAll() }.value
+            for legacy in restored.keys where !legacy.contains("|") {
+                CardPINKeychain.remove(forSerial: legacy)
+                restored.removeValue(forKey: legacy)
+            }
             guard !restored.isEmpty else { return false }
             queue.sync {
+                // Entries saved before 8.3.0 were keyed by serial alone; they
+                // were removed above and the PIN is asked for once.
                 for (serial, pin) in restored where entries[serial] == nil {
                     entries[serial] = Entry(pin: pin, expiry: nil, storedAt: Date())
                 }
@@ -1423,7 +1490,7 @@ final class CardPINCache {
     private let queue = DispatchQueue(label: "app.pgpony.pincache")
 
     private init() {
-        // v7.1.x (Dong): the PIN cache is bounded by the chosen duration, a
+        // v7.1.x (a tester's report): the PIN cache is bounded by the chosen duration, a
         // wrong-PIN clear, and the manual "Clear Remembered PIN" action — NOT by
         // app backgrounding. Backgrounding used to wipe it here, which defeated
         // the Mail -> PGPony flow (opening the share sheet backgrounds the app and
@@ -1441,6 +1508,16 @@ final class CardPINCache {
         ) { [weak self] _ in
             guard let self, Self.mode.endsOnDeviceLock else { return }
             self.clear()
+        }
+        // 8.3.0 (hardening): the opt-in "Forget When PGPony Leaves the Screen".
+        // Memory only: a PIN kept across restarts stays in the Keychain, behind
+        // its own Face ID check.
+        NotificationCenter.default.addObserver(
+            forName: applicationDidEnterBackground,
+            object: nil, queue: nil
+        ) { [weak self] _ in
+            guard let self, SecretCacheBackgroundPolicy.clearsOnBackground else { return }
+            self.queue.sync { self.entries.removeAll() }
         }
     }
 
@@ -1547,7 +1624,7 @@ final class CardPINCache {
         }
     }
 
-    /// v7.1.1 (Dong) — change the cache duration AND immediately re-apply it to a
+    /// v7.1.1 (a tester's report) — change the cache duration AND immediately re-apply it to a
     /// PIN that is already held, so switching (e.g.) "1 minute" -> "Until I clear
     /// it" takes effect on the CURRENT PIN right away instead of waiting for the
     /// next decrypt to call store().
@@ -1707,6 +1784,14 @@ final class PassphraseCache {
             object: nil, queue: nil
         ) { [weak self] _ in
             guard let self, Self.mode.endsOnDeviceLock else { return }
+            self.clear()
+        }
+        // 8.3.0 (hardening): the opt-in clear on background.
+        NotificationCenter.default.addObserver(
+            forName: applicationDidEnterBackground,
+            object: nil, queue: nil
+        ) { [weak self] _ in
+            guard let self, SecretCacheBackgroundPolicy.clearsOnBackground else { return }
             self.clear()
         }
     }

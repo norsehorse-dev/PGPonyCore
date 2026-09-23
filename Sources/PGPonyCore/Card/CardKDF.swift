@@ -155,7 +155,10 @@ struct CardKDF: Equatable {
         guard let countBytes = fields[0x83], countBytes.count == 4 else { return nil }
         var count = 0
         for b in countBytes { count = (count << 8) | Int(b) }
-        guard count > 0 else { return nil }
+        // 8.3.0 (hardening): GnuPG's kdf-setup calibrates to tens of millions
+        // of octets; a count past 2^28 (about 268 million) is not one a real
+        // card was provisioned with, and would hold the PIN check for minutes.
+        guard count > 0, count <= 1 << 28 else { return nil }
 
         // PW1 salt is the only one required to verify a user PIN. The reset-code
         // and PW3 salts are optional here so a card that omits them still works

@@ -100,6 +100,16 @@ enum MLKEMService {
 
     // MARK: - Handle lifecycle
 
+    /// 8.3.0 (hardening): wipe a scratch buffer that held secret material
+    /// once its bytes have been copied out, with liboqs's own cleanse (which
+    /// the compiler may not optimize away). Best effort: Swift may have made
+    /// copies of its own, and the returned `Data` is the caller's to drop.
+    private static func cleanse(_ bytes: inout [UInt8]) {
+        bytes.withUnsafeMutableBytes { raw in
+            if let base = raw.baseAddress { OQS_MEM_cleanse(base, raw.count) }
+        }
+    }
+
     /// Runs `body` with a live OQS_KEM handle for `level`, freeing it
     /// afterwards. Also asserts liboqs's advertised sizes match the level's
     /// constants, so a mismatched library can never feed the packet layer
@@ -129,6 +139,7 @@ enum MLKEMService {
         try withKEM(level) { kem in
             var pk = [UInt8](repeating: 0, count: level.publicKeyBytes)
             var sk = [UInt8](repeating: 0, count: level.secretKeyBytes)
+            defer { cleanse(&sk) }
             let rc = OQS_KEM_keypair(kem, &pk, &sk)
             guard rc == OQS_SUCCESS else { throw Failure.operationFailed("keypair") }
             return (Data(pk), Data(sk))
@@ -144,6 +155,7 @@ enum MLKEMService {
         return try withKEM(level) { kem in
             var pk = [UInt8](repeating: 0, count: level.publicKeyBytes)
             var sk = [UInt8](repeating: 0, count: level.secretKeyBytes)
+            defer { cleanse(&sk) }
             let rc = seed.withUnsafeBytes { s in
                 OQS_KEM_keypair_derand(kem, &pk, &sk,
                                        s.bindMemory(to: UInt8.self).baseAddress)
@@ -166,6 +178,7 @@ enum MLKEMService {
         return try withKEM(level) { kem in
             var ct = [UInt8](repeating: 0, count: level.ciphertextBytes)
             var ss = [UInt8](repeating: 0, count: sharedSecretBytes)
+            defer { cleanse(&ss) }
             let rc = publicKey.withUnsafeBytes { p in
                 OQS_KEM_encaps(kem, &ct, &ss,
                                p.bindMemory(to: UInt8.self).baseAddress)
@@ -188,6 +201,7 @@ enum MLKEMService {
         }
         return try withKEM(level) { kem in
             var ss = [UInt8](repeating: 0, count: sharedSecretBytes)
+            defer { cleanse(&ss) }
             let rc = ciphertext.withUnsafeBytes { c in
                 secretKey.withUnsafeBytes { sk in
                     OQS_KEM_decaps(kem, &ss,

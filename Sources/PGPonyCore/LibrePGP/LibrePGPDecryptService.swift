@@ -375,12 +375,7 @@ enum LibrePGPDecryptService {
                 let prefix = [UInt8](repeating: 0, count: prefixCount)
                 CC_SHA256_Update(&ctx, prefix, CC_LONG(prefix.count))
             }
-            var bytesHashed = 0
-            while bytesHashed < count {
-                let chunk = min(saltedPass.count, count - bytesHashed)
-                CC_SHA256_Update(&ctx, Array(saltedPass[0..<chunk]), CC_LONG(chunk))
-                bytesHashed += chunk
-            }
+            S2KStream.feed(saltedPass, count: count) { bytes, n in CC_SHA256_Update(&ctx, bytes, CC_LONG(n)) }
             var hash = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
             CC_SHA256_Final(&hash, &ctx)
             keyMaterial.append(contentsOf: hash)

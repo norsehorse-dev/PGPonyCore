@@ -24,8 +24,13 @@ enum MIMEParser {
     /// Parse any bytes into a MIME entity tree. A non-MIME / plain-text input
     /// becomes a single `text/plain` leaf holding the whole input.
     static func parse(_ data: Data) -> MIMEEntity {
-        parseEntity(Array(data))
+        parseEntity(Array(data), depth: 0)
     }
+
+    /// 8.3.0 hardening: nested multiparts past this depth are kept as one
+    /// opaque leaf instead of recursing again. Real mail nests a handful of
+    /// levels (signed, mixed, alternative, related); 32 is far above that.
+    static let maxNestingDepth = 32
 
     /// Structured-detection entry point used by the decrypt view.
     ///
@@ -34,7 +39,7 @@ enum MIMEParser {
     /// its existing plain-text behaviour. This is the guarantee that inline PGP
     /// and normal messages never change.
     static func parseMultipart(_ data: Data) -> MIMEMessage? {
-        let root = parseEntity(Array(data))
+        let root = parseEntity(Array(data), depth: 0)
         guard root.contentType.isMultipart,
               case .multipart(let parts) = root.content,
               !parts.isEmpty else {
@@ -45,7 +50,7 @@ enum MIMEParser {
 
     // MARK: - Entity parsing
 
-    private static func parseEntity(_ bytes: [UInt8]) -> MIMEEntity {
+    private static func parseEntity(_ bytes: [UInt8], depth: Int) -> MIMEEntity {
         let (headerBytes, bodyBytes) = splitHeadersAndBody(bytes)
         let headers = parseHeaders(headerBytes)
 
@@ -58,9 +63,10 @@ enum MIMEParser {
             .trimmingCharacters(in: CharacterSet(charactersIn: "<> "))
 
         let content: MIMEContent
-        if contentType.isMultipart, let boundary = contentType.boundary, !boundary.isEmpty {
+        if contentType.isMultipart, let boundary = contentType.boundary, !boundary.isEmpty,
+           depth < maxNestingDepth {
             let parts = splitMultipartBody(bodyBytes, boundary: boundary)
-            content = .multipart(parts.map { parseEntity($0) })
+            content = .multipart(parts.map { parseEntity($0, depth: depth + 1) })
         } else {
             content = .leaf(Data(transferDecode(bodyBytes, encoding: transferEncoding)))
         }

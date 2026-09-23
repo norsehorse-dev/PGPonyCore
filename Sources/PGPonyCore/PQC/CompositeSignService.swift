@@ -320,17 +320,25 @@ enum CompositeSigVerifier {
 
     /// Both components over the same digest; `compositePublic` is EdDSA
     /// public || ML-DSA public and `signature` EdDSA sig || ML-DSA sig.
-    static func verify(suite: CompositeSignSuite, compositePublic: [UInt8], signature: [UInt8], digest: [UInt8]) -> Outcome {
+    /// - Parameter classicalHalfWhenUnavailable: 8.3.0 (hardening). For a
+    ///   certificate binding check only: on a system without ML-DSA, answer
+    ///   from the Ed25519 half alone instead of "unsupported", so an
+    ///   ML-DSA-65 + Ed25519 key's subkey bindings can still be checked on
+    ///   iOS 18. Never used for message signatures, where the
+    ///   user is told the signature could not be checked.
+    static func verify(suite: CompositeSignSuite, compositePublic: [UInt8], signature: [UInt8], digest: [UInt8],
+                       classicalHalfWhenUnavailable: Bool = false) -> Outcome {
         guard let pub = suite.splitPublic(compositePublic) else { return .invalid }
         guard let sig = suite.splitSignature(signature) else { return .invalid }
         guard suite == .mldsa65Ed25519 else {
             return .unsupported(String(localized: "Signatures made with \(suite.displayName) cannot be verified on this device yet."))
         }
-        guard MLDSAService.isAvailable else {
-            return .unsupported(MLDSAService.Failure.unavailable.errorDescription ?? "ML-DSA unavailable")
-        }
         guard let edKey = try? Curve25519.Signing.PublicKey(rawRepresentation: Data(pub.eddsa)) else { return .invalid }
         let edOK = edKey.isValidSignature(Data(sig.eddsa), for: Data(digest))
+        guard MLDSAService.isAvailable else {
+            if classicalHalfWhenUnavailable { return edOK ? .valid : .invalid }
+            return .unsupported(MLDSAService.Failure.unavailable.errorDescription ?? "ML-DSA unavailable")
+        }
         let mlOK: Bool
         do {
             mlOK = try MLDSAService.verify(signature: sig.mldsa, message: digest, publicKey: pub.mldsa, suite: suite)
