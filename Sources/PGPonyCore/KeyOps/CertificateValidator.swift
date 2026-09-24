@@ -18,12 +18,14 @@
 // that pick recipients or attribute signatures read that view.
 //
 // Bindings this code cannot check: an ML-DSA-65 + Ed25519 primary where
-// ML-DSA is unavailable is checked on its Ed25519 half; an Ed448 primary
+// ML-DSA is unavailable is checked on its Ed25519 half. An Ed448 primary
 // (RFC 9980 algorithm 31), a DSA primary, a LibrePGP v5 key, an ECDSA key on
-// a curve other than P-256/384/521 and a v4 key with algorithm 27 are
-// accepted unchecked. Whether a binding is uncheckable depends only on the
-// signer's key; a signature naming a hash or version this code cannot
-// handle is invalid.
+// a curve other than P-256/384/521 and a v4 key with algorithm 27 have no
+// verifier here: such a binding counts for encryption and signing only for a
+// subkey the caller lists in `pinnedSubkeys` (one the user accepted), and
+// `newestVerifiedBinding`, what a merge should add subkeys on, never returns
+// it. Whether a binding is uncheckable depends only on the signer's key; a
+// signature naming a hash or version this code cannot handle is invalid.
 
 import Foundation
 import CryptoKit
@@ -48,19 +50,56 @@ enum CertificateValidator {
         case uncheckable
     }
 
+    // MARK: - Errors and pins
+
+    /// The stored ring did not parse, so which of its subkeys the primary
+    /// bound cannot be decided. Encrypt paths refuse the key.
+    struct UnreadableKey: LocalizedError {
+        var errorDescription: String? { "This key could not be read." }
+    }
+
+    /// Subkeys the user accepted whose binding cannot be checked here (a DSA,
+    /// Ed448, brainpool or LibrePGP v5 primary), by the primary's
+    /// fingerprint. They qualify for `.encrypt` and `.sign` like verified
+    /// ones; nothing else with an uncheckable binding does. Empty by default;
+    /// an app sets this from its own record of what the user accepted, and
+    /// should never add to it from a merge or refresh.
+    static var pinnedSubkeys: (_ primaryFingerprint: [UInt8]) -> Set<[UInt8]> = { _ in [] }
+
+    /// Fingerprint of a primary or subkey packet body: v4 SHA-1, v6 SHA-256
+    /// (0x9B framing), LibrePGP v5 SHA-256 (0x9A framing).
+    static func fingerprint(ofKeyBody body: [UInt8]) -> [UInt8] {
+        switch body.first {
+        case 6: return OpenPGPPacketParser.computeV6Fingerprint(packetBody: body)
+        case 5: return Array(SHA256.hash(data: Data(frameKey(body, signatureVersion: 5))))
+        default: return OpenPGPPacketParser.computeV4Fingerprint(packetBody: body)
+        }
+    }
+
+    /// Armored input as binary; binary input as given.
+    private static func binary(_ data: Data) -> Data {
+        guard data.starts(with: Array("-----BEGIN".utf8)),
+              let text = String(data: data, encoding: .utf8),
+              let raw = try? OpenPGPPacketParser.dearmor(text) else { return data }
+        return raw
+    }
+
     // MARK: - Ring filtering
 
-    /// `data` (a transferable public key, binary) with every subkey that does
+    /// `data` (a transferable PUBLIC key, binary) with every subkey that does
     /// not qualify for `purpose` removed, with the signatures under it. The
-    /// primary, its User IDs and their signatures pass through untouched. A
-    /// ring that does not parse, or is a secret ring, comes back as given:
-    /// the callers fail on it on their own.
-    static func boundComponents(_ data: Data, purpose: Purpose = .any, at date: Date = Date()) -> Data {
-        guard let packets = try? OpenPGPPacketParser.parsePackets(data: Array(data)),
-              let primaryIndex = packets.firstIndex(where: { $0.tag == 6 }) else {
-            return data
+    /// primary, its User IDs and their signatures pass through untouched.
+    /// Throws `UnreadableKey` when the ring does not parse: an unfiltered ring
+    /// must never reach a recipient picker. A secret ring (no tag 6 primary)
+    /// comes back as given; encrypt paths only ever pass public data.
+    static func boundComponents(_ data: Data, purpose: Purpose = .any, at date: Date = Date()) throws -> Data {
+        let data = binary(data)
+        guard let packets = try? OpenPGPPacketParser.parsePackets(data: Array(data)) else {
+            throw UnreadableKey()
         }
+        guard let primaryIndex = packets.firstIndex(where: { $0.tag == 6 }) else { return data }
         let primaryBody = packets[primaryIndex].body
+        let pinned = pinnedSubkeys(fingerprint(ofKeyBody: primaryBody))
         var out: [UInt8] = []
         var index = 0
         var changed = false
@@ -76,7 +115,7 @@ enum CertificateValidator {
             while end < packets.count, packets[end].tag == 2 || packets[end].tag == 12 { end += 1 }
             let signatures = packets[(index + 1)..<end].filter { $0.tag == 2 }.map(\.body)
             if qualifies(subkeyBody: packet.body, signatures: signatures, primaryBody: primaryBody,
-                         purpose: purpose, at: date) {
+                         purpose: purpose, at: date, pinned: pinned) {
                 for p in packets[index..<end] {
                     out += OpenPGPPacketBuilder.buildNewFormatPacketBytes(tag: p.tag, body: p.body)
                 }
@@ -88,48 +127,106 @@ enum CertificateValidator {
         return changed ? Data(out) : data
     }
 
-    /// True when the subkey carries a verified binding from the primary that
-    /// qualifies for `purpose`.
+    /// Fingerprints of the subkeys in a public ring whose newest binding is
+    /// uncheckable on this device (no binding that verifies, and none that
+    /// fails). Empty for a ring that does not parse or has no such subkey.
+    static func uncheckableSubkeys(in data: Data) -> (primary: [UInt8], subkeys: [[UInt8]]) {
+        guard let packets = try? OpenPGPPacketParser.parsePackets(data: Array(binary(data))),
+              let primaryIndex = packets.firstIndex(where: { $0.tag == 6 }) else { return ([], []) }
+        let primaryBody = packets[primaryIndex].body
+        var found: [[UInt8]] = []
+        var index = 0
+        while index < packets.count {
+            guard packets[index].tag == 14 else { index += 1; continue }
+            var end = index + 1
+            while end < packets.count, packets[end].tag == 2 || packets[end].tag == 12 { end += 1 }
+            let signatures = packets[(index + 1)..<end].filter { $0.tag == 2 }.map(\.body)
+            if newestBinding(subkeyBody: packets[index].body, signatures: signatures,
+                             primaryBody: primaryBody)?.1 == .uncheckable {
+                found.append(fingerprint(ofKeyBody: packets[index].body))
+            }
+            index = end
+        }
+        return (fingerprint(ofKeyBody: primaryBody), found)
+    }
+
+    /// True when the subkey qualifies for `purpose`. `.any` (display) takes a
+    /// verified or an uncheckable binding. `.encrypt` and `.sign` take a
+    /// verified binding, or an uncheckable one only for a subkey in `pinned`;
+    /// `.sign` also needs a back-signature that verifies.
     static func qualifies(subkeyBody: [UInt8], signatures: [[UInt8]], primaryBody: [UInt8],
-                          purpose: Purpose, at date: Date = Date()) -> Bool {
-        guard let binding = newestVerifiedBinding(subkeyBody: subkeyBody, signatures: signatures,
-                                                  primaryBody: primaryBody) else { return false }
+                          purpose: Purpose, at date: Date = Date(), pinned: Set<[UInt8]> = []) -> Bool {
+        guard let found = newestBinding(subkeyBody: subkeyBody, signatures: signatures,
+                                       primaryBody: primaryBody) else { return false }
+        let (binding, verdict) = found
+        let trusted = verdict == .valid || pinned.contains(fingerprint(ofKeyBody: subkeyBody))
         let flags = binding.hashedSubpackets.first(where: { $0.type == 27 })?.data.first
         switch purpose {
         case .any:
             return true
         case .encrypt:
+            guard trusted else { return false }
             if let flags, flags & 0x0C == 0 { return false }
             return !isExpired(binding, subkeyBody: subkeyBody, at: date)
         case .sign:
-            guard let flags, flags & 0x02 != 0 else { return false }
+            guard trusted, let flags, flags & 0x02 != 0 else { return false }
             guard !isExpired(binding, subkeyBody: subkeyBody, at: date) else { return false }
             return backSignatureVerifies(in: binding, subkeyBody: subkeyBody, primaryBody: primaryBody)
         }
     }
 
-    /// The newest 0x18 over (primary, subkey) that the primary made and that
-    /// verifies (or cannot be checked here, per the header).
-    static func newestVerifiedBinding(subkeyBody: [UInt8], signatures: [[UInt8]],
-                                      primaryBody: [UInt8]) -> OpenPGPPacketParser.ParsedSignature? {
-        var best: OpenPGPPacketParser.ParsedSignature?
-        var bestTime: Date = .distantPast
+    /// Signer attribution: a trusted binding (as `qualifies`) and a verified
+    /// back-signature, without the expiry check (a signature is judged by
+    /// when it was made, elsewhere).
+    static func isBoundSigningSubkey(subkeyBody: [UInt8], signatures: [[UInt8]], primaryBody: [UInt8],
+                                     pinned: Set<[UInt8]>) -> Bool {
+        guard let found = newestBinding(subkeyBody: subkeyBody, signatures: signatures,
+                                       primaryBody: primaryBody) else { return false }
+        let (binding, verdict) = found
+        guard verdict == .valid || pinned.contains(fingerprint(ofKeyBody: subkeyBody)) else { return false }
+        return backSignatureVerifies(in: binding, subkeyBody: subkeyBody, primaryBody: primaryBody)
+    }
+
+    /// The newest 0x18 over (primary, subkey) made by the primary, with the
+    /// verdict it rests on: the newest one that verifies when any does,
+    /// otherwise the newest one this device cannot check. Bindings that fail
+    /// are ignored. Nil when there is neither.
+    static func newestBinding(subkeyBody: [UInt8], signatures: [[UInt8]],
+                              primaryBody: [UInt8]) -> (OpenPGPPacketParser.ParsedSignature, Verdict)? {
+        var bestValid: OpenPGPPacketParser.ParsedSignature?
+        var bestUncheckable: OpenPGPPacketParser.ParsedSignature?
         for body in signatures {
             guard let sig = try? OpenPGPPacketParser.parseSignaturePacket(body: body),
                   sig.signatureType == 0x18, issuedBy(primaryBody: primaryBody, sig) else { continue }
-            let verified = bindingDocuments(primaryBody: primaryBody, subkeyBody: subkeyBody,
-                                            signatureVersion: sig.version).contains {
-                verify(sig, signerBody: primaryBody, document: $0) != .invalid
+            let verdicts = bindingDocuments(primaryBody: primaryBody, subkeyBody: subkeyBody,
+                                            signatureVersion: sig.version).map {
+                verify(sig, signerBody: primaryBody, document: $0)
             }
-            guard verified else { continue }
             let t = sig.creationTime ?? .distantPast
-            if best == nil || t >= bestTime { best = sig; bestTime = t }
+            if verdicts.contains(.valid) {
+                if bestValid == nil || t >= (bestValid?.creationTime ?? .distantPast) { bestValid = sig }
+            } else if verdicts.contains(.uncheckable) {
+                if bestUncheckable == nil || t >= (bestUncheckable?.creationTime ?? .distantPast) { bestUncheckable = sig }
+            }
         }
-        return best
+        if let bestValid { return (bestValid, .valid) }
+        if let bestUncheckable { return (bestUncheckable, .uncheckable) }
+        return nil
+    }
+
+    /// The newest 0x18 that VERIFIES. What a merge or refresh may add a
+    /// subkey on: an uncheckable binding never adds one.
+    static func newestVerifiedBinding(subkeyBody: [UInt8], signatures: [[UInt8]],
+                                      primaryBody: [UInt8]) -> OpenPGPPacketParser.ParsedSignature? {
+        guard let found = newestBinding(subkeyBody: subkeyBody, signatures: signatures,
+                                       primaryBody: primaryBody), found.1 == .valid else { return nil }
+        return found.0
     }
 
     /// A signing subkey's 0x19, carried in the binding's embedded-signature
     /// subpacket (hashed or unhashed), made by the subkey over (primary, subkey).
+    /// Only a back-signature that verifies counts: the subkey made it, so an
+    /// uncheckable one proves nothing.
     static func backSignatureVerifies(in binding: OpenPGPPacketParser.ParsedSignature,
                                       subkeyBody: [UInt8], primaryBody: [UInt8]) -> Bool {
         let embedded = (binding.hashedSubpackets + binding.unhashedSubpackets).filter { $0.type == 32 }
@@ -138,7 +235,7 @@ enum CertificateValidator {
                   back.signatureType == 0x19 else { continue }
             let verified = bindingDocuments(primaryBody: primaryBody, subkeyBody: subkeyBody,
                                             signatureVersion: back.version).contains {
-                verify(back, signerBody: subkeyBody, document: $0) != .invalid
+                verify(back, signerBody: subkeyBody, document: $0) == .valid
             }
             if verified { return true }
         }

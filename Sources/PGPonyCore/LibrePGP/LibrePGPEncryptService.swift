@@ -91,7 +91,7 @@ enum LibrePGPEncryptService {
     /// multi-recipient message can address a LibrePGP key next to others.
     static func findRecipient(publicKeyData: [UInt8]) throws -> Recipient {
         // 8.3.0 (hardening): only subkeys the primary bound for encryption.
-        let publicKeyData = Array(CertificateValidator.boundComponents(Data(publicKeyData), purpose: .encrypt))
+        let publicKeyData = Array(try CertificateValidator.boundComponents(Data(publicKeyData), purpose: .encrypt))
         let packets = try OpenPGPPacketParser.parsePackets(data: publicKeyData)
         // Scan key + subkey packets (public tag 14/6 and, defensively, secret
         // tag 7) for the v5 Kyber (algorithm 8) subkey. Capture the first parse

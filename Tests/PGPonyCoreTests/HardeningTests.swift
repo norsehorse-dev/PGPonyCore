@@ -37,7 +37,7 @@ final class HardeningTests: XCTestCase {
 
     func testASubkeyBoundByAnotherPrimaryIsNotPartOfTheCertificate() throws {
         let (own, combined, foreign) = try ringWithForeignSubkey()
-        let kept = CertificateValidator.boundComponents(combined, purpose: .encrypt)
+        let kept = try CertificateValidator.boundComponents(combined, purpose: .encrypt)
         let subkeys = try packets(kept).filter { $0.tag == 14 }.map(\.body)
         XCTAssertEqual(subkeys.count, 1)
         XCTAssertFalse(subkeys.contains(foreign))
@@ -46,10 +46,10 @@ final class HardeningTests: XCTestCase {
 
     func testGeneratedKeysKeepEveryComponent() throws {
         let v4 = try Ed25519KeyGenerator.generate(name: "Keep", email: "keep@example.org", passphrase: nil, expirationInterval: nil)
-        XCTAssertEqual(CertificateValidator.boundComponents(v4.publicKeyData), v4.publicKeyData)
-        XCTAssertEqual(CertificateValidator.boundComponents(v4.publicKeyData, purpose: .encrypt), v4.publicKeyData)
+        XCTAssertEqual(try CertificateValidator.boundComponents(v4.publicKeyData), v4.publicKeyData)
+        XCTAssertEqual(try CertificateValidator.boundComponents(v4.publicKeyData, purpose: .encrypt), v4.publicKeyData)
         let v6 = try V6KeyGenerator.generate(name: "Keep Six", email: "keep6@example.org", passphrase: nil, expirationInterval: nil)
-        XCTAssertEqual(CertificateValidator.boundComponents(v6.publicKeyData), v6.publicKeyData)
+        XCTAssertEqual(try CertificateValidator.boundComponents(v6.publicKeyData), v6.publicKeyData)
     }
 
     func testABindingWithAnUnsupportedHashIsInvalidNotUncheckable() throws {
