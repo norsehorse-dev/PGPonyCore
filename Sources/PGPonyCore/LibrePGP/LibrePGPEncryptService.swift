@@ -89,9 +89,15 @@ enum LibrePGPEncryptService {
     /// The first v5 Kyber (algorithm 8) encryption subkey in a transferable
     /// public key, parsed as a recipient. 8.3.0 (4.4): factored out so a
     /// multi-recipient message can address a LibrePGP key next to others.
-    static func findRecipient(publicKeyData: [UInt8]) throws -> Recipient {
+    /// `alreadyBound` is true only for a single subkey cut from a ring that
+    /// `CertificateValidator.boundComponents` has already filtered for
+    /// `.encrypt` (`encryptionTargets`): such a piece has no primary packet
+    /// to check the binding against again.
+    static func findRecipient(publicKeyData: [UInt8], alreadyBound: Bool = false) throws -> Recipient {
         // 8.3.0 (hardening): only subkeys the primary bound for encryption.
-        let publicKeyData = Array(try CertificateValidator.boundComponents(Data(publicKeyData), purpose: .encrypt))
+        let publicKeyData = alreadyBound
+            ? publicKeyData
+            : Array(try CertificateValidator.boundComponents(Data(publicKeyData), purpose: .encrypt))
         let packets = try OpenPGPPacketParser.parsePackets(data: publicKeyData)
         // Scan key + subkey packets (public tag 14/6 and, defensively, secret
         // tag 7) for the v5 Kyber (algorithm 8) subkey. Capture the first parse

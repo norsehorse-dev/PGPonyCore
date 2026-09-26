@@ -89,15 +89,15 @@ enum CertificateValidator {
     /// `data` (a transferable PUBLIC key, binary) with every subkey that does
     /// not qualify for `purpose` removed, with the signatures under it. The
     /// primary, its User IDs and their signatures pass through untouched.
-    /// Throws `UnreadableKey` when the ring does not parse: an unfiltered ring
-    /// must never reach a recipient picker. A secret ring (no tag 6 primary)
-    /// comes back as given; encrypt paths only ever pass public data.
+    /// Throws `UnreadableKey` when the ring does not parse, or has no public
+    /// primary key packet to check bindings against (a secret ring, or a bare
+    /// subkey): an unfiltered ring must never reach a recipient picker.
     static func boundComponents(_ data: Data, purpose: Purpose = .any, at date: Date = Date()) throws -> Data {
         let data = binary(data)
         guard let packets = try? OpenPGPPacketParser.parsePackets(data: Array(data)) else {
             throw UnreadableKey()
         }
-        guard let primaryIndex = packets.firstIndex(where: { $0.tag == 6 }) else { return data }
+        guard let primaryIndex = packets.firstIndex(where: { $0.tag == 6 }) else { throw UnreadableKey() }
         let primaryBody = packets[primaryIndex].body
         let pinned = pinnedSubkeys(fingerprint(ofKeyBody: primaryBody))
         var out: [UInt8] = []

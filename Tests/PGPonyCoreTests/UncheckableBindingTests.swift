@@ -5,11 +5,11 @@
 //
 // Bindings made by a primary this code cannot verify (DSA, brainpool) count
 // for encryption only for subkeys the caller lists in `pinnedSubkeys`, and
-// `newestVerifiedBinding` never returns one. A ring that does not parse is
-// refused. Fixtures made with gpg 2.4.4: a DSA primary with an ElGamal
-// subkey, the same key with a second ElGamal subkey whose binding has one
-// byte of its signature changed, and a brainpoolP256r1 primary with an ECDH
-// subkey.
+// `newestVerifiedBinding` never returns one. A ring that does not parse, or
+// has no public primary key packet, is refused. Fixtures made with gpg
+// 2.4.4: a DSA primary with an ElGamal subkey, the same key with a second
+// ElGamal subkey whose binding has one byte of its signature changed, and a
+// brainpoolP256r1 primary with an ECDH subkey.
 
 import XCTest
 @testable import PGPonyCore
@@ -68,5 +68,18 @@ final class UncheckableBindingTests: XCTestCase {
         XCTAssertThrowsError(try CertificateValidator.boundComponents(broken, purpose: .encrypt)) {
             XCTAssertTrue($0 is CertificateValidator.UnreadableKey)
         }
+    }
+
+    func testARingWithNoPublicPrimaryThrows() throws {
+        // The subkey and its binding alone: nothing to check the binding
+        // against, so the ring is unreadable rather than passed through.
+        let packets = try OpenPGPPacketParser.parsePackets(data: Array(brainpoolRing))
+        let start = try XCTUnwrap(packets.firstIndex { $0.tag == 14 })
+        var bare: [UInt8] = []
+        for p in packets[start...] { bare += OpenPGPPacketBuilder.buildNewFormatPacketBytes(tag: p.tag, body: p.body) }
+        XCTAssertThrowsError(try CertificateValidator.boundComponents(Data(bare), purpose: .any)) {
+            XCTAssertTrue($0 is CertificateValidator.UnreadableKey)
+        }
+        XCTAssertThrowsError(try LibrePGPEncryptService.findRecipient(publicKeyData: bare))
     }
 }
