@@ -13,8 +13,9 @@
 // v6-only (Sections 5.3.1, 5.3.2):
 //
 //   algo 30  ML-DSA-65 + Ed25519   (generate, sign, verify, certify here)
-//   algo 31  ML-DSA-87 + Ed448     (import and label; verify needs Ed448,
-//                                   which nothing on iOS provides yet)
+//   algo 31  ML-DSA-87 + Ed448     (generate, sign, verify, certify here
+//                                   since 8.4.0 build 8; the Ed448 half is
+//                                   Ed448.swift)
 //
 // Byte layout, all fixed length, the EdDSA component FIRST (Tables 6 and 7):
 //
@@ -144,9 +145,9 @@ enum MLDSAService {
             case .unavailable:
                 return String(localized: "ML-DSA signatures need iOS 26 or later on this device.")
             case let .badInputSize(field, expected, got):
-                return "ML-DSA \(field) has the wrong size: expected \(expected) bytes, got \(got)."
+                return String(localized: "ML-DSA \(field) has the wrong size: expected \(String(describing: expected)) bytes, got \(String(describing: got)).")
             case let .operationFailed(op):
-                return "ML-DSA \(op) failed."
+                return String(localized: "ML-DSA \(String(describing: op)) failed.")
             }
         }
     }
@@ -175,7 +176,7 @@ enum MLDSAService {
         } catch let e as Failure {
             throw e
         } catch {
-            throw Failure.operationFailed("key expansion")
+            throw Failure.operationFailed(String(localized: "key expansion"))
         }
     }
 
@@ -213,7 +214,7 @@ enum MLDSAService {
     /// Pure ML-DSA verification over `message` with an empty context.
     static func verify(signature: [UInt8], message: [UInt8], publicKey: [UInt8], suite: CompositeSignSuite) throws -> Bool {
         guard publicKey.count == suite.mldsaPublicLength else {
-            throw Failure.badInputSize(field: "public key", expected: suite.mldsaPublicLength, got: publicKey.count)
+            throw Failure.badInputSize(field: String(localized: "public key"), expected: suite.mldsaPublicLength, got: publicKey.count)
         }
         guard signature.count == suite.mldsaSignatureLength else { return false }
         guard #available(iOS 26.0, macOS 26.0, *) else { throw Failure.unavailable }
@@ -227,7 +228,7 @@ enum MLDSAService {
                 return key.isValidSignature(Data(signature), for: Data(message))
             }
         } catch {
-            throw Failure.operationFailed("public key decoding")
+            throw Failure.operationFailed(String(localized: "public key decoding"))
         }
     }
 }
@@ -243,10 +244,18 @@ struct CompositeSigningInfo {
     let mldsaSeed: [UInt8]
     /// EdDSA public || ML-DSA public, the key packet's material.
     let compositePublic: [UInt8]
+    /// 8.4.0 build 8 (plan 2): the 57-octet Ed448 seed of an ML-DSA-87 +
+    /// Ed448 key. Ed25519SigningInfo.privateKey is a Curve25519 key and cannot
+    /// hold it, so for this suite the EdDSA half rides here and the
+    /// info's Curve25519 key is a throwaway that nothing composite reads
+    /// (every composite path signs through V6SignatureKey(info)).
+    var ed448Seed: [UInt8]? = nil
 
-    /// EdDSA secret || ML-DSA seed, the secret packet's material.
+    /// EdDSA secret || ML-DSA seed, the secret packet's material. For the
+    /// Ed448 suite the stored Ed448 seed is the EdDSA secret and the argument
+    /// is ignored.
     func compositeSecret(eddsaSecret: [UInt8]) -> [UInt8] {
-        eddsaSecret + mldsaSeed
+        (ed448Seed ?? eddsaSecret) + mldsaSeed
     }
 }
 
@@ -272,9 +281,15 @@ enum CompositeSigner {
     /// `compositeSecret` is EdDSA secret || ML-DSA seed.
     static func sign(suite: CompositeSignSuite, compositeSecret: [UInt8], digest: [UInt8]) throws -> [UInt8] {
         guard let parts = suite.splitSecret(compositeSecret) else { throw Failure.badSecret }
-        guard suite == .mldsa65Ed25519 else { throw Failure.unsupportedSuite(suite) }
-        let ed = try Curve25519.Signing.PrivateKey(rawRepresentation: Data(parts.eddsa))
-        let edSig = Array(try ed.signature(for: Data(digest)))
+        let edSig: [UInt8]
+        switch suite {
+        case .mldsa65Ed25519:
+            let ed = try Curve25519.Signing.PrivateKey(rawRepresentation: Data(parts.eddsa))
+            edSig = Array(try ed.signature(for: Data(digest)))
+        case .mldsa87Ed448:
+            // 8.4.0 build 8 (plan 2): pure Ed448, empty context, over the digest.
+            edSig = try Ed448.sign(message: digest, seed: parts.eddsa)
+        }
         guard edSig.count == suite.eddsaSignatureLength else { throw Failure.badSecret }
         let mlSig = try MLDSAService.sign(message: digest, seed: parts.mldsaSeed, suite: suite)
         return edSig + mlSig
@@ -283,9 +298,14 @@ enum CompositeSigner {
     /// The public material for a composite secret: EdDSA public || ML-DSA public.
     static func publicMaterial(suite: CompositeSignSuite, compositeSecret: [UInt8]) throws -> [UInt8] {
         guard let parts = suite.splitSecret(compositeSecret) else { throw Failure.badSecret }
-        guard suite == .mldsa65Ed25519 else { throw Failure.unsupportedSuite(suite) }
-        let ed = try Curve25519.Signing.PrivateKey(rawRepresentation: Data(parts.eddsa))
-        let edPub = Array(ed.publicKey.rawRepresentation)
+        let edPub: [UInt8]
+        switch suite {
+        case .mldsa65Ed25519:
+            let ed = try Curve25519.Signing.PrivateKey(rawRepresentation: Data(parts.eddsa))
+            edPub = Array(ed.publicKey.rawRepresentation)
+        case .mldsa87Ed448:
+            edPub = try Ed448.publicKey(seed: parts.eddsa)
+        }
         let mlPub = try MLDSAService.publicKey(fromSeed: parts.mldsaSeed, suite: suite)
         return edPub + mlPub
     }
@@ -324,27 +344,32 @@ enum CompositeSigVerifier {
     ///   certificate binding check only: on a system without ML-DSA, answer
     ///   from the Ed25519 half alone instead of "unsupported", so an
     ///   ML-DSA-65 + Ed25519 key's subkey bindings can still be checked on
-    ///   iOS 18. Never used for message signatures, where the
+    ///   iOS 18. 8.4.0: the same holds for ML-DSA-87 + Ed448, answered from
+    ///   its Ed448 half. Never used for message signatures, where the
     ///   user is told the signature could not be checked.
     static func verify(suite: CompositeSignSuite, compositePublic: [UInt8], signature: [UInt8], digest: [UInt8],
                        classicalHalfWhenUnavailable: Bool = false) -> Outcome {
         guard let pub = suite.splitPublic(compositePublic) else { return .invalid }
         guard let sig = suite.splitSignature(signature) else { return .invalid }
-        guard suite == .mldsa65Ed25519 else {
-            return .unsupported(String(localized: "Signatures made with \(suite.displayName) cannot be verified on this device yet."))
+        let edOK: Bool
+        switch suite {
+        case .mldsa65Ed25519:
+            guard let edKey = try? Curve25519.Signing.PublicKey(rawRepresentation: Data(pub.eddsa)) else { return .invalid }
+            edOK = edKey.isValidSignature(Data(sig.eddsa), for: Data(digest))
+        case .mldsa87Ed448:
+            // 8.4.0 build 8 (plan 2): strict pure Ed448 (Ed448.swift).
+            edOK = Ed448.verify(signature: sig.eddsa, message: digest, publicKey: pub.eddsa)
         }
-        guard let edKey = try? Curve25519.Signing.PublicKey(rawRepresentation: Data(pub.eddsa)) else { return .invalid }
-        let edOK = edKey.isValidSignature(Data(sig.eddsa), for: Data(digest))
         guard MLDSAService.isAvailable else {
             if classicalHalfWhenUnavailable { return edOK ? .valid : .invalid }
-            return .unsupported(MLDSAService.Failure.unavailable.errorDescription ?? "ML-DSA unavailable")
+            return .unsupported(MLDSAService.Failure.unavailable.errorDescription ?? String(localized: "ML-DSA unavailable"))
         }
         let mlOK: Bool
         do {
             mlOK = try MLDSAService.verify(signature: sig.mldsa, message: digest, publicKey: pub.mldsa, suite: suite)
         } catch let e as MLDSAService.Failure {
             if case .unavailable = e {
-                return .unsupported(e.errorDescription ?? "ML-DSA unavailable")
+                return .unsupported(e.errorDescription ?? String(localized: "ML-DSA unavailable"))
             }
             return .invalid
         } catch {
@@ -364,11 +389,17 @@ enum CompositeSigVerifier {
 enum V6SignatureKey {
     case ed25519(Curve25519.Signing.PrivateKey)
     case composite(CompositeSignSuite, compositeSecret: [UInt8])
+    /// 8.4.0 build 9 (plan 5l): an RFC 9580 Ed448 key (algorithm 28): SHA-512
+    /// with a 32-octet salt, the 114-octet native signature value.
+    case ed448(Ed448SigningKey)
 
-    /// From an unlocked signing key: composite when the info carries the
-    /// ML-DSA half, plain Ed25519 otherwise.
+    /// From an unlocked signing key: Ed448 when the info carries one (8.4.0
+    /// build 9), composite when it carries the ML-DSA half, plain Ed25519
+    /// otherwise.
     init(_ info: Ed25519SigningInfo) {
-        if let c = info.composite {
+        if let e = info.ed448 {
+            self = .ed448(e)
+        } else if let c = info.composite {
             self = .composite(c.suite, compositeSecret: c.compositeSecret(eddsaSecret: Array(info.privateKey.rawRepresentation)))
         } else {
             self = .ed25519(info.privateKey)
@@ -379,6 +410,7 @@ enum V6SignatureKey {
         switch self {
         case .ed25519: return 27
         case .composite(let suite, _): return suite.rawValue
+        case .ed448: return 28
         }
     }
 
@@ -393,6 +425,7 @@ enum V6SignatureKey {
         switch self {
         case .ed25519: return 10
         case .composite: return CompositeSignSuite.hashAlgorithm
+        case .ed448: return OpenPGP448.signatureHashAlgorithm
         }
     }
 
@@ -400,6 +433,7 @@ enum V6SignatureKey {
         switch self {
         case .ed25519: return 32
         case .composite: return CompositeSignSuite.saltLength
+        case .ed448: return OpenPGP448.v6SaltLength
         }
     }
 
@@ -407,6 +441,7 @@ enum V6SignatureKey {
         switch self {
         case .ed25519: return 64
         case .composite(let suite, _): return suite.compositeSignatureLength
+        case .ed448: return 114
         }
     }
 
@@ -416,6 +451,8 @@ enum V6SignatureKey {
             return Array(try key.signature(for: Data(digest)))
         case .composite(let suite, let secret):
             return try CompositeSigner.sign(suite: suite, compositeSecret: secret, digest: digest)
+        case .ed448(let key):
+            return try Ed448.sign(message: digest, seed: key.seed)
         }
     }
 

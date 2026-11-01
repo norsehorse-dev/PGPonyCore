@@ -18,10 +18,10 @@ enum AESKeyWrapError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .invalidKeySize: return "AES key wrap: invalid KEK size (must be 16, 24, or 32 bytes)"
-        case .invalidDataSize: return "AES key wrap: data must be a multiple of 8 bytes and at least 16"
-        case .integrityCheckFailed: return "AES key unwrap: integrity check failed (wrong key or corrupted data)"
-        case .encryptionFailed: return "AES key wrap: AES-ECB encryption failed"
+        case .invalidKeySize: return String(localized: "AES key wrap: invalid KEK size (must be 16, 24, or 32 bytes)")
+        case .invalidDataSize: return String(localized: "AES key wrap: data must be a multiple of 8 bytes and at least 16")
+        case .integrityCheckFailed: return String(localized: "AES key unwrap: integrity check failed (wrong key or corrupted data)")
+        case .encryptionFailed: return String(localized: "AES key wrap: AES-ECB encryption failed")
         }
     }
 }

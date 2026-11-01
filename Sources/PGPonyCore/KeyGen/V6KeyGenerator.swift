@@ -27,6 +27,7 @@
 import Foundation
 import CryptoKit
 import CommonCrypto
+import Security
 
 // MARK: - Result
 
@@ -46,7 +47,7 @@ enum V6KeyGeneratorError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .passphraseNotSupportedYet:
-            return "Passphrase protection for v6 keys requires AEAD-OCB and is not yet supported in this release."
+            return String(localized: "Passphrase protection for v6 keys requires AEAD-OCB and is not yet supported in this release.")
         }
     }
 }
@@ -353,6 +354,12 @@ class V6KeyGenerator {
     /// Android writes them. The secret packets hold EdDSA secret || ML-DSA seed
     /// (primary) and X25519 secret || ML-KEM seed (subkey), locked exactly as
     /// `generate` locks its material (Argon2id + AES-256-OCB, S2K usage 253).
+    ///
+    /// 8.4.0 build 8 (Android 4.6.0 item 3): `suite: .mldsa87Ed448` makes the
+    /// stronger tier, an ML-DSA-87 + Ed448 primary (algorithm 31) with an
+    /// ML-KEM-1024 + X448 encryption subkey (algorithm 36). The encryption
+    /// subkey follows the signing tier, as Android's CompositePrimaryKeyGen
+    /// pairs them; everything else is the same layout.
     static func generateComposite(
         name: String,
         email: String,
@@ -360,18 +367,28 @@ class V6KeyGenerator {
         expirationInterval: TimeInterval?,
         suite: CompositeSignSuite = .mldsa65Ed25519
     ) throws -> V6KeyGeneratorResult {
-        guard suite == .mldsa65Ed25519 else { throw CompositeSigner.Failure.unsupportedSuite(suite) }
         let genStart = Date()
         let lock: V6SecretLock? = try lockPassphrase(from: passphrase).map { try makeV6Lock(passphrase: $0) }
         let creationTime = UInt32(Date().timeIntervalSince1970)
 
-        // Primary: an Ed25519 keypair and a 32-octet ML-DSA seed (FIPS 204),
-        // the seed expanded to its public key by CryptoKit.
-        let edKey = Curve25519.Signing.PrivateKey()
+        // Primary: an EdDSA keypair (Ed25519, or a 57-octet Ed448 seed) and a
+        // 32-octet ML-DSA seed (FIPS 204), the seed expanded to its public key
+        // by CryptoKit.
+        let eddsaPublic: [UInt8]
+        let eddsaSecret: [UInt8]
+        switch suite {
+        case .mldsa65Ed25519:
+            let edKey = Curve25519.Signing.PrivateKey()
+            eddsaPublic = Array(edKey.publicKey.rawRepresentation)
+            eddsaSecret = Array(edKey.rawRepresentation)
+        case .mldsa87Ed448:
+            eddsaSecret = try Ed448.generateSeed()
+            eddsaPublic = try Ed448.publicKey(seed: eddsaSecret)
+        }
         let mldsaSeed = try MLDSAService.randomSeed()
         let mldsaPub = try MLDSAService.publicKey(fromSeed: mldsaSeed, suite: suite)
-        let primaryPublic = Array(edKey.publicKey.rawRepresentation) + mldsaPub
-        let primarySecret = Array(edKey.rawRepresentation) + mldsaSeed
+        let primaryPublic = eddsaPublic + mldsaPub
+        let primarySecret = eddsaSecret + mldsaSeed
         let signer = V6SignatureKey.composite(suite, compositeSecret: primarySecret)
 
         let primaryPubBody = buildV6PublicKeyBody(
@@ -391,15 +408,28 @@ class V6KeyGenerator {
             userIDBytes: userIDBytes, creationTime: creationTime)
 
         // Encryption subkey: ML-KEM-768 + X25519 (algorithm 35), built exactly
-        // as `generate(pqcEncryption: true)` builds it.
-        let xKey = Curve25519.KeyAgreement.PrivateKey()
+        // as `generate(pqcEncryption: true)` builds it; for the 87 tier
+        // ML-KEM-1024 + X448 (algorithm 36), built as `addV6Subkey` builds it.
+        let kemSuite: CompositeSuite = suite == .mldsa87Ed448 ? .ietf1024 : .ietf768
+        let eccPublic: [UInt8]
+        let eccSecret: [UInt8]
+        switch kemSuite {
+        case .ietf768:
+            let xKey = Curve25519.KeyAgreement.PrivateKey()
+            eccPublic = Array(xKey.publicKey.rawRepresentation)
+            eccSecret = Array(xKey.rawRepresentation)
+        case .ietf1024:
+            let x448Private = try X448.generatePrivateKey()
+            eccPublic = Array(try X448.publicKey(for: x448Private))
+            eccSecret = Array(x448Private)
+        }
         let mlkemSeed = try secureRandomBytes(64)                            // d‖z
         let (mlkemPub, _) = try MLKEMService.generateKeyPair(seed: Data(mlkemSeed),
-                                                             level: CompositeSuite.ietf768.mlkemLevel)
+                                                             level: kemSuite.mlkemLevel)
         let encPubBody = buildV6PublicKeyBody(
-            creationTime: creationTime, algorithm: algoMLKEM768X25519,
-            keyMaterial: Array(xKey.publicKey.rawRepresentation) + Array(mlkemPub))
-        let encSecret = Array(xKey.rawRepresentation) + mlkemSeed          // 96 octets
+            creationTime: creationTime, algorithm: kemSuite.algId,
+            keyMaterial: eccPublic + Array(mlkemPub))
+        let encSecret = eccSecret + mlkemSeed          // 96 octets (768) or 120 (1024)
         let encBindingSig = try buildV6SubkeyBindingSignature(
             signer: signer, primaryKeyBody: primaryPubBody, primaryFingerprint: fingerprint,
             subkeyBody: encPubBody, creationTime: creationTime,
@@ -447,10 +477,10 @@ class V6KeyGenerator {
 
         var errorDescription: String? {
             switch self {
-            case .noPrimary: return "No primary key packet in the v6 key."
-            case .expiryBeforeCreation: return "The chosen expiration is before the key was created."
-            case .signingSubkeyUnavailable: return "The signing subkey's secret is needed to re-date its binding."
-            case .signingSubkeyMismatch: return "The signing subkey secret does not match the key's signing subkey."
+            case .noPrimary: return String(localized: "No primary key packet in the v6 key.")
+            case .expiryBeforeCreation: return String(localized: "The chosen expiration is before the key was created.")
+            case .signingSubkeyUnavailable: return String(localized: "The signing subkey's secret is needed to re-date its binding.")
+            case .signingSubkeyMismatch: return String(localized: "The signing subkey secret does not match the key's signing subkey.")
             }
         }
     }
@@ -527,9 +557,11 @@ class V6KeyGenerator {
         primaryFingerprint: [UInt8],
         signingSubkey: Curve25519.Signing.PrivateKey?,
         signingSubkeyFingerprint: [UInt8]?,
-        expiresAt: Date?
+        expiresAt: Date?,
+        includeCurrentSubkeys: Bool = true
     ) throws -> (publicKeyData: Data, secretKeyData: Data) {
-        let sigCreation = UInt32(Date().timeIntervalSince1970)
+        let now = Date()
+        let sigCreation = UInt32(now.timeIntervalSince1970)
         let pubPackets = try OpenPGPPacketParser.parsePackets(data: Array(publicKeyData))
 
         guard let primaryPkt = pubPackets.first(where: { $0.tag == 6 }) else { throw V6EditError.noPrimary }
@@ -543,45 +575,84 @@ class V6KeyGenerator {
             return exp - Double(creation)
         }
 
-        // Fresh primary direct-key self-signature (0x1F) carrying the new expiry.
-        let newDirectKeySig = try buildV6DirectKeySignature(
-            signer: primarySigner,
-            primaryKeyBody: primaryBody,
-            primaryFingerprint: primaryFingerprint,
-            creationTime: sigCreation,
-            expirationInterval: try relInterval(creation: primaryCreation)
-        )
+        // 8.4.0 (plan 5d, Android 4.7.0 item 53): the superseding signatures
+        // carry every hashed subpacket of the ones they replace (key flags,
+        // features, symmetric, hash, AEAD and key server preferences), not
+        // the generator's defaults, so an imported key keeps what its owner
+        // set. Only the creation time, the expiry, the back-signature and
+        // the issuer are new.
+        func newestSelfSignature(_ type: UInt8, in range: Range<Int>) -> OpenPGPPacketParser.ParsedSignature? {
+            var newest: OpenPGPPacketParser.ParsedSignature?
+            for k in range where pubPackets[k].tag == 2 {
+                guard let sig = try? OpenPGPPacketParser.parseSignaturePacket(body: pubPackets[k].body),
+                      sig.signatureType == type,
+                      sig.issuerFingerprint.map({ Array($0.prefix(32)) == primaryFingerprint }) ?? true else { continue }
+                if newest == nil || (sig.creationTime ?? .distantPast) >= (newest?.creationTime ?? .distantPast) {
+                    newest = sig
+                }
+            }
+            return newest
+        }
+        let primaryIndex = pubPackets.firstIndex(where: { $0.tag == 6 }) ?? 0
+        let primaryEnd = pubPackets[(primaryIndex + 1)...].firstIndex(where: { $0.tag == 13 || $0.tag == 14 || $0.tag == 17 })
+            ?? pubPackets.count
 
-        // A fresh 0x18 binding per subkey, in ring order, carrying the new expiry.
-        // A sign-capable subkey (key flag 0x02) also gets a fresh embedded 0x19
-        // back-signature; its key flags are read from the existing binding so an
-        // imported layout keeps its capabilities.
-        // 8.3.0 (4.6): a subkey the primary has revoked keeps its old binding
-        // (a fresh, newer one would let a verifier that ranks self-signatures
-        // by date treat the soft revocation as superseded), and it needs no
-        // back-signature either.
+        // Fresh primary direct-key self-signature (0x1F) carrying the new expiry.
+        let newDirectKeySig: [UInt8]
+        if let oldDirect = newestSelfSignature(0x1F, in: (primaryIndex + 1)..<primaryEnd) {
+            newDirectKeySig = try assembleV6Signature(
+                signer: primarySigner,
+                sigType: 0x1F,
+                documentHashChunks: directKeyDocumentChunks(primaryKeyBody: primaryBody),
+                hashedSubpackets: carriedSubpackets(
+                    from: oldDirect.hashedSubpackets, creationTime: sigCreation,
+                    expirationInterval: try relInterval(creation: primaryCreation),
+                    embeddedBackSignature: nil, issuerFingerprint: primaryFingerprint),
+                unhashedSubpackets: [])
+        } else {
+            newDirectKeySig = try buildV6DirectKeySignature(
+                signer: primarySigner,
+                primaryKeyBody: primaryBody,
+                primaryFingerprint: primaryFingerprint,
+                creationTime: sigCreation,
+                expirationInterval: try relInterval(creation: primaryCreation)
+            )
+        }
+
+        // 8.4.0 (plan 5d, Android 4.7.0 item 53): a subkey's binding is signed
+        // again only when the caller asks for it (`includeCurrentSubkeys`) and
+        // the subkey is still valid now. An expired subkey keeps its old
+        // binding: before 8.4.0 every subkey got the primary's new date, which
+        // brought expired subkeys back. A revoked subkey keeps its old binding
+        // too (a fresh, newer one would let a verifier that ranks
+        // self-signatures by date treat the soft revocation as superseded),
+        // and so does a signing subkey whose secret was not passed in, since
+        // its binding needs a back-signature only that subkey can make.
         let revokedSubkeys = revokedSubkeyPositions(packets: pubPackets)
         var newBindings: [[UInt8]?] = []         // indexed by subkey order; nil keeps the old binding
         for (idx, pkt) in pubPackets.enumerated() where pkt.tag == 14 {
-            if revokedSubkeys.contains(idx) {
+            let blockEnd = pubPackets[(idx + 1)...].firstIndex(where: { $0.tag != 2 && $0.tag != 12 }) ?? pubPackets.count
+            let oldBinding = newestSelfSignature(0x18, in: (idx + 1)..<blockEnd)
+            let subBody = pkt.body
+            let subCreation = try OpenPGPPacketParser.parsePublicKeyFields(body: subBody).creationTime
+            var expired = false
+            if let d = oldBinding?.hashedSubpackets.first(where: { $0.type == 9 })?.data, d.count == 4 {
+                let seconds = UInt32(d[0]) << 24 | UInt32(d[1]) << 16 | UInt32(d[2]) << 8 | UInt32(d[3])
+                expired = seconds > 0 && Date(timeIntervalSince1970: TimeInterval(subCreation) + TimeInterval(seconds)) <= now
+            }
+            guard includeCurrentSubkeys, !revokedSubkeys.contains(idx), !expired, let oldBinding else {
                 newBindings.append(nil)
                 continue
             }
-            let subBody = pkt.body
-            let subCreation = try OpenPGPPacketParser.parsePublicKeyFields(body: subBody).creationTime
-            var keyFlags: UInt8 = 0x0C
-            if idx + 1 < pubPackets.count, pubPackets[idx + 1].tag == 2 {
-                let sig = try OpenPGPPacketParser.parseSignaturePacket(body: pubPackets[idx + 1].body)
-                if let kf = sig.hashedSubpackets.first(where: { $0.type == 27 })?.data.first { keyFlags = kf }
-            }
+            let keyFlags = oldBinding.hashedSubpackets.first(where: { $0.type == 27 })?.data.first ?? 0x0C
 
             var backSig: [UInt8]? = nil
             if (keyFlags & 0x02) != 0 {
-                guard let signingSubkey, let signingSubkeyFingerprint else {
-                    throw V6EditError.signingSubkeyUnavailable
-                }
                 let subFP = computeV6Fingerprint(packetBody: subBody)
-                guard subFP == signingSubkeyFingerprint else { throw V6EditError.signingSubkeyMismatch }
+                guard let signingSubkey, subFP == signingSubkeyFingerprint else {
+                    newBindings.append(nil)
+                    continue
+                }
                 backSig = try buildV6PrimaryKeyBindingSignature(
                     subkeySigner: .ed25519(signingSubkey),
                     primaryKeyBody: primaryBody,
@@ -591,16 +662,15 @@ class V6KeyGenerator {
                 )
             }
 
-            let binding = try buildV6SubkeyBindingSignature(
+            let binding = try assembleV6Signature(
                 signer: primarySigner,
-                primaryKeyBody: primaryBody,
-                primaryFingerprint: primaryFingerprint,
-                subkeyBody: subBody,
-                creationTime: sigCreation,
-                expirationInterval: try relInterval(creation: subCreation),
-                keyFlags: keyFlags,
-                embeddedBackSignature: backSig
-            )
+                sigType: 0x18,
+                documentHashChunks: subkeyBindingDocumentChunks(primaryKeyBody: primaryBody, subkeyBody: subBody),
+                hashedSubpackets: carriedSubpackets(
+                    from: oldBinding.hashedSubpackets, creationTime: sigCreation,
+                    expirationInterval: try relInterval(creation: subCreation),
+                    embeddedBackSignature: backSig, issuerFingerprint: primaryFingerprint),
+                unhashedSubpackets: [])
             newBindings.append(binding)
         }
 
@@ -612,6 +682,8 @@ class V6KeyGenerator {
             var ctx: Ctx = .none
             var order = -1
             var out = Data()
+            var wroteDirect = false
+            var wroteBinding = false
             for pkt in packets {
                 switch pkt.tag {
                 case 6, 5:
@@ -623,14 +695,19 @@ class V6KeyGenerator {
                 case 14, 7:
                     ctx = .subkey
                     order += 1
+                    wroteBinding = false
                     out.append(buildPacket(tag: pkt.tag, body: Data(pkt.body)))
                 case 2:
+                    // A replaced self-signature is written once, in place of
+                    // the first old copy; any older copies of it go.
                     let sig = (try? OpenPGPPacketParser.parseSignaturePacket(body: pkt.body))?.signatureType
                     if ctx == .primary, sig == 0x1F {
-                        out.append(buildPacket(tag: 2, body: Data(newDirectKeySig)))
+                        if !wroteDirect { out.append(buildPacket(tag: 2, body: Data(newDirectKeySig))) }
+                        wroteDirect = true
                     } else if ctx == .subkey, sig == 0x18, order >= 0, order < newBindings.count,
                               let fresh = newBindings[order] {
-                        out.append(buildPacket(tag: 2, body: Data(fresh)))
+                        if !wroteBinding { out.append(buildPacket(tag: 2, body: Data(fresh))) }
+                        wroteBinding = true
                     } else {
                         out.append(buildPacket(tag: 2, body: Data(pkt.body)))
                     }
@@ -858,6 +935,201 @@ class V6KeyGenerator {
         )
     }
 
+    // MARK: - Add Subkey only shapes (8.4.0 build 9, plan 5l)
+
+    /// 8.4.0 build 9 (plan 5l): subkeys Add Subkey offers that the keygen set
+    /// does not. Kept apart from V6SubkeyKind so the advanced keygen and its
+    /// labels stay as they are.
+    enum V6AddOnlySubkeyKind: Equatable {
+        /// An ML-DSA-87 + Ed448 signing subkey (RFC 9980 algorithm 31) with a
+        /// 0x19 back-signature the composite subkey itself makes, as
+        /// `.mldsa65Sign` is for algorithm 30. Needs iOS 26 (ML-DSA).
+        case mldsa87Sign
+        /// An RSA subkey (algorithm 1), v6-framed, under a composite ML-DSA
+        /// primary (algorithm 30 or 31; Android 4.6.0 item 21). `keyFlags` is
+        /// 0x02 (sign, with an RSA 0x19 back-signature), 0x0C (encrypt) or
+        /// 0x20 (authenticate).
+        case rsa(bits: Int, keyFlags: UInt8)
+        /// 8.4.0 build 10 (plan 5m): an RFC 9580 Ed448 signing subkey
+        /// (algorithm 28, the 57-octet seed as its secret), with a 0x19
+        /// back-signature it makes itself. Offered under an Ed448 primary.
+        case ed448Sign
+        /// 8.4.0 build 10 (plan 5m): an RFC 9580 X448 encryption subkey
+        /// (algorithm 26, the 56-octet scalar as its secret).
+        case x448Encrypt
+    }
+
+    enum V6AddOnlyError: LocalizedError {
+        case needsCompositePrimary
+
+        var errorDescription: String? {
+            switch self {
+            case .needsCompositePrimary:
+                return String(localized: "RSA subkeys can be added to a v6 key only when its primary key is an ML-DSA key.")
+            }
+        }
+    }
+
+    /// 8.4.0 build 9 (plan 5l): append an Add Subkey only shape to a v6 key.
+    /// The 0x18 binding is made by the primary exactly as `addV6Subkey(kind:)`
+    /// makes it (for a composite primary, the composite signature, SHA-256,
+    /// 16-octet salt), and a signing subkey's 0x19 back-signature by the new
+    /// subkey itself. The secret is locked like the rest of the key.
+    static func addV6Subkey(
+        publicKeyData: Data,
+        secretKeyData: Data,
+        primarySigner: V6SignatureKey,
+        primaryFingerprint: [UInt8],
+        addOnly kind: V6AddOnlySubkeyKind,
+        expirationInterval: TimeInterval?,
+        passphrase: String?
+    ) throws -> V6AddSubkeyResult {
+        let creationTime = UInt32(Date().timeIntervalSince1970)
+
+        let pubPackets = try OpenPGPPacketParser.parsePackets(data: Array(publicKeyData))
+        guard let primaryPkt = pubPackets.first(where: { $0.tag == 6 }) else { throw V6EditError.noPrimary }
+        let primaryBody = primaryPkt.body
+        if case .rsa = kind {
+            guard primaryBody.count > 5, primaryBody[0] == 6, CompositeSignSuite.isComposite(primaryBody[5]) else {
+                throw V6AddOnlyError.needsCompositePrimary
+            }
+        }
+
+        let lock: V6SecretLock? = try lockPassphrase(from: passphrase).map { try makeV6Lock(passphrase: $0) }
+
+        let subBody: [UInt8]
+        let subSecretBody: [UInt8]
+        let keyFlags: UInt8
+        var backSig: [UInt8]? = nil
+
+        switch kind {
+        case .mldsa87Sign:
+            let suite = CompositeSignSuite.mldsa87Ed448
+            let edSeed = try Ed448.generateSeed()
+            let edPublic = try Ed448.publicKey(seed: edSeed)
+            let mldsaSeed = try MLDSAService.randomSeed()
+            let mldsaPub = try MLDSAService.publicKey(fromSeed: mldsaSeed, suite: suite)
+            let secret = edSeed + mldsaSeed
+            subBody = buildV6PublicKeyBody(creationTime: creationTime, algorithm: suite.rawValue,
+                                           keyMaterial: edPublic + mldsaPub)
+            subSecretBody = try buildV6SecretKeyBody(publicBody: subBody, rawPrivateKey: secret, lock: lock, packetTagID: 0xC7)
+            keyFlags = 0x02
+            backSig = try buildV6PrimaryKeyBindingSignature(
+                subkeySigner: .composite(suite, compositeSecret: secret), primaryKeyBody: primaryBody,
+                subkeyBody: subBody, subkeyFingerprint: computeV6Fingerprint(packetBody: subBody),
+                creationTime: creationTime)
+        case .rsa(let bits, let flags):
+            // n and e as MPIs after the four-octet material length; the secret
+            // is d, p, q, u as MPIs, with no checksum when unprotected (v6).
+            let rsa = try ClassicalSubkeyGen.rsaKeyMaterial(bits: bits)
+            subBody = buildV6PublicKeyBody(creationTime: creationTime, algorithm: 1, keyMaterial: rsa.publicMPIs)
+            subSecretBody = try buildV6SecretKeyBody(publicBody: subBody, rawPrivateKey: rsa.secretMPIs,
+                                                     lock: lock, packetTagID: 0xC7)
+            keyFlags = flags
+            if flags & 0x02 != 0 {
+                backSig = try buildV6RSAPrimaryKeyBindingSignature(
+                    rsaKey: rsa.privateKey, primaryKeyBody: primaryBody, subkeyBody: subBody,
+                    subkeyFingerprint: computeV6Fingerprint(packetBody: subBody), creationTime: creationTime)
+            }
+        case .ed448Sign:
+            // 8.4.0 build 10 (plan 5m): checked with Sequoia (pysequoia 0.1.35)
+            // through a Python mirror: it signs with the new subkey.
+            let seed = try Ed448.generateSeed()
+            let edPublic = try Ed448.publicKey(seed: seed)
+            subBody = buildV6PublicKeyBody(creationTime: creationTime, algorithm: 28, keyMaterial: edPublic)
+            subSecretBody = try buildV6SecretKeyBody(publicBody: subBody, rawPrivateKey: seed, lock: lock, packetTagID: 0xC7)
+            keyFlags = 0x02
+            let subFP = computeV6Fingerprint(packetBody: subBody)
+            backSig = try buildV6PrimaryKeyBindingSignature(
+                subkeySigner: .ed448(Ed448SigningKey(seed: seed, publicKey: edPublic, keyVersion: 6, fingerprint: subFP)),
+                primaryKeyBody: primaryBody, subkeyBody: subBody, subkeyFingerprint: subFP,
+                creationTime: creationTime)
+        case .x448Encrypt:
+            // 8.4.0 build 10 (plan 5m): Sequoia encrypts to it and the secret
+            // decrypts (Python mirror, pysequoia 0.1.35).
+            let scalar = try X448.generatePrivateKey()
+            let xPublic = Array(try X448.publicKey(for: scalar))
+            subBody = buildV6PublicKeyBody(creationTime: creationTime, algorithm: 26, keyMaterial: xPublic)
+            subSecretBody = try buildV6SecretKeyBody(publicBody: subBody, rawPrivateKey: Array(scalar),
+                                                     lock: lock, packetTagID: 0xC7)
+            keyFlags = 0x0C
+        }
+
+        let subFP = computeV6Fingerprint(packetBody: subBody)
+        let binding = try buildV6SubkeyBindingSignature(
+            signer: primarySigner,
+            primaryKeyBody: primaryBody,
+            primaryFingerprint: primaryFingerprint,
+            subkeyBody: subBody,
+            creationTime: creationTime,
+            expirationInterval: expirationInterval,
+            keyFlags: keyFlags,
+            embeddedBackSignature: backSig
+        )
+
+        var newPublic = publicKeyData
+        newPublic.append(buildPacket(tag: 14, body: Data(subBody)))
+        newPublic.append(buildPacket(tag: 2, body: Data(binding)))
+
+        var newSecret = secretKeyData
+        newSecret.append(buildPacket(tag: 7, body: Data(subSecretBody)))
+        newSecret.append(buildPacket(tag: 2, body: Data(binding)))
+
+        return V6AddSubkeyResult(
+            publicKeyData: newPublic,
+            secretKeyData: newSecret,
+            armoredPublicKey: armorData(newPublic, type: .publicKey),
+            subkeyFingerprintHex: subFP.map { String(format: "%02x", $0) }.joined()
+        )
+    }
+
+    /// 8.4.0 build 9 (plan 5l, Android 4.6.0 item 21): the 0x19 back-signature
+    /// of an RSA signing subkey on a v6 key: a v6 signature (RFC 9580 5.2.3)
+    /// by the subkey, RSASSA-PKCS1-v1_5 over SHA-256 with a 16-octet salt,
+    /// the value as one MPI, hashed over (primary, subkey) with 0x9B framing
+    /// and the same subpackets as the EdDSA and composite back-signatures.
+    private static func buildV6RSAPrimaryKeyBindingSignature(
+        rsaKey: SecKey,
+        primaryKeyBody: [UInt8],
+        subkeyBody: [UInt8],
+        subkeyFingerprint: [UInt8],
+        creationTime: UInt32
+    ) throws -> [UInt8] {
+        var hashed = Data()
+        hashed.append(buildSubpacket(type: 2, data: creationTime.bigEndianBytes, critical: true))
+        hashed.append(buildSubpacket(type: 33, data: [6] + subkeyFingerprint))
+        let hashedSubpackets = Array(hashed)
+
+        let salt = try secureRandomBytes(16)   // SHA-256 (RFC 9580 Table 23)
+        var rawHashedPortion: [UInt8] = [6, 0x19, 1, 8]
+        rawHashedPortion.append(contentsOf: UInt32(hashedSubpackets.count).bigEndianBytes)
+        rawHashedPortion.append(contentsOf: hashedSubpackets)
+
+        var hashInput = Data(salt)
+        hashInput.append(contentsOf: subkeyBindingDocumentChunks(primaryKeyBody: primaryKeyBody, subkeyBody: subkeyBody))
+        hashInput.append(contentsOf: rawHashedPortion)
+        hashInput.append(contentsOf: [0x06, 0xFF])
+        hashInput.append(contentsOf: UInt32(rawHashedPortion.count).bigEndianBytes)
+        let digest = Array(SHA256.hash(data: hashInput))
+
+        var error: Unmanaged<CFError>?
+        guard let value = SecKeyCreateSignature(rsaKey, .rsaSignatureDigestPKCS1v15SHA256,
+                                                Data(digest) as CFData, &error) as Data? else {
+            let message = (error?.takeRetainedValue()).map { CFErrorCopyDescription($0) as String }
+                ?? String(localized: "RSA sign failed")
+            throw NSError(domain: "PGPony.V6KeyGen", code: 3, userInfo: [NSLocalizedDescriptionKey: message])
+        }
+
+        var body = rawHashedPortion
+        body.append(contentsOf: [0, 0, 0, 0])          // no unhashed subpackets
+        body.append(digest[0])
+        body.append(digest[1])
+        body.append(UInt8(salt.count))
+        body.append(contentsOf: salt)
+        body.append(contentsOf: Ed25519KeyGenerator.canonicalMPI([UInt8](value)))
+        return body
+    }
+
     // MARK: - v6 Public Key Body
 
     /// Build a v6 public-key packet body (used for both primary tag 6 and subkey tag 14):
@@ -907,7 +1179,7 @@ class V6KeyGenerator {
         var buf = [UInt8](repeating: 0, count: n)
         guard SecRandomCopyBytes(kSecRandomDefault, n, &buf) == errSecSuccess else {
             throw NSError(domain: "PGPony.V6KeyGen", code: 2,
-                          userInfo: [NSLocalizedDescriptionKey: "Random generation failed"])
+                          userInfo: [NSLocalizedDescriptionKey: String(localized: "Random generation failed")])
         }
         return buf
     }
@@ -1144,6 +1416,36 @@ class V6KeyGenerator {
         )
     }
 
+    // MARK: - Carried subpackets (8.4.0, plan 5d)
+
+    /// The hashed area of a self-signature that supersedes one with `old`
+    /// hashed subpackets: a fresh creation time, the new expiry (none for
+    /// never), every other subpacket of the old one with its critical bit, a
+    /// fresh embedded back-signature where one belongs, and the issuer. The
+    /// old creation time, expiry, back-signature and issuer subpackets are
+    /// not carried, since each is replaced.
+    private static func carriedSubpackets(
+        from old: [OpenPGPPacketParser.ParsedSubpacket],
+        creationTime: UInt32,
+        expirationInterval: TimeInterval?,
+        embeddedBackSignature: [UInt8]?,
+        issuerFingerprint: [UInt8]
+    ) -> [UInt8] {
+        var out = Data()
+        out.append(buildSubpacket(type: 2, data: creationTime.bigEndianBytes, critical: true))
+        if let interval = expirationInterval {
+            out.append(buildSubpacket(type: 9, data: UInt32(interval).bigEndianBytes, critical: true))
+        }
+        for sp in old where ![2, 9, 16, 32, 33].contains(sp.type) {
+            out.append(buildSubpacket(type: sp.type, data: sp.data, critical: sp.isCritical))
+        }
+        if let back = embeddedBackSignature {
+            out.append(buildSubpacket(type: 32, data: back, critical: true))
+        }
+        out.append(buildSubpacket(type: 33, data: [6] + issuerFingerprint))
+        return Array(out)
+    }
+
     // MARK: - v6 Subkey Binding Signature (type 0x18)
 
     private static func buildV6SubkeyBindingSignature(
@@ -1283,7 +1585,7 @@ class V6KeyGenerator {
         var salt = [UInt8](repeating: 0, count: signer.selfSignatureSaltLength)
         guard SecRandomCopyBytes(kSecRandomDefault, salt.count, &salt) == errSecSuccess else {
             throw NSError(domain: "PGPony.V6KeyGen", code: 1,
-                          userInfo: [NSLocalizedDescriptionKey: "Salt generation failed"])
+                          userInfo: [NSLocalizedDescriptionKey: String(localized: "Salt generation failed")])
         }
 
         // Build the raw hashed portion of the sig packet
@@ -1322,7 +1624,7 @@ class V6KeyGenerator {
         let sigBytes = try signer.sign(digest: digestBytes)
         guard sigBytes.count == signer.signatureLength else {
             throw NSError(domain: "PGPony.V6KeyGen", code: 2,
-                          userInfo: [NSLocalizedDescriptionKey: "v6 signature must be \(signer.signatureLength) bytes, got \(sigBytes.count)"])
+                          userInfo: [NSLocalizedDescriptionKey: String(localized: "v6 signature must be \(String(describing: signer.signatureLength)) bytes, got \(sigBytes.count)")])
         }
 
         // Assemble the v6 sig packet body

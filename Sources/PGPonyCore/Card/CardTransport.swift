@@ -153,7 +153,13 @@ protocol CardTransport: AnyObject {
 enum CardTransportAvailability {
 
     static var isNFCAvailable: Bool {
-        NFCCardTransport.isAvailable
+        #if DEBUG
+        // Screenshot runs only (8.4.0 plan 5c): the iPhone simulator has no
+        // NFC reader, so the store shots would show the "no NFC" wording a
+        // real iPhone never sees. The UI test sets this on iPhone launches.
+        if ProcessInfo.processInfo.environment["snapshotNFC"] == "1" { return true }
+        #endif
+        return NFCCardTransport.isAvailable
     }
 
     static var isUSBSmartCardAvailable: Bool {

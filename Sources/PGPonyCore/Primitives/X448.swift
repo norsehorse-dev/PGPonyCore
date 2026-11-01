@@ -56,11 +56,11 @@ enum X448 {
         var errorDescription: String? {
             switch self {
             case let .badLength(field, expected, got):
-                return "X448 \(field) has wrong size: expected \(expected) bytes, got \(got)."
+                return String(localized: "X448 \(field) has wrong size: expected \(String(describing: expected)) bytes, got \(String(describing: got)).")
             case .zeroSharedSecret:
-                return "X448 produced an all-zero shared secret (low-order peer key)."
+                return String(localized: "X448 produced an all-zero shared secret (low-order peer key).")
             case .randomnessUnavailable:
-                return "X448 could not obtain secure random bytes."
+                return String(localized: "X448 could not obtain secure random bytes.")
             }
         }
     }
@@ -156,12 +156,15 @@ enum X448 {
 
     // MARK: - Field arithmetic (16 x 28-bit limbs in UInt64)
 
-    private typealias FE = [UInt64]
+    // 8.4.0 build 8 (plan 2): the field type and the operations Ed448.swift
+    // builds its Edwards arithmetic on are internal rather than private.
+    // Visibility only; no arithmetic changed.
+    typealias FE = [UInt64]
 
     private static let nLimbs = 16
     private static let mask28: UInt64 = (1 << 28) - 1
 
-    private enum FEConst {
+    enum FEConst {
         static let zero: FE = [UInt64](repeating: 0, count: 16)
         static var one: FE { var f = zero; f[0] = 1; return f }
     }
@@ -174,7 +177,7 @@ enum X448 {
         return p
     }()
 
-    private static func fromBytes(_ b: [UInt8]) -> FE {
+    static func fromBytes(_ b: [UInt8]) -> FE {
         // Little-endian bits 28i..28i+27 per limb. Walk the bytes once,
         // spilling each into the limb(s) its bits land in.
         var f = [UInt64](repeating: 0, count: nLimbs)
@@ -210,7 +213,7 @@ enum X448 {
         return c
     }
 
-    private static func addFE(_ a: FE, _ b: FE) -> FE {
+    static func addFE(_ a: FE, _ b: FE) -> FE {
         var c = [UInt64](repeating: 0, count: nLimbs)
         for i in 0..<nLimbs { c[i] = a[i] &+ b[i] }
         return norm(c)
@@ -219,13 +222,13 @@ enum X448 {
     /// a - b, biased by 2p so every limb difference stays non-negative in
     /// unsigned arithmetic (inputs are normalized, so a[i] + 2p[i] always
     /// exceeds b[i]).
-    private static func subFE(_ a: FE, _ b: FE) -> FE {
+    static func subFE(_ a: FE, _ b: FE) -> FE {
         var c = [UInt64](repeating: 0, count: nLimbs)
         for i in 0..<nLimbs { c[i] = a[i] &+ (2 &* pLimbs[i]) &- b[i] }
         return norm(c)
     }
 
-    private static func mulFE(_ a: FE, _ b: FE) -> FE {
+    static func mulFE(_ a: FE, _ b: FE) -> FE {
         // Schoolbook columns; see the header comment for the overflow
         // budget. Column k >= 16 folds into k-16 and k-8.
         var cols = [UInt64](repeating: 0, count: 2 * nLimbs - 1)
@@ -246,14 +249,14 @@ enum X448 {
         return norm(Array(cols[0..<nLimbs]))
     }
 
-    private static func mulSmall(_ a: FE, _ s: UInt64) -> FE {
+    static func mulSmall(_ a: FE, _ s: UInt64) -> FE {
         var c = [UInt64](repeating: 0, count: nLimbs)
         for i in 0..<nLimbs { c[i] = a[i] &* s }
         return norm(c)
     }
 
     /// Arithmetic conditional swap: mask is 0 or all-ones.
-    private static func cswap(_ mask: UInt64, _ a: inout FE, _ b: inout FE) {
+    static func cswap(_ mask: UInt64, _ a: inout FE, _ b: inout FE) {
         for i in 0..<nLimbs {
             let t = mask & (a[i] ^ b[i])
             a[i] ^= t
@@ -263,7 +266,7 @@ enum X448 {
 
     /// Fermat inversion a^(p-2). The exponent is a fixed public constant,
     /// so plain square-and-multiply over its bits leaks nothing secret.
-    private static func invert(_ a: FE) -> FE {
+    static func invert(_ a: FE) -> FE {
         // p - 2 = 2^448 - 2^224 - 3: bits 448.. are zero; bit pattern below
         // is consumed most-significant first.
         var result = FEConst.one
@@ -291,7 +294,7 @@ enum X448 {
     /// Canonical little-endian serialization: normalize (value < 2^448),
     /// then one constant-time conditional subtract of p (2p > 2^448, so
     /// once is enough).
-    private static func toBytes(_ input: FE) -> [UInt8] {
+    static func toBytes(_ input: FE) -> [UInt8] {
         let c = norm(input)
         var d = [UInt64](repeating: 0, count: nLimbs)
         var borrow: UInt64 = 0

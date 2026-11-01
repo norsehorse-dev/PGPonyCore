@@ -29,10 +29,10 @@ enum LibrePGPEncryptService {
 
         var errorDescription: String? {
             switch self {
-            case .notAKyberSubkey:      return "Not a LibrePGP ML-KEM+X25519 (algorithm 8) subkey"
-            case .malformedKey(let m):  return "Malformed LibrePGP key: \(m)"
-            case .rng:                  return "Secure random generation failed"
-            case .internalError(let m): return "LibrePGP encrypt error: \(m)"
+            case .notAKyberSubkey:      return String(localized: "Not a LibrePGP ML-KEM+X25519 (algorithm 8) subkey")
+            case .malformedKey(let m):  return String(localized: "Malformed LibrePGP key: \(m)")
+            case .rng:                  return String(localized: "Secure random generation failed")
+            case .internalError(let m): return String(localized: "LibrePGP encrypt error: \(m)")
             }
         }
     }
@@ -115,7 +115,7 @@ enum LibrePGPEncryptService {
             }
         }
         pgpDebugLog("LibrePGP encrypt: no Kyber subkey. packets=[\(summary.joined(separator: " "))] lastReason=\(lastReason ?? "none")")
-        throw Failure.malformedKey("no algorithm-8 subkey found. Saw packets: \(summary.joined(separator: ", ")). Last parse error: \(lastReason ?? "none")")
+        throw Failure.malformedKey(String(localized: "no algorithm-8 subkey found. Saw packets: \(summary.joined(separator: ", ")). Last parse error: \(String(describing: lastReason ?? "none"))"))
     }
 
     /// Encrypt to an already-parsed recipient. Produces `PKESK(tag1) | OCB-Data(tag20)`.
@@ -133,7 +133,7 @@ enum LibrePGPEncryptService {
                         recipients: [Recipient],
                         filename: String? = nil,
                         signingInfo: Ed25519SigningInfo? = nil) throws -> [UInt8] {
-        guard !recipients.isEmpty else { throw Failure.internalError("no recipients") }
+        guard !recipients.isEmpty else { throw Failure.internalError(String(localized: "no recipients")) }
         // Random AES-256 session key, wrapped once per recipient.
         let sessionKey = try randomBytes(32)
         var out: [UInt8] = []
@@ -168,13 +168,13 @@ enum LibrePGPEncryptService {
         case .ky768_cv25519:
             let recipientPub: Curve25519.KeyAgreement.PublicKey
             do { recipientPub = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: Data(recipient.eccPublic)) }
-            catch { throw Failure.malformedKey("recipient X25519 public key invalid") }
+            catch { throw Failure.malformedKey(String(localized: "recipient X25519 public key invalid")) }
             let ephemeral = Curve25519.KeyAgreement.PrivateKey()
             eccCT = [UInt8](ephemeral.publicKey.rawRepresentation)
             do {
                 let ss = try ephemeral.sharedSecretFromKeyAgreement(with: recipientPub)
                 rawECDH = ss.withUnsafeBytes { Array($0) }                  // raw X25519 output
-            } catch { throw Failure.internalError("X25519 key agreement failed") }
+            } catch { throw Failure.internalError(String(localized: "X25519 key agreement failed")) }
         case .ky1024_cv448:
             // Hand-rolled X448 (X448.swift), same curve the IETF 1024 suite uses.
             do {
@@ -182,7 +182,20 @@ enum LibrePGPEncryptService {
                 eccCT = [UInt8](try X448.publicKey(for: ephemeralSecret))
                 rawECDH = [UInt8](try X448.sharedSecret(privateKey: ephemeralSecret,
                                                         publicKey: Data(recipient.eccPublic)))
-            } catch { throw Failure.internalError("X448 key agreement failed") }
+            } catch { throw Failure.internalError(String(localized: "X448 key agreement failed")) }
+        case .ky768_bp256, .ky1024_bp384:
+            // 8.4.0 build 7 wave 2 (plan K3): a fresh brainpool ephemeral; the
+            // ciphertext is its uncompressed point and the raw ECDH input is
+            // the whole uncompressed shared point, as gpg computes them.
+            guard let curve = suite.brainpoolCurve else {
+                throw Failure.internalError(String(localized: "brainpool key agreement failed"))
+            }
+            do {
+                let ephemeral = try BrainpoolECDH.generateKeyPair(curve: curve)
+                eccCT = ephemeral.point
+                rawECDH = try BrainpoolECDH.sharedPoint(curve: curve, scalar: ephemeral.scalar,
+                                                        peerPoint: recipient.eccPublic)
+            } catch { throw Failure.internalError(String(localized: "brainpool key agreement failed")) }
         }
         let kek = compositeKEK(
             rawECDH: rawECDH,
@@ -202,7 +215,8 @@ enum LibrePGPEncryptService {
                             eccCipherText: eccCT,
                             mlkemCipherText: [UInt8](mlkemCT),
                             sessionKeyAlgo: sessionKeyAlgo,
-                            wrappedKey: wrapped)
+                            wrappedKey: wrapped,
+                            minimalECCBitLength: suite.brainpoolCurve != nil)
     }
 
     /// Derive the 32-octet composite KEK the way GnuPG's encrypt path does.
@@ -246,39 +260,44 @@ enum LibrePGPEncryptService {
         let algo = body[o]; o += 1
         guard algo == algIdKyber else { throw Failure.notAKyberSubkey }
 
-        guard o + 4 <= body.count else { throw Failure.malformedKey("truncated key-material length") }
+        guard o + 4 <= body.count else { throw Failure.malformedKey(String(localized: "truncated key-material length")) }
         let keyMatLen = Int(body[o]) << 24 | Int(body[o+1]) << 16 | Int(body[o+2]) << 8 | Int(body[o+3])
         o += 4
-        guard o + keyMatLen <= body.count else { throw Failure.malformedKey("key material overruns packet") }
+        guard o + keyMatLen <= body.count else { throw Failure.malformedKey(String(localized: "key material overruns packet")) }
         var p = o
         let matEnd = o + keyMatLen
 
         // Curve OID: X25519 (1.3.101.110 = 2b 65 6e) or X448 (1.3.101.111 =
         // 2b 65 6f). v8.2.0 §1 (K2a): the OID is the ONLY thing that tells a
         // 768 key from a 1024 key at algo 8, so the suite is derived here.
-        guard p < matEnd else { throw Failure.malformedKey("missing OID") }
+        guard p < matEnd else { throw Failure.malformedKey(String(localized: "missing OID")) }
         let oidLen = Int(body[p]); p += 1
-        guard p + oidLen <= matEnd else { throw Failure.malformedKey("OID overruns") }
+        guard p + oidLen <= matEnd else { throw Failure.malformedKey(String(localized: "OID overruns")) }
         guard let suite = LibrePGPSuite.fromOidTail(Array(body[p..<(p + oidLen)])) else {
-            throw Failure.malformedKey("unsupported composite curve OID")
+            throw Failure.malformedKey(String(localized: "unsupported composite curve OID"))
         }
         p += oidLen
 
         // ECC point as a bit-length SOS/MPI; normalize to the curve length
         // (drops a 0x40 native-point prefix, left-pads a minimal MPI).
-        guard p + 2 <= matEnd else { throw Failure.malformedKey("missing ECC point length") }
+        guard p + 2 <= matEnd else { throw Failure.malformedKey(String(localized: "missing ECC point length")) }
         let ptBits = Int(body[p]) << 8 | Int(body[p+1]); p += 2
         let ptBytes = (ptBits + 7) / 8
         guard p + ptBytes <= matEnd, ptBytes >= 1,
-              ptBytes <= suite.eccKeyBytes + 1 else { throw Failure.malformedKey("ECC point overruns") }
+              ptBytes <= suite.eccPointBytes + 1 else { throw Failure.malformedKey(String(localized: "ECC point overruns")) }
         let eccPoint = suite.normalizePoint(Array(body[p..<(p + ptBytes)])); p += ptBytes
+        // 8.4.0 build 7 wave 2 (plan K3): a brainpool point must be an
+        // uncompressed point on its curve before anything is encrypted to it.
+        if let curve = suite.brainpoolCurve, curve.decodePoint(eccPoint) == nil {
+            throw Failure.malformedKey(String(localized: "The brainpool public key point is malformed."))
+        }
 
         // ML-KEM public key: 4-octet length prefix then the level's size.
-        guard p + 4 <= matEnd else { throw Failure.malformedKey("missing ML-KEM length") }
+        guard p + 4 <= matEnd else { throw Failure.malformedKey(String(localized: "missing ML-KEM length")) }
         let mlkemLen = Int(body[p]) << 24 | Int(body[p+1]) << 16 | Int(body[p+2]) << 8 | Int(body[p+3])
         p += 4
         guard mlkemLen == suite.mlkemPublicBytes, p + mlkemLen <= matEnd else {
-            throw Failure.malformedKey("ML-KEM public key must be \(suite.mlkemPublicBytes) octets, got \(mlkemLen)")
+            throw Failure.malformedKey(String(localized: "ML-KEM public key must be \(String(describing: suite.mlkemPublicBytes)) octets, got \(String(describing: mlkemLen))"))
         }
         let mlkemPub = Array(body[p..<(p + mlkemLen)])
 
@@ -313,14 +332,21 @@ enum LibrePGPEncryptService {
                              eccCipherText: [UInt8],
                              mlkemCipherText: [UInt8],
                              sessionKeyAlgo: UInt8,
-                             wrappedKey: [UInt8]) -> [UInt8] {
+                             wrappedKey: [UInt8],
+                             minimalECCBitLength: Bool = false) -> [UInt8] {
         var body: [UInt8] = [3]
         body.append(contentsOf: keyID)
         body.append(algIdKyber)
 
         // eccCT — fixed-length 256-bit SOS (GnuPG stores the X25519 KEM ciphertext
-        // as a plain 32-octet value, no 0x40 prefix).
-        let bits = eccCipherText.count * 8
+        // as a plain 32-octet value, no 0x40 prefix). 8.4.0 build 7 wave 2
+        // (plan K3): a brainpool ephemeral is an uncompressed 0x04 || X || Y
+        // point, which gpg writes as a MINIMAL MPI (its exact bit length, 515
+        // for brainpoolP256r1), as Android's eccSos does.
+        var bits = eccCipherText.count * 8
+        if minimalECCBitLength, let first = eccCipherText.first {
+            bits = (eccCipherText.count - 1) * 8 + (8 - first.leadingZeroBitCount)
+        }
         body.append(UInt8(truncatingIfNeeded: bits >> 8))
         body.append(UInt8(truncatingIfNeeded: bits))
         body.append(contentsOf: eccCipherText)

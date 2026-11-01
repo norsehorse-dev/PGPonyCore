@@ -21,12 +21,17 @@ enum CardSigner {
     enum SignError: LocalizedError {
         case badSignatureLength(Int)
         case emptyCardSignature
+        /// 8.4.0 build 10 (plan 5m): an ECDSA answer that is not r || s for the
+        /// slot's curve (nor a DER pair that fits it).
+        case badECDSASignatureLength(Int, expected: Int)
         var errorDescription: String? {
             switch self {
             case .badSignatureLength(let n):
-                return "The card returned a \(n)-byte signature; expected 64."
+                return String(localized: "The card returned a \(n)-byte signature; expected 64.")
             case .emptyCardSignature:
-                return "The card returned an empty signature."
+                return String(localized: "The card returned an empty signature.")
+            case .badECDSASignatureLength(let n, let expected):
+                return String(localized: "The card returned a \(n)-byte signature; expected \(expected).")
             }
         }
     }
@@ -85,10 +90,13 @@ enum CardSigner {
         )
     }
 
-    /// Shared core: build a v4 SHA-256 signature packet over `message` with the
+    /// Shared core: build a v4 signature packet over `message` with the
     /// given sig type, having the card produce the signature value via PSO:CDS.
     /// EdDSA (algo 22) produces a 64-byte R||S (two MPIs); RSA (algo 1) produces
     /// one modulus-length value (a single MPI) over a PKCS#1 v1.5 DigestInfo.
+    /// 8.4.0 build 10 (plan 5m): ECDSA (algo 19) produces r || s (two MPIs) over
+    /// the curve's hash. EdDSA and RSA keep SHA-256; ECDSA uses SHA-256, SHA-384
+    /// or SHA-512 by curve (`algorithm.hashAlgorithmID`).
     /// Returns the new-format tag-2 packet bytes plus the issuer key ID. Subpacket
     /// layout (hashed: creation time + issuer FP; unhashed: issuer key ID) matches
     /// the in-app software signer exactly.
@@ -108,8 +116,11 @@ enum CardSigner {
                    + buildSubpacket(type: 33, data: issuerFP)
         let unhashed = buildSubpacket(type: 16, data: keyID)
 
-        // v4 trailer: version, sig type, pubkey algo, SHA-256 (8).
-        var trailer: [UInt8] = [4, sigType, pubAlgo, 8]
+        let hashAlgo = algorithm.hashAlgorithmID
+
+        // v4 trailer: version, sig type, pubkey algo, hash algo (SHA-256 = 8,
+        // or the curve's hash for ECDSA).
+        var trailer: [UInt8] = [4, sigType, pubAlgo, hashAlgo]
         trailer += u16be(UInt16(hashed.count)) + hashed
 
         // Hash the document bytes directly, then the trailer. For sig type 0x01
@@ -117,50 +128,41 @@ enum CardSigner {
         var hashInput = Data(message)
         hashInput.append(contentsOf: trailer)
         hashInput.append(contentsOf: [4, 0xFF] + u32be(UInt32(trailer.count)))
-        let digest = Array(SHA256.hash(data: hashInput))
+        let digest = algorithm.digest(hashInput)
 
         // Produce the algorithm-specific signature MPI list on the card. EdDSA
         // signs the bare digest and returns 64 bytes (R || S, two MPIs); RSA
         // signs a PKCS#1 v1.5 DigestInfo and returns one modulus-length value
-        // (a single MPI).
-        let mpis: [[UInt8]]
-        switch algorithm {
-        case .eddsa:
-            let sig = try await service.sign(digest: digest)
-            guard sig.count == 64 else { throw SignError.badSignatureLength(sig.count) }
-            mpis = [Array(sig[0..<32]), Array(sig[32..<64])]
-        case .rsa:
-            var sig = try await service.signRSA(digestInfo: sha256DigestInfo(digest))
-            guard !sig.isEmpty else { throw SignError.emptyCardSignature }
-            // Canonical OpenPGP MPI: the byte count must match the bit length, so
-            // strip any leading zero bytes the card padded the value with. Without
-            // this, a signature with a zero top byte (~1/256) encodes a bit length
-            // shorter than the bytes written and parses misaligned.
-            while sig.first == 0x00 && sig.count > 1 { sig.removeFirst() }
-            mpis = [sig]
-        }
+        // (a single MPI, leading zero octets stripped); ECDSA signs the hash
+        // and returns r || s (two MPIs). 8.4.0 build 10 (plan 5m): one helper
+        // for every card signing path, so they cannot disagree.
+        let raw = try await service.signDigest(digest, algorithm: algorithm)
+        let mpis = try algorithm.signatureMPIs(fromCardOutput: raw)
 
         let body = assembleSignatureBody(
             pubkeyAlgo: pubAlgo, sigType: sigType,
             hashed: hashed, unhashed: unhashed,
-            hashPrefix2: [digest[0], digest[1]], signatureMPIs: mpis
+            hashPrefix2: [digest[0], digest[1]], signatureMPIs: mpis,
+            hashAlgorithm: hashAlgo
         )
         return (buildNewFormatPacket(tag: 2, body: body), keyID)
     }
 
     /// Pure, hardware-free assembly of a v4 signature packet body (hash algo is
-    /// SHA-256 = 8). `signatureMPIs` is the algorithm's signature value split into
-    /// MPIs: [R, S] for EdDSA, [sig] for RSA. Exposed internally so the framing
-    /// can be unit-tested without a card.
+    /// SHA-256 = 8 unless `hashAlgorithm` says otherwise). `signatureMPIs` is the
+    /// algorithm's signature value split into MPIs: [R, S] for EdDSA, [sig] for
+    /// RSA, [r, s] for ECDSA. Exposed internally so the framing can be
+    /// unit-tested without a card.
     static func assembleSignatureBody(
         pubkeyAlgo: UInt8,
         sigType: UInt8,
         hashed: [UInt8],
         unhashed: [UInt8],
         hashPrefix2: [UInt8],
-        signatureMPIs: [[UInt8]]
+        signatureMPIs: [[UInt8]],
+        hashAlgorithm: UInt8 = 8
     ) -> [UInt8] {
-        var body: [UInt8] = [4, sigType, pubkeyAlgo, 8]
+        var body: [UInt8] = [4, sigType, pubkeyAlgo, hashAlgorithm]
         body += u16be(UInt16(hashed.count)) + hashed
         body += u16be(UInt16(unhashed.count)) + unhashed
         body += hashPrefix2
@@ -264,5 +266,143 @@ enum CardSigner {
         }
         crc &= 0xFFFFFF
         return [UInt8((crc >> 16) & 0xFF), UInt8((crc >> 8) & 0xFF), UInt8(crc & 0xFF)]
+    }
+}
+
+// MARK: - 8.4.0 build 10 (plan 5m): what each card algorithm hashes, sends and gets back
+
+extension CardSignatureAlgorithm {
+
+    /// The OpenPGP hash ID a card signature of this algorithm uses. EdDSA and
+    /// RSA stay on SHA-256 (8), which the RSA DigestInfo prefix assumes. ECDSA
+    /// follows the curve as GnuPG and the software ECDSA signer do: SHA-256 (8)
+    /// on P-256, SHA-384 (9) on P-384, SHA-512 (10) on P-521.
+    var hashAlgorithmID: UInt8 {
+        switch self {
+        case .eddsa, .rsa: return 8
+        case .ecdsa(let curve): return curve.hashAlgorithmID
+        }
+    }
+
+    /// The cleartext "Hash:" armor header for `hashAlgorithmID`.
+    var armorHashName: String {
+        switch hashAlgorithmID {
+        case 9: return "SHA384"
+        case 10: return "SHA512"
+        default: return "SHA256"
+        }
+    }
+
+    /// `data` hashed with `hashAlgorithmID`.
+    func digest(_ data: Data) -> [UInt8] {
+        var hasher = CardDigestHasher(hashAlgorithmID: hashAlgorithmID)
+        hasher.update(data: data)
+        return hasher.finalize()
+    }
+
+    /// What PSO:COMPUTE DIGITAL SIGNATURE takes for `digest`: the bare digest
+    /// for EdDSA, a SHA-256 DigestInfo for RSA, and for ECDSA the hash cut to
+    /// the curve's field size (its leftmost octets), per the OpenPGP card spec
+    /// 3.4. A natural hash is never longer than its curve, so the cut only
+    /// matters for a longer hash.
+    func cardInput(forDigest digest: [UInt8]) -> [UInt8] {
+        switch self {
+        case .eddsa:
+            return digest
+        case .rsa:
+            return CardSigner.sha256DigestInfo(digest)
+        case .ecdsa(let curve):
+            return digest.count > curve.fieldSize ? Array(digest.prefix(curve.fieldSize)) : digest
+        }
+    }
+
+    /// The signature MPIs (before MPI framing) from the card's raw PSO:CDS
+    /// output: [R, S] for EdDSA (64 octets), [value] for RSA with leading zero
+    /// octets stripped, [r, s] for ECDSA (r || s, each the field size; a DER
+    /// SEQUENCE of two INTEGERs is taken too, as a fallback for a card that
+    /// answers that way). MPI encoding strips the remaining zero octets.
+    func signatureMPIs(fromCardOutput raw: [UInt8]) throws -> [[UInt8]] {
+        switch self {
+        case .eddsa:
+            guard raw.count == 64 else { throw CardSigner.SignError.badSignatureLength(raw.count) }
+            return [Array(raw[0..<32]), Array(raw[32..<64])]
+        case .rsa:
+            guard !raw.isEmpty else { throw CardSigner.SignError.emptyCardSignature }
+            // Canonical OpenPGP MPI: the byte count must match the bit length, so
+            // strip any leading zero bytes the card padded the value with.
+            var sig = raw
+            while sig.first == 0x00 && sig.count > 1 { sig.removeFirst() }
+            return [sig]
+        case .ecdsa(let curve):
+            guard !raw.isEmpty else { throw CardSigner.SignError.emptyCardSignature }
+            guard let rs = Self.ecdsaRawSignature(raw, curve: curve) else {
+                throw CardSigner.SignError.badECDSASignatureLength(raw.count, expected: 2 * curve.fieldSize)
+            }
+            return [Array(rs[0..<curve.fieldSize]), Array(rs[curve.fieldSize...])]
+        }
+    }
+
+    /// r || s, each left-padded to the field size, from the card's answer:
+    /// already that shape (the OpenPGP card form), or a DER SEQUENCE { INTEGER
+    /// r, INTEGER s } whose integers fit the field. Nil otherwise.
+    static func ecdsaRawSignature(_ raw: [UInt8], curve: NISTCurve) -> [UInt8]? {
+        let size = curve.fieldSize
+        if raw.count == 2 * size { return raw }
+        // DER fallback.
+        func readLength(_ bytes: [UInt8], _ i: inout Int) -> Int? {
+            guard i < bytes.count else { return nil }
+            let first = Int(bytes[i]); i += 1
+            if first < 0x80 { return first }
+            let n = first & 0x7F
+            guard n >= 1, n <= 2, i + n <= bytes.count else { return nil }
+            var len = 0
+            for _ in 0..<n { len = (len << 8) | Int(bytes[i]); i += 1 }
+            return len
+        }
+        func readInteger(_ bytes: [UInt8], _ i: inout Int) -> [UInt8]? {
+            guard i < bytes.count, bytes[i] == 0x02 else { return nil }
+            i += 1
+            guard let len = readLength(bytes, &i), len >= 1, i + len <= bytes.count else { return nil }
+            var value = Array(bytes[i..<(i + len)])
+            i += len
+            while value.count > 1 && value.first == 0 { value.removeFirst() }
+            return curve.padded(value)
+        }
+        guard raw.first == 0x30 else { return nil }
+        var i = 1
+        guard let seqLen = readLength(raw, &i), i + seqLen == raw.count else { return nil }
+        guard let r = readInteger(raw, &i), let s = readInteger(raw, &i), i == raw.count else { return nil }
+        return r + s
+    }
+}
+
+/// 8.4.0 build 10 (plan 5m): an incremental hash picked by OpenPGP hash ID
+/// (8 SHA-256, 9 SHA-384, 10 SHA-512; anything else SHA-256), so a signer that
+/// streams its input can follow `CardSignatureAlgorithm.hashAlgorithmID`.
+/// `nonisolated` so it can be fed off the main thread like CryptoKit's own.
+nonisolated struct CardDigestHasher {
+    // Exactly one of the three is set, by the hash ID given at init.
+    private var sha256: SHA256?
+    private var sha384: SHA384?
+    private var sha512: SHA512?
+
+    init(hashAlgorithmID: UInt8) {
+        switch hashAlgorithmID {
+        case 9: sha384 = SHA384()
+        case 10: sha512 = SHA512()
+        default: sha256 = SHA256()
+        }
+    }
+
+    mutating func update<D: DataProtocol>(data: D) {
+        sha256?.update(data: data)
+        sha384?.update(data: data)
+        sha512?.update(data: data)
+    }
+
+    func finalize() -> [UInt8] {
+        if let h = sha384 { return Array(h.finalize()) }
+        if let h = sha512 { return Array(h.finalize()) }
+        return Array((sha256 ?? SHA256()).finalize())
     }
 }

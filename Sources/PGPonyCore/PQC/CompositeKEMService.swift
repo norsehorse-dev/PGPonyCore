@@ -44,9 +44,9 @@ enum CompositeKEMService {
         var errorDescription: String? {
             switch self {
             case let .badKeySize(field, expected, got):
-                return "Composite KEM \(field) has wrong size: expected \(expected), got \(got)."
+                return String(localized: "Composite KEM \(field) has wrong size: expected \(String(describing: expected)), got \(String(describing: got)).")
             case let .ecdh(m):
-                return "Composite KEM ECDH error: \(m)."
+                return String(localized: "Composite KEM ECDH error: \(String(describing: m)).")
             }
         }
     }
@@ -109,17 +109,17 @@ enum CompositeKEMService {
         case .ietf768:
             let priv: Curve25519.KeyAgreement.PrivateKey
             do { priv = try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: secret) }
-            catch { throw Failure.ecdh("invalid secret key") }
+            catch { throw Failure.ecdh(String(localized: "invalid secret key")) }
             let peer: Curve25519.KeyAgreement.PublicKey
             do { peer = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: peerPublic) }
-            catch { throw Failure.ecdh("invalid public key") }
+            catch { throw Failure.ecdh(String(localized: "invalid public key")) }
             do {
                 let ss = try priv.sharedSecretFromKeyAgreement(with: peer)
                 return ss.withUnsafeBytes { Data($0) }               // raw X25519 output
-            } catch { throw Failure.ecdh("key agreement failed") }
+            } catch { throw Failure.ecdh(String(localized: "key agreement failed")) }
         case .ietf1024:
             do { return try X448.sharedSecret(privateKey: secret, publicKey: peerPublic) }
-            catch { throw Failure.ecdh("X448 agreement failed: \(error.localizedDescription)") }
+            catch { throw Failure.ecdh(String(localized: "X448 agreement failed: \(error.localizedDescription)")) }
         }
     }
 
@@ -168,7 +168,7 @@ enum CompositeKEMService {
                             ecdhPublicKey: Data,
                             algId: UInt8 = algIdMLKEM768X25519) throws -> Data {
         guard let suite = CompositeSuite.from(algId: algId) else {
-            throw Failure.ecdh("unknown composite algorithm id \(algId)")
+            throw Failure.ecdh(String(localized: "unknown composite algorithm id \(String(describing: algId))"))
         }
         guard ecdhCipherText.count == suite.eccKeyBytes else {
             throw Failure.badKeySize(field: "ecdhCipherText", expected: suite.eccKeyBytes, got: ecdhCipherText.count)

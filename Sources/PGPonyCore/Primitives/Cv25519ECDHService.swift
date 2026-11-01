@@ -29,9 +29,9 @@ enum ECDHError: LocalizedError {
         case .sessionKeyWrapFailed(let msg): return String(localized: "Session key wrap failed: \(msg)")
         case .sessionKeyUnwrapFailed(let msg): return String(localized: "Session key unwrap failed: \(msg)")
         case .invalidPublicKey: return String(localized: "Invalid Cv25519 public key")
-        case .invalidEphemeralKey: return "Invalid ephemeral key data"
-        case .invalidWrappedData: return "Invalid wrapped session key data"
-        case .unsupportedAlgorithm(let id): return "Unsupported symmetric algorithm ID: \(id)"
+        case .invalidEphemeralKey: return String(localized: "Invalid ephemeral key data")
+        case .invalidWrappedData: return String(localized: "Invalid wrapped session key data")
+        case .unsupportedAlgorithm(let id): return String(localized: "Unsupported symmetric algorithm ID: \(String(describing: id))")
         }
     }
 }
@@ -101,6 +101,26 @@ class Cv25519ECDHService {
                 throw ECDHError.keyAgreementFailed(error.localizedDescription)
             }
             curveOID = nist.oid
+        } else if curve == .x448 {
+            // 8.4.0 build 9 (plan 5l): X448 in GnuPG's ECDH convention (a
+            // LibrePGP v5 cv448 subkey): the shared secret is the raw X448
+            // output and the ephemeral goes out bare (56 octets, no 0x40). An
+            // ephemeral whose first octet is zero is drawn again, so its MPI
+            // is always the full 56 octets, as GnuPG's own are.
+            guard recipientPublicKey.count == 56 else { throw ECDHError.invalidPublicKey }
+            var secret = try X448.generatePrivateKey()
+            var publicValue = Array(try X448.publicKey(for: secret))
+            while publicValue.first == 0 {
+                secret = try X448.generatePrivateKey()
+                publicValue = Array(try X448.publicKey(for: secret))
+            }
+            ephemeralPublicBytes = publicValue
+            do {
+                sharedSecretBytes = Array(try X448.sharedSecret(privateKey: secret, publicKey: Data(recipientPublicKey)))
+            } catch {
+                throw ECDHError.keyAgreementFailed(error.localizedDescription)
+            }
+            curveOID = OpenPGP448.x448OID
         } else {
             let ephemeralKey = Curve25519.KeyAgreement.PrivateKey()
             ephemeralPublicBytes = Array(ephemeralKey.publicKey.rawRepresentation)
@@ -160,7 +180,7 @@ class Cv25519ECDHService {
 
         // Ephemeral public key with 0x40 prefix (OpenPGP Cv25519 encoding); a
         // NIST point is already in its SEC 1 form 0x04 || X || Y (8.3.0, NIST B).
-        let ephemeralEncoded: [UInt8] = curve.nistCurve == nil ? [0x40] + ephemeralPublicBytes : ephemeralPublicBytes
+        let ephemeralEncoded: [UInt8] = (curve.nistCurve == nil && curve != .x448) ? [0x40] + ephemeralPublicBytes : ephemeralPublicBytes
 
         return ECDHEncryptedSessionKey(
             ephemeralPublicKey: ephemeralEncoded,
@@ -211,6 +231,34 @@ class Cv25519ECDHService {
             )
         }
 
+        // 8.4.0 build 9 (plan 5l): X448 (GnuPG's cv448). The ephemeral is
+        // accepted bare or 0x40-prefixed, with any leading zero octets the
+        // MPI dropped put back. A key that does not open the packet fails
+        // the key unwrap below, the normal wrong-key result.
+        if curve == .x448 {
+            var eph = ephemeralPublicKey
+            if eph.count == 57, eph.first == 0x40 { eph.removeFirst() }
+            guard !eph.isEmpty, eph.count <= 56, recipientPrivateKey.count == 56 else {
+                throw ECDHError.invalidEphemeralKey
+            }
+            eph = [UInt8](repeating: 0, count: 56 - eph.count) + eph
+            let shared: [UInt8]
+            do {
+                shared = Array(try X448.sharedSecret(privateKey: Data(recipientPrivateKey), publicKey: Data(eph)))
+            } catch {
+                throw ECDHError.keyAgreementFailed(error.localizedDescription)
+            }
+            return try sessionKeyFromSharedSecret(
+                sharedSecret: shared,
+                wrappedSessionKey: wrappedSessionKey,
+                recipientFingerprint: recipientFingerprint,
+                kdfHashID: kdfHashID,
+                kdfCipherID: kdfCipherID,
+                includesAlgorithmID: includesAlgorithmID,
+                curveOID: OpenPGP448.x448OID
+            )
+        }
+
         // 1. Parse ephemeral public key (strip 0x40 prefix)
         var ephemeralRaw = ephemeralPublicKey
         if ephemeralRaw.first == 0x40 {
@@ -225,7 +273,7 @@ class Cv25519ECDHService {
         do {
             privKey = try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: recipientPrivateKey)
         } catch {
-            throw ECDHError.keyAgreementFailed("Invalid private key: \(error.localizedDescription)")
+            throw ECDHError.keyAgreementFailed(String(localized: "Invalid private key: \(error.localizedDescription)"))
         }
 
         let ephPubKey: Curve25519.KeyAgreement.PublicKey
@@ -312,7 +360,7 @@ class Cv25519ECDHService {
         let actualChecksum = sessionKey.reduce(UInt16(0)) { ($0 &+ UInt16($1)) }
 
         guard expectedChecksum == actualChecksum else {
-            throw ECDHError.sessionKeyUnwrapFailed("Session key checksum mismatch")
+            throw ECDHError.sessionKeyUnwrapFailed(String(localized: "Session key checksum mismatch"))
         }
 
         return (algorithmID, sessionKey)

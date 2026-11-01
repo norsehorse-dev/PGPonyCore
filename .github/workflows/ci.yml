@@ -14,9 +14,11 @@ jobs:
       - name: Build for generic iOS
         run: >
           xcodebuild build
-          -scheme PGPonyCore
+          -scheme PGPonyCore-Package
           -destination 'generic/platform=iOS'
 
+      # PGPonyCore-Package is the scheme Xcode makes for the whole package: both
+      # libraries (PGPonyCore and PGPonyPair) and both test targets.
       # Tests run on a simulator. Don't hardcode a device model — each Xcode ships a
       # different set of iPhone simulators (Xcode 26 has iPhone 17, not iPhone 16), so
       # pick the first available iPhone simulator at runtime. Kept separate from the
@@ -26,7 +28,7 @@ jobs:
           set -euo pipefail
           UDID=$(xcrun simctl list devices available -j | python3 -c "import json,sys; ds=json.load(sys.stdin)['devices']; c=[d['udid'] for r,l in ds.items() if 'iOS' in r for d in l if d.get('isAvailable') and d['name'].startswith('iPhone')]; print(c[0] if c else ''); sys.exit(0 if c else 1)")
           echo "Selected iOS simulator: $UDID"
-          xcodebuild test -scheme PGPonyCore -destination "id=$UDID"
+          xcodebuild test -scheme PGPonyCore-Package -destination "id=$UDID"
 
       - name: Verify no app/platform imports leaked into the core
         run: |

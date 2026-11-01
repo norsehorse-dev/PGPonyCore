@@ -17,15 +17,19 @@
 // `boundComponents` returns the ring with every other subkey removed; callers
 // that pick recipients or attribute signatures read that view.
 //
-// Bindings this code cannot check: an ML-DSA-65 + Ed25519 primary where
-// ML-DSA is unavailable is checked on its Ed25519 half. An Ed448 primary
-// (RFC 9980 algorithm 31), a DSA primary, a LibrePGP v5 key, an ECDSA key on
-// a curve other than P-256/384/521 and a v4 key with algorithm 27 have no
-// verifier here: such a binding counts for encryption and signing only for a
-// subkey the caller lists in `pinnedSubkeys` (one the user accepted), and
-// `newestVerifiedBinding`, what a merge should add subkeys on, never returns
-// it. Whether a binding is uncheckable depends only on the signer's key; a
-// signature naming a hash or version this code cannot handle is invalid.
+// A binding that cannot be checked on this device: an ML-DSA-65 + Ed25519
+// primary where ML-DSA is unavailable is checked on its Ed25519 half, and an
+// ML-DSA-87 + Ed448 primary (RFC 9980 algorithm 31) likewise on its Ed448
+// half (Ed448.swift); where ML-DSA is available both halves are checked.
+// Since 8.4.0, DSA (17) and brainpool ECDSA (19) primaries and subkeys
+// verify (DSABrainpoolVerifier), so their bindings are checked, not pinned. A
+// LibrePGP v5 key other than Ed25519 and Ed448, and an ECDSA key on a curve
+// with no verifier here, have no verifier: such a binding counts for
+// encryption and signing only for a subkey the caller lists in
+// `pinnedSubkeys` (one the user accepted), and `newestVerifiedBinding`, what
+// a merge should add subkeys on, never returns it. Whether a binding is
+// uncheckable depends only on the signer's key; a signature naming a hash or
+// version this code cannot handle is invalid.
 
 import Foundation
 import CryptoKit
@@ -41,6 +45,12 @@ enum CertificateValidator {
         case encrypt
         /// Bound, grants signing, back-signed, not expired.
         case sign
+        /// 8.4.0 build 10 (plan 5m): bound, grants encryption when the binding
+        /// carries key flags, expiry NOT checked. What a decrypt path reads: an
+        /// expired encryption subkey only stops new encryption to it, as in
+        /// gpg 2.4.4, which decrypts with an expired subkey and with a revoked
+        /// one. Revocation is judged by the callers, never here.
+        case decrypt
     }
 
     enum Verdict: Equatable {
@@ -58,8 +68,9 @@ enum CertificateValidator {
         var errorDescription: String? { "This key could not be read." }
     }
 
-    /// Subkeys the user accepted whose binding cannot be checked here (a DSA,
-    /// Ed448, brainpool or LibrePGP v5 primary), by the primary's
+    /// Subkeys the user accepted whose binding cannot be checked here (a
+    /// LibrePGP v5 primary other than Ed25519 and Ed448, or an ECDSA primary
+    /// on a curve with no verifier here), by the primary's
     /// fingerprint. They qualify for `.encrypt` and `.sign` like verified
     /// ones; nothing else with an uncheckable binding does. Empty by default;
     /// an app sets this from its own record of what the user accepted, and
@@ -168,6 +179,10 @@ enum CertificateValidator {
             guard trusted else { return false }
             if let flags, flags & 0x0C == 0 { return false }
             return !isExpired(binding, subkeyBody: subkeyBody, at: date)
+        case .decrypt:
+            guard trusted else { return false }
+            if let flags, flags & 0x0C == 0 { return false }
+            return true
         case .sign:
             guard trusted, let flags, flags & 0x02 != 0 else { return false }
             guard !isExpired(binding, subkeyBody: subkeyBody, at: date) else { return false }
@@ -242,6 +257,103 @@ enum CertificateValidator {
         return false
     }
 
+    // MARK: - Why no encryption subkey (8.4.0 build 9, plan 5l)
+
+    /// 8.4.0 build 9 (plan 5l): what is wrong with a key that has no
+    /// encryption subkey to use, when it does have one the primary bound for
+    /// encryption that is only expired or revoked (a stored copy older than
+    /// the owner's expiry extension, as in a user's report).
+    enum UnusableEncryptionSubkey: Equatable {
+        /// The newest expiry among the expired ones.
+        case expired(Date)
+        case revoked
+    }
+
+    /// Nil when the ring has an encryption subkey that may be used now (or
+    /// none bound for encryption at all, or does not parse): the caller's own
+    /// error stands then. Revoked is reported only when no subkey is merely
+    /// expired, since importing a current copy can fix an expiry.
+    static func unusableEncryptionSubkey(in data: Data, at date: Date = Date()) -> UnusableEncryptionSubkey? {
+        guard let packets = try? OpenPGPPacketParser.parsePackets(data: Array(binary(data))),
+              let primaryIndex = packets.firstIndex(where: { $0.tag == 6 }) else { return nil }
+        let primaryBody = packets[primaryIndex].body
+        let pinned = pinnedSubkeys(fingerprint(ofKeyBody: primaryBody))
+        let revoked = V6KeyGenerator.revokedSubkeyPositions(packets: packets)
+        var newestExpiry: Date?
+        var sawRevoked = false
+        var index = 0
+        while index < packets.count {
+            guard packets[index].tag == 14 else { index += 1; continue }
+            var end = index + 1
+            while end < packets.count, packets[end].tag == 2 || packets[end].tag == 12 { end += 1 }
+            let body = packets[index].body
+            let signatures = packets[(index + 1)..<end].filter { $0.tag == 2 }.map(\.body)
+            defer { index = end }
+            guard let found = newestBinding(subkeyBody: body, signatures: signatures, primaryBody: primaryBody),
+                  found.1 == .valid || pinned.contains(fingerprint(ofKeyBody: body)) else { continue }
+            let binding = found.0
+            if let flags = binding.hashedSubpackets.first(where: { $0.type == 27 })?.data.first,
+               flags & 0x0C == 0 { continue }
+            if revoked.contains(index) { sawRevoked = true; continue }
+            if isExpired(binding, subkeyBody: body, at: date) {
+                if let expiry = expiryDate(binding, subkeyBody: body),
+                   newestExpiry.map({ expiry > $0 }) ?? true { newestExpiry = expiry }
+                continue
+            }
+            // Bound for encryption, trusted, not revoked, not expired.
+            return nil
+        }
+        if let newestExpiry { return .expired(newestExpiry) }
+        return sawRevoked ? .revoked : nil
+    }
+
+    /// 8.4.0 build 11 (plan 5n, Android 4.7.0 item 53): each subkey's expiry as
+    /// its newest binding states it (the one that verifies, else the newest
+    /// this device cannot check), keyed by the subkey's fingerprint in
+    /// lowercase hex. A bound subkey with no expiry maps to nil; a subkey with
+    /// no binding at all is left out.
+    static func subkeyExpiries(in data: Data) -> [String: Date?] {
+        guard let packets = try? OpenPGPPacketParser.parsePackets(data: Array(binary(data))),
+              let primaryIndex = packets.firstIndex(where: { $0.tag == 6 }) else { return [:] }
+        let primaryBody = packets[primaryIndex].body
+        var out: [String: Date?] = [:]
+        var index = 0
+        while index < packets.count {
+            guard packets[index].tag == 14 else { index += 1; continue }
+            var end = index + 1
+            while end < packets.count, packets[end].tag == 2 || packets[end].tag == 12 { end += 1 }
+            let body = packets[index].body
+            let signatures = packets[(index + 1)..<end].filter { $0.tag == 2 }.map(\.body)
+            index = end
+            guard let found = newestBinding(subkeyBody: body, signatures: signatures, primaryBody: primaryBody) else { continue }
+            let fp = fingerprint(ofKeyBody: body).map { String(format: "%02x", $0) }.joined()
+            out[fp] = .some(expiryDate(found.0, subkeyBody: body))
+        }
+        return out
+    }
+
+    /// The plain sentence for `unusableEncryptionSubkey`, or nil.
+    static func unusableEncryptionSubkeyMessage(in data: Data, at date: Date = Date()) -> String? {
+        switch unusableEncryptionSubkey(in: data, at: date) {
+        case .expired(let expiry)?:
+            let when = expiry.formatted(date: .abbreviated, time: .omitted)
+            return String(localized: "This key's encryption subkey expired on \(when). Import a current copy of the key.")
+        case .revoked?:
+            return String(localized: "This key's encryption subkey was revoked by its owner. Ask them for a current copy of the key.")
+        case nil:
+            return nil
+        }
+    }
+
+    private static func expiryDate(_ binding: OpenPGPPacketParser.ParsedSignature, subkeyBody: [UInt8]) -> Date? {
+        guard let sp = binding.hashedSubpackets.first(where: { $0.type == 9 }), sp.data.count == 4,
+              subkeyBody.count >= 5 else { return nil }
+        let seconds = UInt32(sp.data[0]) << 24 | UInt32(sp.data[1]) << 16 | UInt32(sp.data[2]) << 8 | UInt32(sp.data[3])
+        guard seconds > 0 else { return nil }
+        let created = UInt32(subkeyBody[1]) << 24 | UInt32(subkeyBody[2]) << 16 | UInt32(subkeyBody[3]) << 8 | UInt32(subkeyBody[4])
+        return Date(timeIntervalSince1970: Double(created) + Double(seconds))
+    }
+
     private static func isExpired(_ binding: OpenPGPPacketParser.ParsedSignature,
                                   subkeyBody: [UInt8], at date: Date) -> Bool {
         guard let sp = binding.hashedSubpackets.first(where: { $0.type == 9 }), sp.data.count == 4,
@@ -259,14 +371,16 @@ enum CertificateValidator {
     /// taken as the primary's, which is how old GnuPG self-signatures look.
     static func issuedBy(primaryBody: [UInt8], _ sig: OpenPGPPacketParser.ParsedSignature) -> Bool {
         guard let version = primaryBody.first else { return false }
-        let fp = version == 6 ? OpenPGPPacketParser.computeV6Fingerprint(packetBody: primaryBody)
-                              : OpenPGPPacketParser.computeV4Fingerprint(packetBody: primaryBody)
+        // 8.4.0 build 9 (plan 5l): a LibrePGP v5 primary has a 32-octet
+        // fingerprint and a leading key ID, as a v6 one does.
+        let long = version == 6 || version == 5
+        let fp = fingerprint(ofKeyBody: primaryBody)
         if let issuer = sig.issuerFingerprint {
-            return version == 6 ? (issuer.count >= 32 && Array(issuer.prefix(32)) == fp)
-                                : (issuer.count >= 20 && Array(issuer.suffix(20)) == fp)
+            return long ? (issuer.count >= 32 && Array(issuer.prefix(32)) == fp)
+                        : (issuer.count >= 20 && Array(issuer.suffix(20)) == fp)
         }
         if let keyID = sig.issuerKeyID {
-            return keyID == (version == 6 ? Array(fp.prefix(8)) : Array(fp.suffix(8)))
+            return keyID == (long ? Array(fp.prefix(8)) : Array(fp.suffix(8)))
         }
         return true
     }
@@ -307,11 +421,32 @@ enum CertificateValidator {
     // MARK: - Verification by key algorithm
 
     /// Verify `sig` over `document` with the key whose public body is
-    /// `signerBody` (a primary or a subkey). Ed25519 (v4 22, v6 27), ECDSA on
-    /// the NIST curves (19), RSA (1, 3), composite ML-DSA-65 + Ed25519 (30).
+    /// `signerBody` (a primary or a subkey). Ed25519 (v4 22, v4 and v6 27), ECDSA on
+    /// the NIST curves (19), RSA (1, 3), composite ML-DSA-65 + Ed25519 (30) and,
+    /// since 8.4.0 build 8, ML-DSA-87 + Ed448 (31),
+    /// and since 8.4.0 build 7 DSA (17) and ECDSA on the brainpool curves (19).
     static func verify(_ sig: OpenPGPPacketParser.ParsedSignature, signerBody: [UInt8], document: [UInt8]) -> Verdict {
         guard let version = signerBody.first, signerBody.count > 5 else { return .invalid }
-        if version == 5 { return .uncheckable }
+        // 8.4.0 build 9 (plan 5l): Ed448 signers, a LibrePGP v5 key
+        // (algorithm 22 with the Ed448 OID, v5 signatures) or an RFC 9580 one
+        // (algorithm 28), and a v5 Ed25519 key. Other v5 keys stay uncheckable.
+        if let c = OpenPGP448.component(keyBody: signerBody), c.curve == .ed448 {
+            guard sig.version == version, sig.publicKeyAlgorithm == c.algorithm else { return .invalid }
+            return OpenPGP448.verify(sig, document: document, publicKey: c.publicKey) ? .valid : .invalid
+        }
+        if version == 5 {
+            guard signerBody[5] == 22, sig.version == 5, sig.publicKeyAlgorithm == 22, signerBody.count > 11 else {
+                return .uncheckable
+            }
+            let oidLength = Int(signerBody[10])
+            guard 11 + oidLength <= signerBody.count,
+                  Array(signerBody[11..<(11 + oidLength)]) == Self.ed25519LegacyOID else { return .uncheckable }
+            var offset = 11 + oidLength
+            guard var point = readMPI(signerBody, &offset), point.count == 33, point.first == 0x40 else { return .invalid }
+            point.removeFirst()
+            return bool(try? OpenPGPPacketParser.verifyEd25519Signature(
+                signature: sig, document: document, publicKey: point))
+        }
         guard version == 4 || version == 6 else { return .invalid }
         guard sig.version == version else { return .invalid }
         let algorithm = signerBody[5]
@@ -323,24 +458,37 @@ enum CertificateValidator {
         case 1, 3:
             return verifyRSA(sig, document: document, keyBody: signerBody) ? .valid : .invalid
         case 27:
-            if version == 4 { return .uncheckable }
-            guard signerBody.count >= 42 else { return .invalid }
+            // The 32-octet point follows the algorithm octet on a v4 key
+            // (RFC 9580 5.5.2.3, the RFC 9980 A.2 shape); a v6 key puts its
+            // four-octet key material length first.
+            let start = version == 4 ? 6 : 10
+            guard signerBody.count >= start + 32 else { return .invalid }
             return bool(try? OpenPGPPacketParser.verifyEd25519Signature(
-                signature: sig, document: document, publicKey: Array(signerBody[10..<42])))
-        case 30:
+                signature: sig, document: document, publicKey: Array(signerBody[start..<(start + 32)])))
+        case 30, 31:
+            // 8.4.0 build 8 (plan 2): algorithm 31 verifies like 30, its Ed448
+            // half through Ed448.swift (bindings, back-signatures and
+            // certifications all come through here).
             guard let material = CompositeSignSuite.publicMaterial(fromKeyPacketBody: signerBody)?.material else { return .invalid }
             return bool(try? OpenPGPPacketParser.verifyEd25519Signature(
                 signature: sig, document: document, publicKey: material,
                 compositeClassicalHalfWhenUnavailable: true))
-        case 31:
-            return .uncheckable
+        case 17:
+            // 8.4.0 build 7 (plan K4): DSA, v4 keys only (RFC 9580 has no v6 DSA).
+            guard version == 4, let verified = DSABrainpoolVerifier.verify(sig, document: document, keyBody: signerBody) else {
+                return .invalid
+            }
+            return verified ? .valid : .invalid
         case 22, 19:
             guard version == 4, signerBody.count > 7 else { return .invalid }
             let oidLength = Int(signerBody[6])
             guard 7 + oidLength <= signerBody.count else { return .invalid }
             let oid = Array(signerBody[7..<(7 + oidLength)])
             if algorithm == 19, ![NISTCurve.p256, .p384, .p521].contains(where: { $0.oid == oid }) {
-                return .uncheckable
+                // 8.4.0 build 7 (plan K3, K4): brainpool ECDSA verifies here;
+                // any other curve (secp256k1 and the like) stays uncheckable.
+                guard BrainpoolCurve.forOID(oid) != nil else { return .uncheckable }
+                return DSABrainpoolVerifier.verify(sig, document: document, keyBody: signerBody) == true ? .valid : .invalid
             }
             if algorithm == 22, oid != Self.ed25519LegacyOID { return .uncheckable }
             var offset = 7 + oidLength

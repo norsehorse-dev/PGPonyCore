@@ -30,11 +30,11 @@ enum LibrePGPDecryptService {
 
         var errorDescription: String? {
             switch self {
-            case .noCompositeSubkey: return "No LibrePGP ML-KEM+X25519 secret subkey found"
-            case .noPKESK:           return "No LibrePGP (algorithm 8) PKESK in the message"
-            case .malformed(let m):  return "Malformed LibrePGP data: \(m)"
-            case .passphraseRequired: return "This LibrePGP key is passphrase-protected"
-            case .invalidPassphrase:  return "Incorrect passphrase for this LibrePGP key"
+            case .noCompositeSubkey: return String(localized: "No LibrePGP ML-KEM+X25519 secret subkey found")
+            case .noPKESK:           return String(localized: "No LibrePGP (algorithm 8) PKESK in the message")
+            case .malformed(let m):  return String(localized: "Malformed LibrePGP data: \(m)")
+            case .passphraseRequired: return String(localized: "This LibrePGP key is passphrase-protected")
+            case .invalidPassphrase:  return String(localized: "Incorrect passphrase for this LibrePGP key")
             case .foreignSecretFormat:
                 return String(localized: "This key's private material was exported by GnuPG in its internal format, which PGPony can't use to decrypt. Use a LibrePGP key generated in PGPony.")
             }
@@ -47,8 +47,8 @@ enum LibrePGPDecryptService {
     struct DecryptionKey {
         let keyID: [UInt8]          // leading 8 octets of the v5 fingerprint
         let v5Fingerprint: [UInt8]  // 32 octets
-        let eccPublic: [UInt8]      // recipient ECC public (R): 32 or 56
-        let eccSecret: [UInt8]      // raw ECC scalar: 32 or 56
+        let eccPublic: [UInt8]      // recipient ECC public (R): 32 or 56, or a 65 / 97 brainpool point
+        let eccSecret: [UInt8]      // raw ECC scalar: 32 or 56, or 32 / 48 for brainpool
         let mlkemSeed: [UInt8]      // 64-octet ML-KEM seed (d‖z)
         let suite: LibrePGPSuite
 
@@ -193,7 +193,7 @@ enum LibrePGPDecryptService {
         let ptBits = Int(body[p]) << 8 | Int(body[p+1]); p += 2
         let ptBytes = (ptBits + 7) / 8
         guard p + ptBytes <= matStart + keyMatLen, ptBytes >= 1,
-              ptBytes <= suite.eccKeyBytes + 1 else { return nil }
+              ptBytes <= suite.eccPointBytes + 1 else { return nil }
         let eccPoint = suite.normalizePoint(Array(body[p..<(p + ptBytes)]))
 
         o = matStart + keyMatLen
@@ -260,7 +260,7 @@ enum LibrePGPDecryptService {
                 secret = material
             }
         } else {
-            throw Failure.malformed("unsupported S2K usage \(usage)")
+            throw Failure.malformed(String(localized: "unsupported S2K usage \(String(describing: usage))"))
         }
 
         return DecryptionKey(
@@ -288,27 +288,27 @@ enum LibrePGPDecryptService {
     ///     ‖ sessionKeyAlgo(1) ‖ wrappedKeyLen(1) ‖ wrappedKey.
     private static func parsePKESK(_ b: [UInt8]) throws -> PKESK {
         var o = 0
-        guard b.count > 11, b[o] == 3 else { throw Failure.malformed("expected v3 PKESK") }
+        guard b.count > 11, b[o] == 3 else { throw Failure.malformed(String(localized: "expected v3 PKESK")) }
         o += 1
         let keyID = Array(b[o..<(o + 8)]); o += 8
-        guard b[o] == 8 else { throw Failure.malformed("PKESK is not algorithm 8") }
+        guard b[o] == 8 else { throw Failure.malformed(String(localized: "PKESK is not algorithm 8")) }
         o += 1
 
-        guard o + 2 <= b.count else { throw Failure.malformed("truncated ecc length") }
+        guard o + 2 <= b.count else { throw Failure.malformed(String(localized: "truncated ecc length")) }
         let bits = Int(b[o]) << 8 | Int(b[o+1]); o += 2
         let nBytes = (bits + 7) / 8
-        guard o + nBytes <= b.count else { throw Failure.malformed("truncated ecc ciphertext") }
+        guard o + nBytes <= b.count else { throw Failure.malformed(String(localized: "truncated ecc ciphertext")) }
         let eccCT = Array(b[o..<(o + nBytes)]); o += nBytes
 
-        guard o + 4 <= b.count else { throw Failure.malformed("truncated ML-KEM length") }
+        guard o + 4 <= b.count else { throw Failure.malformed(String(localized: "truncated ML-KEM length")) }
         let mLen = Int(b[o]) << 24 | Int(b[o+1]) << 16 | Int(b[o+2]) << 8 | Int(b[o+3]); o += 4
-        guard o + mLen <= b.count else { throw Failure.malformed("truncated ML-KEM ciphertext") }
+        guard o + mLen <= b.count else { throw Failure.malformed(String(localized: "truncated ML-KEM ciphertext")) }
         let mlkemCT = Array(b[o..<(o + mLen)]); o += mLen
 
-        guard o + 2 <= b.count else { throw Failure.malformed("truncated wrapped key header") }
+        guard o + 2 <= b.count else { throw Failure.malformed(String(localized: "truncated wrapped key header")) }
         let symAlgo = b[o]; o += 1
         let wLen = Int(b[o]); o += 1
-        guard o + wLen <= b.count else { throw Failure.malformed("truncated wrapped key") }
+        guard o + wLen <= b.count else { throw Failure.malformed(String(localized: "truncated wrapped key")) }
         let wrapped = Array(b[o..<(o + wLen)])
 
         return PKESK(keyID: keyID, eccCipherText: eccCT, mlkemCipherText: mlkemCT,
@@ -327,16 +327,27 @@ enum LibrePGPDecryptService {
         case .ky768_cv25519:
             let priv: Curve25519.KeyAgreement.PrivateKey
             do { priv = try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: Data(key.eccSecret)) }
-            catch { throw Failure.malformed("invalid X25519 secret") }
+            catch { throw Failure.malformed(String(localized: "invalid X25519 secret")) }
             let ephemeral: Curve25519.KeyAgreement.PublicKey
             do { ephemeral = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: Data(eccCT)) }
-            catch { throw Failure.malformed("invalid X25519 ephemeral public") }
+            catch { throw Failure.malformed(String(localized: "invalid X25519 ephemeral public")) }
             rawECDH = try priv.sharedSecretFromKeyAgreement(with: ephemeral).withUnsafeBytes { Array($0) }
         case .ky1024_cv448:
             do {
                 rawECDH = [UInt8](try X448.sharedSecret(privateKey: Data(key.eccSecret),
                                                         publicKey: Data(eccCT)))
-            } catch { throw Failure.malformed("X448 agreement failed") }
+            } catch { throw Failure.malformed(String(localized: "X448 agreement failed")) }
+        case .ky768_bp256, .ky1024_bp384:
+            // 8.4.0 build 7 wave 2 (plan K3): ECDH on the brainpool curve. The
+            // ephemeral must be an uncompressed point on the curve (checked
+            // before the secret scalar is used); the raw ECDH input to the KDF
+            // is the whole uncompressed shared point, as gpg computes it.
+            guard let curve = suite.brainpoolCurve else {
+                throw Failure.malformed(String(localized: "brainpool agreement failed"))
+            }
+            do {
+                rawECDH = try BrainpoolECDH.sharedPoint(curve: curve, scalar: key.eccSecret, peerPoint: eccCT)
+            } catch { throw Failure.malformed(String(localized: "brainpool agreement failed")) }
         }
 
         // ML-KEM decapsulation using the seed-derived secret key.

@@ -102,10 +102,20 @@ struct OpenPGPCardInfo {
     let kdfEnabled: Bool
     /// Human-readable KDF parameters ("SHA-256, 100000 iterations") or "Off".
     let kdfDescription: String?
+    /// 8.4.0 build 10 (plan 5m): the signing slot's whole algorithm attributes
+    /// (DO C1: algorithm ID, then the curve OID for ECC), so an ECDSA key's
+    /// curve, and with it the signature's hash, is known. A `var` with a
+    /// default so the memberwise initializer keeps working without it.
+    var signAlgoAttributes: [UInt8]? = nil
 
     /// The on-card signing algorithm mapped to the packet shape CardSigner can
-    /// build, or nil if absent/unsupported.
+    /// build, or nil if absent/unsupported. 8.4.0 build 10 (plan 5m): read from
+    /// the full attributes first, which is the only way to name an ECDSA
+    /// key's curve; the bare algorithm ID covers EdDSA and RSA as before.
     var signatureAlgorithm: CardSignatureAlgorithm? {
+        if let signAlgoAttributes, let algorithm = CardSignatureAlgorithm(attributes: signAlgoAttributes) {
+            return algorithm
+        }
         guard let signAlgoID else { return nil }
         return CardSignatureAlgorithm(cardAlgoID: signAlgoID)
     }
@@ -137,28 +147,49 @@ enum OpenPGPCardPIN {
 /// The signature-packet shape CardSigner builds for an on-card signing key,
 /// selected from the card's signature algorithm attribute (the first byte of the
 /// C1 DO). EdDSA is two MPIs (R, S) over a bare digest; RSA is a single MPI over
-/// a PKCS#1 v1.5 DigestInfo.
+/// a PKCS#1 v1.5 DigestInfo. 8.4.0 build 10 (plan 5m): ECDSA on a NIST curve is
+/// two MPIs (r, s) over the hash, which follows the curve (SHA-256, SHA-384,
+/// SHA-512); the helpers that pick the hash and split the card's output are in
+/// CardSigner.swift.
 enum CardSignatureAlgorithm: Equatable {
     case eddsa   // algo 22 (Ed25519) — bare digest in, 64-byte R||S out
     case rsa     // algo 1 (RSA) — DigestInfo in, modulus-length value out
+    /// 8.4.0 build 10 (plan 5m): algo 19 (ECDSA) on P-256, P-384 or P-521. The
+    /// hash in (truncated to the curve's size, OpenPGP card spec 3.4), r || s
+    /// out, each half the curve's field size.
+    case ecdsa(NISTCurve)
 
     /// OpenPGP public-key algorithm ID used in the v4 signature packet trailer.
     var packetAlgorithmID: UInt8 {
         switch self {
         case .eddsa: return 22
         case .rsa:   return 1
+        case .ecdsa: return 19
         }
     }
 
     /// Map a raw OpenPGP-card algorithm-attribute ID (first byte of the C1
-    /// signature DO) to the packet shape. Returns nil for algorithms PGPony's
-    /// card signer doesn't build yet (e.g. ECDSA).
+    /// signature DO) to the packet shape. Returns nil for ECDSA, whose curve
+    /// the ID alone does not name: use `init?(attributes:)` for that.
     init?(cardAlgoID: UInt8) {
         switch cardAlgoID {
         case 0x16: self = .eddsa   // 22
         case 0x01: self = .rsa     // 1
         default:   return nil
         }
+    }
+
+    /// 8.4.0 build 10 (plan 5m): map the whole C1 attributes. ECDSA (0x13) on a
+    /// NIST curve becomes `.ecdsa`; ECDSA on brainpool or secp256k1 stays nil,
+    /// as PGPony does not sign with those. Other IDs as `init?(cardAlgoID:)`.
+    init?(attributes: [UInt8]) {
+        guard let algoID = attributes.first else { return nil }
+        if algoID == 0x13 {
+            guard let curve = CardAlgorithmAttributes.nistCurve(attributes) else { return nil }
+            self = .ecdsa(curve)
+            return
+        }
+        self.init(cardAlgoID: algoID)
     }
 }
 
@@ -214,7 +245,7 @@ enum OpenPGPCardError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .nfcUnavailable:
-            return "This device can't read NFC hardware keys, or NFC is unavailable right now."
+            return String(localized: "This device can't read NFC hardware keys, or NFC is unavailable right now.")
         case .usbSmartCardUnavailable:
             return String(localized: "This device can't use a USB-C hardware key. That needs iOS or iPadOS 16 or later.")
         case .usbKeyNotAttached:
@@ -227,11 +258,20 @@ enum OpenPGPCardError: LocalizedError {
         case .noTransportAvailable:
             return String(localized: "No way to reach a hardware key. Plug a USB-C key into this device, or use a device that supports NFC.")
         case .notISO7816:
-            return "That tag isn't an OpenPGP smart card."
+            return String(localized: "That tag isn't an OpenPGP smart card.")
         case .appletNotFound:
-            return String(localized: "No OpenPGP application was found on the card.")
+            // 8.4.0 build 7 (Android 4.7.0 item 29): over NFC, a SELECT that
+            // fails is most often a key that turns OpenPGP off over NFC (the
+            // Nitrokey 3 does); say so and point to USB-C where it exists.
+            let overNFC = CardTransportAvailability.isUSBSmartCardAvailable
+                ? String(localized: "This key did not open its OpenPGP application over NFC. Some keys, the Nitrokey 3 among them, turn OpenPGP off over NFC. If your key has USB-C, plug it in and try again.")
+                : String(localized: "This key did not open its OpenPGP application over NFC. Some keys, the Nitrokey 3 among them, turn OpenPGP off over NFC. Such a key works over USB-C on a device that supports it.")
+            return CardConnectionCopy.prompt(
+                nfc: overNFC,
+                usb: String(localized: "No OpenPGP application was found on the card.")
+            )
         case .unexpectedStatus(let sw1, let sw2):
-            return String(format: "The card returned an unexpected status (0x%02X%02X).", sw1, sw2)
+            return String(format: String(localized: "The card returned an unexpected status (0x%02X%02X)."), sw1, sw2)
         case .pinBlocked:
             return String(localized: "This PIN is blocked: the card refused it too many times. Unblock it with your admin PIN (PW3) or your reset code. Your keys are not lost.")
         case .wrongPIN(let n):
@@ -253,9 +293,9 @@ enum OpenPGPCardError: LocalizedError {
         case .storedPINUnavailable:
             return String(localized: "No PIN is remembered for this key. Enter its PIN once and it can be remembered.")
         case .malformedResponse:
-            return "The card's response could not be understood."
+            return String(localized: "The card's response could not be understood.")
         case .sessionClosed:
-            return "The card session is no longer active. Tap your key again."
+            return String(localized: "The card session is no longer active. Tap your key again.")
         case .connectionLost:
             // v8.1.0: was NFC wording unconditionally. A tester on USB-C was
             // told to hold his key against the phone and tap.
@@ -264,7 +304,7 @@ enum OpenPGPCardError: LocalizedError {
                 usb: String(localized: "The card connection dropped before the operation finished. Check the key is firmly in the USB-C port and try again.")
             )
         case .changeNotCommitted:
-            return "The card reported the PIN change but the new PIN didn't verify, so it may not have saved. Hold the key steady and try again."
+            return String(localized: "The card reported the PIN change but the new PIN didn't verify, so it may not have saved. Hold the key steady and try again.")
         case .pinTooLong(let maximum):
             return String(localized: "That PIN is longer than this card accepts (maximum \(maximum) characters). It wasn't sent, so no attempt was used.")
         case .kdfUnsupported:
@@ -598,9 +638,9 @@ final class OpenPGPCardService {
         func uif(_ tag: UInt16) -> String? {
             guard let d = BERTLV.find(tag, in: data), let b = d.first else { return nil }
             switch b {
-            case 0x00: return "Off"
-            case 0x01: return "On"
-            case 0x02: return "On (fixed)"
+            case 0x00: return String(localized: "Off")
+            case 0x01: return String(localized: "On")
+            case 0x02: return String(localized: "On (fixed)")
             default:   return nil
             }
         }
@@ -645,7 +685,8 @@ final class OpenPGPCardService {
             touchPolicyAuth: uif(0x00D8),
             signatureCounter: sigCounter,
             kdfEnabled: kdf?.isEnabled ?? false,
-            kdfDescription: kdf?.displayDescription
+            kdfDescription: kdf?.displayDescription,
+            signAlgoAttributes: algoSig
         )
     }
 
@@ -861,18 +902,110 @@ final class OpenPGPCardService {
     /// SHA-256 is ~51 bytes, so the input fits one short APDU; `transmitChained`
     /// is used for symmetry and to stay correct if a longer hash is ever passed.
     ///
-    /// The response is requested with an extended-length Le (512). An RSA-4096
-    /// signature is 512 bytes — too large for a single short-APDU response — and
+    /// The response length asked for follows the signing key's size. An RSA-4096
+    /// signature is 512 bytes, too large for a single short-APDU response, and
     /// the Yubico/Token2 OpenPGP applets expect extended length for it (the same
-    /// thing scdaemon uses). Requesting more than the modulus length is fine: the
-    /// card returns exactly its signature bytes with 0x9000.
+    /// thing scdaemon uses), so keys over 2048 bits ask for 512 with an extended
+    /// Le. 8.4.0 build 7 (a user report, YubiKey NEO over NFC): an OpenPGP 2.0
+    /// applet refuses an extended Le with 0x6700, so keys up to 2048 bits (a
+    /// 256-byte signature) ask with a short Le of 256, which every card takes.
     func signRSA(digestInfo: [UInt8]) async throws -> [UInt8] {
+        let le = Self.rsaSignatureLe(modulusBits: await signingKeyModulusBits())
         let (data, sw1, sw2) = try await transmitChained(
             instructionCode: 0x2A, p1Parameter: 0x9E, p2Parameter: 0x9A,
-            data: digestInfo, expectedResponseLength: 512
+            data: digestInfo, expectedResponseLength: le
         )
         guard sw1 == 0x90, sw2 == 0x00 else { throw OpenPGPCardError.unexpectedStatus(sw1, sw2) }
         return data
+    }
+
+    /// 8.4.0 build 10 (plan 5m): PSO:COMPUTE DIGITAL SIGNATURE for whichever
+    /// algorithm the signing slot holds, over a digest made with
+    /// `algorithm.hashAlgorithmID`. Formats the input as the algorithm needs (the
+    /// bare digest for EdDSA, a PKCS#1 v1.5 DigestInfo for RSA, the hash cut to
+    /// the curve's size for ECDSA) and returns the card's raw output, which
+    /// `algorithm.signatureMPIs(fromCardOutput:)` turns into the packet's MPIs.
+    /// PW1 (mode `.signing`) must already be verified.
+    func signDigest(_ digest: [UInt8], algorithm: CardSignatureAlgorithm) async throws -> [UInt8] {
+        switch algorithm {
+        case .eddsa:
+            return try await sign(digest: digest)
+        case .rsa:
+            return try await signRSA(digestInfo: CardSigner.sha256DigestInfo(digest))
+        case .ecdsa(let curve):
+            return try await signECDSA(digest: digest, curve: curve)
+        }
+    }
+
+    /// 8.4.0 build 10 (plan 5m): PSO:COMPUTE DIGITAL SIGNATURE for an ECDSA key
+    /// on a NIST curve. The OpenPGP card spec 3.4 (7.2.10) takes the hash as
+    /// the command data, no DigestInfo, and a hash longer than the curve is cut
+    /// to its leftmost field-size octets, as GnuPG's agent does before it hands
+    /// the hash to scdaemon. The natural hashes (SHA-256 on P-256, SHA-384 on
+    /// P-384, SHA-512 on P-521) are never longer, so nothing is cut today. The
+    /// card answers r || s, each the field size (64, 96 or 132 octets), which a
+    /// short Le of 256 covers. The curve comes from the slot's own attributes
+    /// (C1, read as build 7 reads the RSA size) when the card serves them, so
+    /// the cut and the length check follow the key actually in the slot.
+    func signECDSA(digest: [UInt8], curve: NISTCurve) async throws -> [UInt8] {
+        var slotCurve = curve
+        if let attributes = await signingKeyAttributes(),
+           case .ecdsa(let onCard)? = CardSignatureAlgorithm(attributes: attributes) {
+            slotCurve = onCard
+        }
+        let input = CardSignatureAlgorithm.ecdsa(slotCurve).cardInput(forDigest: digest)
+        let apdu = APDU(
+            instructionClass: 0x00, instructionCode: 0x2A,
+            p1Parameter: 0x9E, p2Parameter: 0x9A,
+            data: Data(input), expectedResponseLength: 256
+        )
+        let (data, sw1, sw2) = try await transmit(apdu)
+        guard sw1 == 0x90, sw2 == 0x00 else { throw OpenPGPCardError.unexpectedStatus(sw1, sw2) }
+        return data
+    }
+
+    /// 8.4.0 build 7: the Le for PSO:COMPUTE DIGITAL SIGNATURE with an RSA key
+    /// of `modulusBits`. Unknown size keeps the 512 extended Le of earlier builds.
+    static func rsaSignatureLe(modulusBits: Int?) -> Int {
+        guard let modulusBits, modulusBits > 0 else { return 512 }
+        return modulusBits <= 2048 ? 256 : 512
+    }
+
+    /// 8.4.0 build 7: the signing slot's RSA modulus size from its algorithm
+    /// attributes (DO C1: 01, n bits, e bits, format), read directly and, if the
+    /// card does not serve C1 on its own, from the application related data
+    /// (6E). GET DATA does not touch the PIN state, so a card that wants the PIN
+    /// for every signature still signs once after it. Nil when neither answers.
+    func signingKeyModulusBits() async -> Int? {
+        guard let attr = await signingKeyAttributes(), attr.count >= 3, attr[0] == 0x01 else { return nil }
+        return Int(attr[1]) << 8 | Int(attr[2])
+    }
+
+    /// 8.4.0 build 10 (plan 5m): the signing slot's algorithm attributes (DO
+    /// C1), read directly and, if the card does not serve C1 on its own, from
+    /// the application related data (6E). Split out of build 7's
+    /// `signingKeyModulusBits` so the ECDSA path reads the curve OID the same
+    /// way. GET DATA leaves the PIN state alone. Nil when neither answers.
+    func signingKeyAttributes() async -> [UInt8]? {
+        let direct = APDU(
+            instructionClass: 0x00, instructionCode: 0xCA,
+            p1Parameter: 0x00, p2Parameter: 0xC1,
+            data: Data(), expectedResponseLength: 256
+        )
+        if let reply = try? await transmit(direct), reply.sw1 == 0x90, reply.sw2 == 0x00,
+           !reply.data.isEmpty {
+            return reply.data
+        }
+        let related = APDU(
+            instructionClass: 0x00, instructionCode: 0xCA,
+            p1Parameter: 0x00, p2Parameter: 0x6E,
+            data: Data(), expectedResponseLength: 256
+        )
+        if let reply = try? await transmit(related), reply.sw1 == 0x90, reply.sw2 == 0x00,
+           let attr = BERTLV.find(0x00C1, in: reply.data), !attr.isEmpty {
+            return attr
+        }
+        return nil
     }
 
     /// PSO:DECIPHER for a Curve25519 (cv25519) ECDH key. Assumes PW1 (mode
@@ -1249,7 +1382,7 @@ final class OpenPGPCardService {
         case 0x1337: return "Warsaw Hackerspace"
         case 0x63AF: return "Trustica"
         case 0xFFFF: return "Test card"
-        default:     return String(format: "Manufacturer 0x%04X", id)
+        default:     return String(format: String(localized: "Manufacturer 0x%04X"), id)
         }
     }
 
@@ -1462,9 +1595,17 @@ final class CardPINCache {
         return true
     }
 
+    /// 8.4.0 build 9 (plan 5l): the app's PIN mode check (OwnerCheck), set by
+    /// the app at launch; nil in the extensions. It answers nil outside PIN
+    /// mode, and then the device check below runs as before.
+    static var pinModeGate: ((String) async -> Bool?)? = nil
+
     /// Face ID / Touch ID with passcode fallback. False on any failure or
-    /// cancel, which the caller turns into the ordinary PIN prompt.
+    /// cancel, which the caller turns into the ordinary PIN prompt. In PIN
+    /// mode (8.4.0 build 9, plan 5l) the PGPony PIN instead, never the
+    /// device passcode.
     static func authenticate(reason: String) async -> Bool {
+        if let gate = pinModeGate, let answer = await gate(reason) { return answer }
         let context = LAContext()
         var error: NSError?
         guard context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &error) else { return false }
@@ -1743,7 +1884,7 @@ enum CardPINKeychain {
 
 /// The passphrase twin of `CardPINCache`, colocated with it because they are the
 /// same mechanism for two secret kinds: an in-memory, never-persisted cache
-/// bounded only by the chosen duration. §4.6 posture decision (Kevin): software
+/// bounded only by the chosen duration. §4.6 posture decision: software
 /// key passphrases mirror the card-PIN posture rather than going to the Keychain,
 /// because a passphrase written to disk beside its key would collapse two factors
 /// into one. It reuses `CardPINCache.Mode` so the duration options and labels stay

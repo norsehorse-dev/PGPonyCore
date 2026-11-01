@@ -39,8 +39,10 @@ enum KeyAlgorithm: String, Codable, CaseIterable {
     // 8.3.0 (planning 4.1, Android 4.4.0): RFC 9980 composite SIGNATURE
     // primaries (algorithms 30 and 31). The whole key is post-quantum: an
     // ML-DSA + EdDSA primary that certifies and signs, with an ML-KEM
-    // composite encryption subkey. 65 is generated (iOS 26 provides ML-DSA);
-    // 87 imports and labels only, its Ed448 half having no implementation here.
+    // composite encryption subkey. 65 is generated (iOS 26 provides ML-DSA).
+    // 8.4.0 build 8 (Android 4.6.0 item 3): 87 is generated too, as the
+    // explicit stronger tier with an ML-KEM-1024 + X448 subkey; its Ed448
+    // half is Ed448.swift.
     case v6MLDSA65 = "ML-DSA-65+Ed25519 (v6)"
     case v6MLDSA87 = "ML-DSA-87+Ed448 (v6)"
     // 8.3.0 (planning 4.3, Android 4.5.0 item 14): the v4 interop shape. A
@@ -52,15 +54,29 @@ enum KeyAlgorithm: String, Codable, CaseIterable {
     case librePGPKyber = "ML-KEM-768+X25519 (LibrePGP)"
     // v8.2.0 §1 (K2a): the LibrePGP 1024 form (gpg ky1024_cv448, still algo 8).
     case librePGPKyber1024 = "ML-KEM-1024+X448 (LibrePGP)"
+    // 8.4.0 build 7 wave 2 (plan K3, Android 4.6.0 item 13): gpg's
+    // ky768_bp256, a v4 Ed25519 primary with a v5 algorithm 8 ML-KEM-768 +
+    // brainpoolP256r1 subkey. Generated, encrypted to and decrypted.
+    case librePGPKyberBP256 = "ML-KEM-768+brainpoolP256r1 (LibrePGP)"
+    // 8.4.0 build 7 wave 2 (Android issue #2): gpg's ky1024_bp384, as
+    // Kleopatra makes it. Imported, encrypted to and decrypted; not generated.
+    case librePGPKyberBP384 = "ML-KEM-1024+brainpoolP384r1 (LibrePGP)"
     // 8.3.0 (NIST A to E): the NIST prime curves are usable (ECDSA sign and
     // verify, ECDH encrypt and decrypt, all on CryptoKit), one label each.
     case nistP256 = "NIST P-256"
     case nistP384 = "NIST P-384"
     case nistP521 = "NIST P-521"
-    // v8.2.0 issue #2: recognition only. GnuPG/GPG4WIN keys on brainpool
-    // curves import with a real label instead of being mislabeled as RSA;
-    // PGPony does not sign/encrypt with them (CryptoKit has no brainpool).
+    // v8.2.0 issue #2: GnuPG/GPG4WIN keys on brainpool curves import with a
+    // real label instead of being mislabeled as RSA. 8.4.0 build 7: PGPony
+    // verifies their ECDSA signatures (and decrypts the LibrePGP brainpool
+    // composite, which has its own cases above), but does not sign with a
+    // brainpool key or decrypt classic brainpool ECDH (algorithm 18).
     case otherEC = "EC key"
+    // 8.4.0 build 9 (plan 5l): LibrePGP v5 Ed448 + X448 keys, as GnuPG 2.4
+    // and Kleopatra make them (ed448 / cv448). Imported and used in full;
+    // not generated. The X448 case labels the encryption subkey.
+    case librePGPEd448 = "Ed448+X448 (LibrePGP)"
+    case librePGPX448 = "X448 (LibrePGP)"
     
     // v5.0 Phase 5.1 — wrap each case in String(localized:) so Text(algorithm
     // .displayName) localizes via Localizable.xcstrings. Crypto identifiers
@@ -82,13 +98,17 @@ enum KeyAlgorithm: String, Codable, CaseIterable {
         case .v6MLKEM1024:   return String(localized: "Ed25519 + ML-KEM-1024 (v6, post-quantum)")
         case .librePGPKyber: return String(localized: "Ed25519 + ML-KEM-768 (LibrePGP, post-quantum)")
         case .librePGPKyber1024: return String(localized: "Ed25519 + ML-KEM-1024 (LibrePGP, post-quantum)")
+        case .librePGPKyberBP256: return String(localized: "Ed25519 + ML-KEM-768 + brainpoolP256r1 (LibrePGP, post-quantum)")
+        case .librePGPKyberBP384: return String(localized: "ML-KEM-1024 + brainpoolP384r1 (LibrePGP, post-quantum)")
         case .v4MLKEM768:    return String(localized: "Ed25519 + ML-KEM-768 (v4, post-quantum)")
         case .v6MLDSA65: return String(localized: "ML-DSA-65 + Ed25519 (v6, post-quantum signatures)")
         case .v6MLDSA87: return String(localized: "ML-DSA-87 + Ed448 (v6, post-quantum signatures)")
         case .nistP256: return String(localized: "NIST P-256 (ECDSA + ECDH)")
         case .nistP384: return String(localized: "NIST P-384 (ECDSA + ECDH)")
         case .nistP521: return String(localized: "NIST P-521 (ECDSA + ECDH)")
-        case .otherEC: return String(localized: "EC key (brainpool, recognition only)")
+        case .otherEC: return String(localized: "EC key (brainpool, verify only)")
+        case .librePGPEd448: return String(localized: "Ed448 + X448 (LibrePGP v5)")
+        case .librePGPX448: return String(localized: "X448 (LibrePGP v5)")
         }
     }
 
@@ -107,6 +127,8 @@ enum KeyAlgorithm: String, Codable, CaseIterable {
         case .v6MLKEM1024: return "ML-KEM-1024 v6"
         case .librePGPKyber: return "ML-KEM-768 LibrePGP"
         case .librePGPKyber1024: return "ML-KEM-1024 LibrePGP"
+        case .librePGPKyberBP256: return "ML-KEM-768 bp256 LibrePGP"
+        case .librePGPKyberBP384: return "ML-KEM-1024 bp384 LibrePGP"
         case .v4MLKEM768: return "ML-KEM-768 v4"
         case .v6MLDSA65: return "ML-DSA-65 v6"
         case .v6MLDSA87: return "ML-DSA-87 v6"
@@ -114,6 +136,8 @@ enum KeyAlgorithm: String, Codable, CaseIterable {
         case .nistP384: return "P-384"
         case .nistP521: return "P-521"
         case .otherEC: return "EC"
+        case .librePGPEd448: return "Ed448 v5"
+        case .librePGPX448: return "X448 v5"
         }
     }
     
@@ -127,10 +151,14 @@ enum KeyAlgorithm: String, Codable, CaseIterable {
         // The 1024 composites' classical half is X448, so they group with the
         // 448-bit curves for display purposes.
         case .v6Ed448, .v6X448, .v6MLKEM1024, .librePGPKyber1024, .v6MLDSA87: return 448
+        case .librePGPEd448, .librePGPX448: return 448
         case .nistP256: return 256
         case .nistP384: return 384
         case .nistP521: return 521
-        case .otherEC: return 0   // curve not tracked; recognition only
+        // 8.4.0 build 7 wave 2: the brainpool composites group by their curve.
+        case .librePGPKyberBP256: return 256
+        case .librePGPKyberBP384: return 384
+        case .otherEC: return 0   // curve not tracked
         }
     }
 
@@ -154,7 +182,8 @@ enum KeyAlgorithm: String, Codable, CaseIterable {
     /// composite ML-DSA signature primary, which always carries one).
     var isPostQuantum: Bool {
         switch self {
-        case .v6MLKEM768, .v6MLKEM1024, .librePGPKyber, .librePGPKyber1024, .v6MLDSA65, .v6MLDSA87, .v4MLKEM768: return true
+        case .v6MLKEM768, .v6MLKEM1024, .librePGPKyber, .librePGPKyber1024, .librePGPKyberBP256, .librePGPKyberBP384,
+             .v6MLDSA65, .v6MLDSA87, .v4MLKEM768: return true
         default: return false
         }
     }
@@ -194,12 +223,43 @@ enum KeyAlgorithm: String, Codable, CaseIterable {
     /// KeyAlgorithmTests.testIsLibrePGPCoversBothSuitesOnly.
     var isLibrePGP: Bool {
         switch self {
-        case .librePGPKyber, .librePGPKyber1024:
+        case .librePGPKyber, .librePGPKyber1024, .librePGPKyberBP256, .librePGPKyberBP384:
             return true
         case .rsa2048, .rsa3072, .rsa4096, .rsa8192, .ed25519, .v6Ed25519, .v6X25519, .v6Ed448,
              .v6X448, .v6MLKEM768, .v6MLKEM1024, .v6MLDSA65, .v6MLDSA87, .v4MLKEM768,
-             .nistP256, .nistP384, .nistP521, .otherEC:
+             .nistP256, .nistP384, .nistP521, .otherEC, .librePGPEd448, .librePGPX448:
             return false
+        }
+    }
+
+    /// 8.4.0 build 7 wave 2 (plan K3): the LibrePGP composite suite of a
+    /// LibrePGP case; nil for every other algorithm.
+    var librePGPSuite: LibrePGPSuite? {
+        switch self {
+        case .librePGPKyber: return .ky768_cv25519
+        case .librePGPKyber1024: return .ky1024_cv448
+        case .librePGPKyberBP256: return .ky768_bp256
+        case .librePGPKyberBP384: return .ky1024_bp384
+        default: return nil
+        }
+    }
+
+    /// 8.4.0 build 7 wave 2 (plan K3): the model algorithm of a v5 algorithm 8
+    /// (LibrePGP Kyber) key packet body, by its curve OID (the one thing that
+    /// tells the four suites apart at algorithm 8). Body layout: ver(1)=5 |
+    /// ctime(4) | algo(1)=8 | material length(4) | OID length(1) | OID. Nil
+    /// for anything else; an algorithm 8 packet with an unknown curve reads
+    /// as the 768 X25519 form, as before.
+    static func librePGP(v5KeyPacketBody body: [UInt8]) -> KeyAlgorithm? {
+        guard body.count > 11, body[5] == 8 else { return nil }
+        let oidLength = Int(body[10])
+        guard 11 + oidLength <= body.count,
+              let suite = LibrePGPSuite.fromOidTail(Array(body[11..<(11 + oidLength)])) else { return .librePGPKyber }
+        switch suite {
+        case .ky768_cv25519: return .librePGPKyber
+        case .ky1024_cv448: return .librePGPKyber1024
+        case .ky768_bp256: return .librePGPKyberBP256
+        case .ky1024_bp384: return .librePGPKyberBP384
         }
     }
 
@@ -208,6 +268,16 @@ enum KeyAlgorithm: String, Codable, CaseIterable {
     var usesCv25519: Bool {
         switch self {
         case .ed25519, .v6Ed25519, .v6X25519: return true
+        default: return false
+        }
+    }
+
+    /// 8.4.0 build 9 (plan 5l): an Ed448 / X448 key, LibrePGP v5 or RFC 9580
+    /// v6. Encrypt and sign route these through the native builders
+    /// (ObjectivePGP reads neither form).
+    var uses448: Bool {
+        switch self {
+        case .librePGPEd448, .librePGPX448, .v6Ed448, .v6X448: return true
         default: return false
         }
     }
@@ -266,14 +336,16 @@ enum KeyAlgorithm: String, Codable, CaseIterable {
         // (CryptoKit, iOS 26); on an earlier OS the picker leaves it out and
         // GenerateKeyView says why.
         var postQuantum: [KeyAlgorithm] = [.v4MLKEM768, .v6MLKEM768, .v6MLKEM1024]
-        if MLDSAService.isAvailable { postQuantum.append(.v6MLDSA65) }
+        // 8.4.0 build 8 (Android 4.6.0 item 3): ML-DSA-87 + Ed448 follows
+        // ML-DSA-65, which stays the recommended choice.
+        if MLDSAService.isAvailable { postQuantum.append(contentsOf: [.v6MLDSA65, .v6MLDSA87]) }
         return [
             GeneratableGroup(title: String(localized: "Classical"),
                              algorithms: [.rsa2048, .rsa4096, .ed25519, .v6Ed25519]),
             GeneratableGroup(title: String(localized: "Post-quantum (RFC 9980)"),
                              algorithms: postQuantum),
             GeneratableGroup(title: String(localized: "GnuPG / LibrePGP compatibility"),
-                             algorithms: [.librePGPKyber, .librePGPKyber1024]),
+                             algorithms: [.librePGPKyber, .librePGPKyber1024, .librePGPKyberBP256]),
         ]
     }
 
@@ -321,9 +393,23 @@ enum KeyAlgorithm: String, Codable, CaseIterable {
     static func from(keyPacketBody body: [UInt8]) -> KeyAlgorithm? {
         guard body.count > 6 else { return nil }
         let version = body[0]
+        // 8.4.0 build 9 (plan 5l): Ed448 / X448 in either wire form, and the
+        // other LibrePGP v5 packets by their curve OID.
+        if let c = OpenPGP448.component(keyBody: body) {
+            if c.keyVersion == 6 || c.algorithm == 26 || c.algorithm == 28 {
+                return c.curve == .ed448 ? .v6Ed448 : .v6X448
+            }
+            return c.curve == .ed448 ? .librePGPEd448 : .librePGPX448
+        }
+        if version == 5 {
+            if body[5] == 8 { return librePGP(v5KeyPacketBody: body) }
+            if body[5] == 22 || body[5] == 18 { return .ed25519 }
+            return nil
+        }
         if version == 4, let curve = ECCurve.fromKeyPacketBody(body) {
             // 8.3.0 (NIST E): a NIST curve names its own case; the rest of the
-            // recognition-only family (brainpool) stays the generic EC label.
+            // family (brainpool: verify only, see ECCurve.isRecognitionOnly)
+            // stays the generic EC label.
             if let nist = curve.nistCurve { return nist.keyAlgorithm }
             if curve.isRecognitionOnly { return .otherEC }
         }

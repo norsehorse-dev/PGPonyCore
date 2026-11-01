@@ -95,30 +95,39 @@ class KeyServerService {
 
     /// HKP lookup (RFC 4880 draft-shaw-openpgp-hkp): GET /pks/lookup with
     /// op=get and options=mr; the body is the armored key.
-    func hkpLookup(_ query: String, on server: KeyServer) async throws -> String {
+    /// 8.4.0 build 11 (plan 5n, Android 4.6.0 item 18): the answer gets the
+    /// build 6 check a VKS answer gets. `matching` is the cleaned fingerprint
+    /// or key ID of a fingerprint lookup (the primary or a subkey must be that
+    /// key), nil for a search by email or name.
+    func hkpLookup(_ query: String, matching: String?, on server: KeyServer) async throws -> String {
         try OfflineMode.requireOnline()
         let search = query.hasPrefix("0x") || query.contains("@") ? query : "0x" + query
         let encoded = search.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? search
         guard let url = URL(string: "\(baseURL(for: server))/pks/lookup?op=get&options=mr&search=\(encoded)") else {
-            throw KeyServerError.searchFailed("Invalid URL")
+            throw KeyServerError.searchFailed(String(localized: "Invalid URL"))
         }
         do {
             let (data, response) = try await HTTPSessionFactory.boundedData(session(), from: url)
             guard let http = response as? HTTPURLResponse else { throw KeyServerError.invalidResponse }
-            switch http.statusCode {
-            case 200:
-                guard let armored = String(data: data, encoding: .utf8),
-                      armored.contains("-----BEGIN PGP PUBLIC KEY BLOCK-----") else {
-                    throw KeyServerError.noResults
-                }
-                return armored
-            case 404:
-                throw KeyServerError.noResults
-            default:
-                throw KeyServerError.searchFailed("Server returned status \(http.statusCode)")
-            }
+            return try Self.hkpAnswer(status: http.statusCode, body: data, matching: matching)
         } catch {
             throw connectionError(error, on: server)
+        }
+    }
+
+    /// 8.4.0 build 11 (plan 5n, Android 4.6.0 item 18): what an HKP answer
+    /// means, kept apart from the network so it can be tested. A 200 is a key
+    /// only when `validatedKey` says so: a captive portal, an error page that
+    /// quotes the armor header, or a different key than the one asked for
+    /// reads as "not found".
+    static func hkpAnswer(status: Int, body: Data, matching: String?) throws -> String {
+        switch status {
+        case 200:
+            return try validatedKey(body, matching: matching)
+        case 404:
+            throw KeyServerError.noResults
+        default:
+            throw KeyServerError.searchFailed(String(localized: "Server returned status \(status)"))
         }
     }
 
@@ -128,7 +137,7 @@ class KeyServerService {
     func hkpAdd(_ armoredKey: String, on server: KeyServer) async throws -> UploadVerifyOutcome {
         try OfflineMode.requireOnline()
         guard let url = URL(string: "\(baseURL(for: server))/pks/add") else {
-            throw KeyServerError.uploadFailed("Invalid URL")
+            throw KeyServerError.uploadFailed(String(localized: "Invalid URL"))
         }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -159,13 +168,39 @@ class KeyServerService {
     // MARK: - Search by Email (per-server)
 
     /// Search for a public key by email address on a specific server.
+    /// 8.4.0 build 6 (Android 4.6.0 #18): a 200 answer is a key only when it is
+    /// an armored public key whose first packet is a primary key, and, for a
+    /// lookup by fingerprint or key ID, one of its keys is the one asked for.
+    /// A captive portal or error page answering 200 reads as "not found".
+    static func validatedKey(_ data: Data, matching wanted: String?) throws -> String {
+        guard let text = String(data: data, encoding: .utf8),
+              text.contains("-----BEGIN PGP PUBLIC KEY BLOCK-----"),
+              let raw = try? OpenPGPPacketParser.dearmor(text),
+              let packets = try? OpenPGPPacketParser.parsePackets(data: Array(raw)),
+              packets.first?.tag == 6 else { throw KeyServerError.noResults }
+        if let wanted {
+            let want = wanted.uppercased()
+            let found = packets.contains { packet in
+                guard packet.tag == 6 || packet.tag == 14 else { return false }
+                let fp = CertificateValidator.fingerprint(ofKeyBody: packet.body)
+                    .map { String(format: "%02X", $0) }.joined()
+                if fp == want { return true }
+                guard want.count == 16 else { return false }
+                let keyID = packet.body.first == 4 ? String(fp.suffix(16)) : String(fp.prefix(16))
+                return keyID == want
+            }
+            guard found else { throw KeyServerError.noResults }
+        }
+        return text
+    }
+
     func searchByEmail(_ email: String, on server: KeyServer) async throws -> String {
         try OfflineMode.requireOnline()
         let encodedEmail = email.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? email
         let urlString = "\(baseURL(for: server))/vks/v1/by-email/\(encodedEmail)"
 
         guard let url = URL(string: urlString) else {
-            throw KeyServerError.searchFailed("Invalid URL")
+            throw KeyServerError.searchFailed(String(localized: "Invalid URL"))
         }
 
         do {
@@ -177,24 +212,22 @@ class KeyServerService {
 
             switch httpResponse.statusCode {
             case 200:
-                guard let armoredKey = String(data: data, encoding: .utf8) else {
-                    throw KeyServerError.invalidResponse
-                }
-                return armoredKey
+                // 8.4.0 build 6 (Android 4.6.0 #18): only a real public key counts.
+                return try Self.validatedKey(data, matching: nil)
             case 404:
                 throw KeyServerError.noResults
             default:
-                throw KeyServerError.searchFailed("Server returned status \(httpResponse.statusCode)")
+                throw KeyServerError.searchFailed(String(localized: "Server returned status \(httpResponse.statusCode)"))
             }
         } catch let error as KeyServerError {
             // 8.3.0 (6.2): a custom server may speak HKP only.
             if server.isCustom, case .noResults = error {
-                return try await hkpLookup(email, on: server)
+                return try await hkpLookup(email, matching: nil, on: server)
             }
             throw error
         } catch {
             if server.isCustom, isConnectionFailure(error) {
-                return try await hkpLookup(email, on: server)
+                return try await hkpLookup(email, matching: nil, on: server)
             }
             throw connectionError(error, on: server)
         }
@@ -227,19 +260,19 @@ class KeyServerService {
             endpoint = "by-keyid"
         default:
             throw KeyServerError.searchFailed(
-                "Need a full fingerprint (40 hex characters) or a 16-character key ID. \"\(fingerprint)\" is \(cleanFingerprint.count) characters."
+                String(localized: "Need a full fingerprint (40 hex characters) or a 16-character key ID. \"\(String(describing: fingerprint))\" is \(cleanFingerprint.count) characters.")
             )
         }
 
         // Reject non-hex input early so we don't get a server 400.
         guard cleanFingerprint.allSatisfy({ $0.isHexDigit }) else {
-            throw KeyServerError.searchFailed("Fingerprint must contain only hexadecimal characters (0-9, A-F).")
+            throw KeyServerError.searchFailed(String(localized: "Fingerprint must contain only hexadecimal characters (0-9, A-F)."))
         }
 
         let urlString = "\(baseURL(for: server))/vks/v1/\(endpoint)/\(cleanFingerprint)"
 
         guard let url = URL(string: urlString) else {
-            throw KeyServerError.searchFailed("Invalid URL")
+            throw KeyServerError.searchFailed(String(localized: "Invalid URL"))
         }
 
         do {
@@ -251,24 +284,23 @@ class KeyServerService {
 
             switch httpResponse.statusCode {
             case 200:
-                guard let armoredKey = String(data: data, encoding: .utf8) else {
-                    throw KeyServerError.invalidResponse
-                }
-                return armoredKey
+                // 8.4.0 build 6 (Android 4.6.0 #18): only a real public key that
+                // carries the asked-for fingerprint or key ID counts.
+                return try Self.validatedKey(data, matching: cleanFingerprint)
             case 404:
                 throw KeyServerError.noResults
             default:
-                throw KeyServerError.searchFailed("Server returned status \(httpResponse.statusCode)")
+                throw KeyServerError.searchFailed(String(localized: "Server returned status \(httpResponse.statusCode)"))
             }
         } catch let error as KeyServerError {
             // 8.3.0 (6.2): a custom server may speak HKP only.
             if server.isCustom, case .noResults = error {
-                return try await hkpLookup(cleanFingerprint, on: server)
+                return try await hkpLookup(cleanFingerprint, matching: cleanFingerprint, on: server)
             }
             throw error
         } catch {
             if server.isCustom, isConnectionFailure(error) {
-                return try await hkpLookup(cleanFingerprint, on: server)
+                return try await hkpLookup(cleanFingerprint, matching: cleanFingerprint, on: server)
             }
             throw connectionError(error, on: server)
         }
@@ -288,7 +320,7 @@ class KeyServerService {
         let urlString = "\(baseURL(for: server))/vks/v1/upload"
 
         guard let url = URL(string: urlString) else {
-            throw KeyServerError.uploadFailed("Invalid URL")
+            throw KeyServerError.uploadFailed(String(localized: "Invalid URL"))
         }
 
         var request = URLRequest(url: url)
@@ -301,7 +333,7 @@ class KeyServerService {
         do {
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
         } catch {
-            throw KeyServerError.uploadFailed("Could not encode request body: \(error.localizedDescription)")
+            throw KeyServerError.uploadFailed(String(localized: "Could not encode request body: \(error.localizedDescription)"))
         }
 
         do {
@@ -352,7 +384,7 @@ class KeyServerService {
         let urlString = "\(baseURL(for: server))/vks/v1/request-verify"
 
         guard let url = URL(string: urlString) else {
-            throw KeyServerError.uploadFailed("Invalid URL")
+            throw KeyServerError.uploadFailed(String(localized: "Invalid URL"))
         }
 
         var request = URLRequest(url: url)
@@ -370,7 +402,7 @@ class KeyServerService {
 
             guard let httpResponse = response as? HTTPURLResponse,
                   httpResponse.statusCode == 200 else {
-                throw KeyServerError.uploadFailed("Verification request failed")
+                throw KeyServerError.uploadFailed(String(localized: "Verification request failed"))
             }
         } catch let error as KeyServerError {
             throw error
@@ -449,6 +481,10 @@ class KeyServerService {
         guard !servers.isEmpty else { throw KeyServerError.noResults }
 
         var lastError: Error = KeyServerError.noResults
+        // 8.4.0 build 6 (Android 4.7.0 #60): a server that answered "not found"
+        // wins over another's network error, so the result does not depend on
+        // which server was asked last.
+        var sawNotFound = false
         for server in servers {
             do {
                 switch kind {
@@ -458,15 +494,37 @@ class KeyServerService {
                     return try await searchByFingerprint(query, on: server)
                 }
             } catch KeyServerError.noResults {
-                lastError = KeyServerError.noResults
+                sawNotFound = true
                 continue
             } catch {
-                // Network / server error on this server — remember it but keep
+                // Network / server error on this server: remember it but keep
                 // trying the others so one flaky server doesn't block a lookup.
                 lastError = error
                 continue
             }
         }
+        throw sawNotFound ? KeyServerError.noResults : lastError
+    }
+
+    /// 8.4.0 build 6 (Android 4.7.0 #60): Check Key Server. Found on the first
+    /// server that has the key, else not found on the first server that
+    /// answered; throws only when no server answered at all.
+    func checkAcrossServers(_ fingerprint: String) async throws -> (found: Bool, server: String) {
+        let servers = KeyServerRegistry.lookupServers()
+        guard !servers.isEmpty else { throw KeyServerError.noResults }
+        var lastError: Error = KeyServerError.noResults
+        var notFoundOn: String?
+        for server in servers {
+            do {
+                _ = try await searchByFingerprint(fingerprint, on: server)
+                return (true, server.name)
+            } catch KeyServerError.noResults {
+                if notFoundOn == nil { notFoundOn = server.name }
+            } catch {
+                lastError = error
+            }
+        }
+        if let notFoundOn { return (false, notFoundOn) }
         throw lastError
     }
 
@@ -581,5 +639,39 @@ extension KeyServerService {
             return String(localized: "The server rejected the upload (status \(status)).")
         }
         return "Status \(status): \(text.prefix(200))"
+    }
+}
+
+/// 8.4.0 build 6 (Android 4.7.0 #60): the last Check Key Server answer per
+/// key, the server and whether it had the key, shown next to Last checked.
+/// The date stays on the model (`lastCheckedAt`).
+enum KeyServerCheckStore {
+    struct Entry: Codable, Equatable {
+        let server: String
+        let found: Bool
+    }
+
+    private static let storageKey = "pgpony_keyserver_check_v1"
+
+    private static func load() -> [String: Entry] {
+        guard let data = UserDefaults.standard.data(forKey: storageKey),
+              let map = try? JSONDecoder().decode([String: Entry].self, from: data) else { return [:] }
+        return map
+    }
+
+    private static func norm(_ fingerprint: String) -> String {
+        fingerprint.replacingOccurrences(of: " ", with: "").uppercased()
+    }
+
+    static func entry(for fingerprint: String) -> Entry? {
+        load()[norm(fingerprint)]
+    }
+
+    static func set(_ entry: Entry?, for fingerprint: String) {
+        var map = load()
+        map[norm(fingerprint)] = entry
+        if let data = try? JSONEncoder().encode(map) {
+            UserDefaults.standard.set(data, forKey: storageKey)
+        }
     }
 }

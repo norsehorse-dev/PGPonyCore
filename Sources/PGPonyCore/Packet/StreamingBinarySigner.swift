@@ -76,7 +76,9 @@ final class StreamingBinarySigner {
     /// version ‖ sigType ‖ pubAlgo ‖ hashAlgo ‖ hashedLen ‖ hashedSubpackets.
     private let trailer: [UInt8]
 
-    private var hasher = SHA256()
+    // 8.4.0 build 10 (plan 5m): the hash follows `algorithm.hashAlgorithmID`
+    // (SHA-256, or SHA-384 / SHA-512 for a card ECDSA key on P-384 / P-521).
+    private var hasher: CardDigestHasher
     private var finished = false
     /// Set by `finalizeDigest()`; its first two octets are the packet's hash
     /// prefix, so `packet(signature:)` needs it.
@@ -105,6 +107,7 @@ final class StreamingBinarySigner {
         self.rsaPrivateKey = rsaPrivateKey
         self.keyID = keyID
         self.algorithm = algorithm
+        self.hasher = CardDigestHasher(hashAlgorithmID: algorithm.hashAlgorithmID)
         self.sigType = sigType
 
         let seconds = UInt32((creationTime ?? Date()).timeIntervalSince1970)
@@ -125,7 +128,7 @@ final class StreamingBinarySigner {
         self.unhashedSubpackets = OpenPGPPacketBuilder.buildSignatureSubpacket(type: 16, data: keyID)
 
         // v4, [binary=0x00 or text=0x01], [EdDSA=22 or RSA=1], SHA-256.
-        var t: [UInt8] = [4, sigType, algorithm.packetAlgorithmID, 8]
+        var t: [UInt8] = [4, sigType, algorithm.packetAlgorithmID, algorithm.hashAlgorithmID]
         t.append(UInt8((UInt16(hashed.count) >> 8) & 0xFF))
         t.append(UInt8(UInt16(hashed.count) & 0xFF))
         t.append(contentsOf: hashed)
@@ -139,7 +142,8 @@ final class StreamingBinarySigner {
     /// an RSA signature fails verification even though the signature itself is
     /// fine, because a reader picks its verification routine off this packet.
     var onePassPacket: [UInt8] {
-        OpenPGPPacketBuilder.buildOnePassSignaturePacket(keyID: keyID, pubkeyAlgo: algorithm.packetAlgorithmID)
+        OpenPGPPacketBuilder.buildOnePassSignaturePacket(keyID: keyID, pubkeyAlgo: algorithm.packetAlgorithmID,
+                                                         hashAlgo: algorithm.hashAlgorithmID)
     }
 
     /// Feed literal data. The literal packet's own header is NOT signed — a
@@ -182,19 +186,19 @@ final class StreamingBinarySigner {
     /// digest supplies the two-octet hash prefix.
     func packet(signature sigBytes: [UInt8]) throws -> [UInt8] {
         guard let digest = finalizedDigest else {
-            throw PacketBuilderError.signingFailed("packet(signature:) called before finalizeDigest()")
+            throw PacketBuilderError.signingFailed(String(localized: "packet(signature:) called before finalizeDigest()"))
         }
 
         let mpis: [[UInt8]]
         switch algorithm {
         case .eddsa:
             guard sigBytes.count == 64 else {
-                throw PacketBuilderError.signingFailed("Unexpected Ed25519 signature length \(sigBytes.count)")
+                throw PacketBuilderError.signingFailed(String(localized: "Unexpected Ed25519 signature length \(sigBytes.count)"))
             }
             mpis = [Array(sigBytes[0..<32]), Array(sigBytes[32..<64])]
         case .rsa:
             guard !sigBytes.isEmpty else {
-                throw PacketBuilderError.signingFailed("Empty RSA signature")
+                throw PacketBuilderError.signingFailed(String(localized: "Empty RSA signature"))
             }
             // Same leading-zero strip CardSigner's RSA branch does: a modulus-
             // length value that happens to start with a zero byte (the top bits
@@ -205,6 +209,9 @@ final class StreamingBinarySigner {
             var sig = sigBytes
             while sig.first == 0x00 && sig.count > 1 { sig.removeFirst() }
             mpis = [sig]
+        case .ecdsa:
+            // 8.4.0 build 10 (plan 5m): a card's r || s, two MPIs.
+            mpis = try algorithm.signatureMPIs(fromCardOutput: sigBytes)
         }
 
         // The packet's first four octets MUST equal the trailer's first four —
@@ -212,7 +219,7 @@ final class StreamingBinarySigner {
         // the packet header. sigType in particular: a verifier reconstructs
         // the trailer from the packet, so a byte that differs here from what
         // was hashed produces a signature nothing can verify.
-        var body: [UInt8] = [4, sigType, algorithm.packetAlgorithmID, 8]
+        var body: [UInt8] = [4, sigType, algorithm.packetAlgorithmID, algorithm.hashAlgorithmID]
         body.append(UInt8((UInt16(hashedSubpackets.count) >> 8) & 0xFF))
         body.append(UInt8(UInt16(hashedSubpackets.count) & 0xFF))
         body.append(contentsOf: hashedSubpackets)
@@ -263,7 +270,7 @@ final class StreamingBinarySigner {
         switch algorithm {
         case .eddsa:
             guard let signingKey else {
-                throw PacketBuilderError.signingFailed("This signer has no local Ed25519 key; use the card path.")
+                throw PacketBuilderError.signingFailed(String(localized: "This signer has no local Ed25519 key; use the card path."))
             }
             let signature: Data
             do {
@@ -274,16 +281,19 @@ final class StreamingBinarySigner {
             return try packet(signature: Array(signature))
         case .rsa:
             guard let rsaPrivateKey else {
-                throw PacketBuilderError.signingFailed("This signer has no local RSA key; use the card path.")
+                throw PacketBuilderError.signingFailed(String(localized: "This signer has no local RSA key; use the card path."))
             }
             var err: Unmanaged<CFError>?
             guard let signature = SecKeyCreateSignature(
                 rsaPrivateKey, .rsaSignatureDigestPKCS1v15SHA256, Data(digest) as CFData, &err
             ) as Data? else {
-                let msg = (err?.takeRetainedValue()).map { CFErrorCopyDescription($0) as String } ?? "RSA signing failed"
+                let msg = (err?.takeRetainedValue()).map { CFErrorCopyDescription($0) as String } ?? String(localized: "RSA signing failed")
                 throw PacketBuilderError.signingFailed(msg)
             }
             return try packet(signature: Array(signature))
+        case .ecdsa:
+            // 8.4.0 build 10 (plan 5m): only a card signs ECDSA through here.
+            throw PacketBuilderError.signingFailed(String(localized: "This signer has no local ECDSA key; use the card path."))
         }
     }
 }
@@ -302,6 +312,35 @@ enum SignerPublicKey {
     case composite(CompositeSignSuite, [UInt8])
     /// 8.3.0 (NIST D): an ECDSA key on a NIST curve, as its SEC 1 point.
     case ecdsa(NISTCurve, [UInt8])
+    /// 8.4.0 build 7 (plan K4): a DSA key (17) or an ECDSA key on a
+    /// brainpool curve (19), checked by DSABrainpoolVerifier.
+    case dsaOrBrainpool(DSABrainpoolVerifier.PublicKey)
+    /// 8.4.0 build 9 (plan 5l): an Ed448 key (LibrePGP v5 or RFC 9580 v6),
+    /// its 57-octet public key.
+    case ed448([UInt8])
+}
+
+extension SignerPublicKey {
+
+    /// 8.4.0: the DSA or brainpool ECDSA component (primary or subkey, v4)
+    /// among the given public keys whose key ID is `keyID`, for the streaming
+    /// decrypt-verify `resolveSigner` closure. Nil when no such component is
+    /// held, the same contract as the other resolvers.
+    ///
+    /// CORE SEAM: the app passes its SwiftData key models and loads each
+    /// public ring from the Keychain; the core takes the public rings.
+    static func dsaOrBrainpool(forKeyID keyID: [UInt8], amongPublicKeys publicKeys: [Data]) -> SignerPublicKey? {
+        guard keyID.count == 8 else { return nil }
+        for pubData in publicKeys {
+            guard let packets = try? OpenPGPPacketParser.parsePackets(data: Array(pubData)) else { continue }
+            for packet in packets where packet.tag == 6 || packet.tag == 14 {
+                guard let key = DSABrainpoolVerifier.publicKey(fromKeyPacketBody: packet.body),
+                      Array(OpenPGPPacketParser.computeV4Fingerprint(packetBody: packet.body).suffix(8)) == keyID else { continue }
+                return .dsaOrBrainpool(key)
+            }
+        }
+        return nil
+    }
 }
 
 /// Checks a v4 binary signature — EdDSA or RSA, SHA-256 or SHA-512 — over data
@@ -344,6 +383,9 @@ final class StreamingBinaryVerifier {
     private let version: UInt8
     /// v6 only: the 16-octet salt, prepended to the hash at init (v4 = empty).
     private let salt: [UInt8]
+    /// 8.4.0 build 9 (plan 5l): the literal packet's format, name and date,
+    /// which a LibrePGP v5 signature hashes. Set by a reader that has it.
+    var literalMetadata: [UInt8]? = nil
 
     /// - Parameter onePassBody: a tag 4 packet body:
     ///   version, sigType, hashAlgo, pubAlgo, keyID(8), nested.
@@ -359,8 +401,9 @@ final class StreamingBinaryVerifier {
             guard onePassBody[1] == 0x00 else { return nil }
             let hashAlgo = onePassBody[2]
             let pubAlgo = onePassBody[3]
-            // Ed25519 native (v6), or a composite ML-DSA + EdDSA key (8.3.0, 4.1).
-            guard pubAlgo == 27 || CompositeSignSuite.isComposite(pubAlgo) else { return nil }
+            // Ed25519 native (v6), or a composite ML-DSA + EdDSA key (8.3.0, 4.1),
+            // or Ed448 (8.4.0 build 9, plan 5l).
+            guard pubAlgo == 27 || pubAlgo == 28 || CompositeSignSuite.isComposite(pubAlgo) else { return nil }
             let saltLen = Int(onePassBody[4])
             guard onePassBody.count >= 5 + saltLen + 32 + 1 else { return nil }
             switch hashAlgo {
@@ -382,7 +425,8 @@ final class StreamingBinaryVerifier {
             guard onePassBody[1] == 0x00 else { return nil }
             let hashAlgo = onePassBody[2]
             let pubAlgo = onePassBody[3]
-            guard pubAlgo == 22 || pubAlgo == 1 || pubAlgo == 3 || pubAlgo == 19 else { return nil }
+            // 8.4.0 build 7 (plan K4): DSA (17) streams too.
+            guard pubAlgo == 22 || pubAlgo == 1 || pubAlgo == 3 || pubAlgo == 19 || pubAlgo == 17 else { return nil }
             switch hashAlgo {
             case 8:  self.hasher = SHA256()
             case 9:  self.hasher = SHA384()   // 8.3.0 (NIST D): GnuPG's P-384 pairing
@@ -415,6 +459,22 @@ final class StreamingBinaryVerifier {
     func verify(signatureBody body: [UInt8], publicKey: SignerPublicKey?) -> Bool? {
         guard let publicKey else { return nil }
         if version == 6 { return verifyV6(signatureBody: body, publicKey: publicKey) }
+        // 8.4.0 build 9 (plan 5l): a LibrePGP v5 Ed448 signature (announced by
+        // a v3 one-pass packet). It hashes the literal packet's header after
+        // its own fields, so it is checked only when the reader handed that
+        // over; otherwise it is "could not check", never "altered".
+        if body.first == 5 {
+            guard case .ed448(let key) = publicKey, pubkeyAlgorithm == 22, let meta = literalMetadata,
+                  let sig = try? OpenPGPPacketParser.parseSignaturePacket(body: body),
+                  sig.hashAlgorithm == hashAlgorithm, let value = OpenPGP448.signatureValue(sig) else { return nil }
+            hasher.update(data: Data(sig.rawHashedPortion))
+            hasher.update(data: Data(OpenPGP448.v5Trailer(signatureType: sig.signatureType,
+                                                          hashedPortionLength: sig.rawHashedPortion.count,
+                                                          literalMetadata: meta)))
+            let digest = Array(hasher.finalize())
+            guard sig.hashPrefix.count == 2, digest[0] == sig.hashPrefix[0], digest[1] == sig.hashPrefix[1] else { return false }
+            return Ed448.verify(signature: value, message: digest, publicKey: key)
+        }
         guard body.count > 6, body[0] == 4, body[1] == 0x00 else { return nil }
         // The signature packet's own algorithm octets must match what the
         // one-pass packet announced — a mismatch here means the message is
@@ -461,14 +521,27 @@ final class StreamingBinaryVerifier {
             guard let r = readMPI(body, &offset), let s = readMPI(body, &offset) else { return nil }
             return try? NISTECDSAService.verify(r: r, s: s, digest: digest, curve: curve, publicPoint: point)
 
+        case (17, .dsaOrBrainpool(let key)), (19, .dsaOrBrainpool(let key)):
+            // 8.4.0 build 7 (plan K4): a DSA key for a DSA packet, a brainpool
+            // key for an ECDSA one; any other pairing cannot be checked.
+            switch (pubkeyAlgorithm, key) {
+            case (17, .dsa), (19, .brainpool): break
+            default: return nil
+            }
+            guard let sig = try? OpenPGPPacketParser.parseSignaturePacket(body: body) else { return nil }
+            return DSABrainpoolVerifier.verify(sig, digest: digest, key: key)
+
         case (1, .rsa(let key)), (3, .rsa(let key)):
             guard let sig = readMPI(body, &offset) else { return nil }
             // The DIGEST variant: `digest` is already the finalized hash, and
             // this asks Security to apply PKCS#1 v1.5 verification against it
             // directly rather than hashing a message itself.
-            let secAlgorithm: SecKeyAlgorithm = hashAlgorithm == 10
-                ? .rsaSignatureDigestPKCS1v15SHA512
-                : .rsaSignatureDigestPKCS1v15SHA256
+            let secAlgorithm: SecKeyAlgorithm
+            switch hashAlgorithm {
+            case 10: secAlgorithm = .rsaSignatureDigestPKCS1v15SHA512
+            case 9: secAlgorithm = .rsaSignatureDigestPKCS1v15SHA384
+            default: secAlgorithm = .rsaSignatureDigestPKCS1v15SHA256
+            }
             return SecKeyVerifySignature(
                 key, secAlgorithm, Data(digest) as CFData, Data(sig) as CFData, nil
             )
@@ -514,7 +587,8 @@ final class StreamingBinaryVerifier {
         // After the hashed area: unhashedLen(4)|unhashed|hashPrefix(2)|
         // saltLen(1)|salt|signature(native, no MPI: 64 for Ed25519, the
         // composite length for algorithm 30/31).
-        let sigLen = CompositeSignSuite.forAlgorithm(pubkeyAlgorithm)?.compositeSignatureLength ?? 64
+        let sigLen = CompositeSignSuite.forAlgorithm(pubkeyAlgorithm)?.compositeSignatureLength
+            ?? (pubkeyAlgorithm == 28 ? 114 : 64)
         var offset = hashedEnd
         guard body.count >= offset + 4 else { return nil }
         let unhashedLength = (Int(body[offset]) << 24) | (Int(body[offset + 1]) << 16)
@@ -531,6 +605,9 @@ final class StreamingBinaryVerifier {
         switch publicKey {
         case .ed25519(let key) where pubkeyAlgorithm == 27:
             return key.isValidSignature(Data(signature), for: Data(digest))
+        case .ed448(let key) where pubkeyAlgorithm == 28:
+            // 8.4.0 build 9 (plan 5l): RFC 9580 Ed448, 114 octets, pure EdDSA.
+            return Ed448.verify(signature: signature, message: digest, publicKey: key)
         case .composite(let suite, let material) where suite.rawValue == pubkeyAlgorithm:
             // 8.3.0 (4.1): both components over the same digest. An
             // uncheckable composite (no ML-DSA on this OS) is nil, not false:
@@ -636,7 +713,7 @@ final class StreamingV6Signer: StreamingMessageSigner {
         } else {
             var s = [UInt8](repeating: 0, count: 16)
             guard SecRandomCopyBytes(kSecRandomDefault, s.count, &s) == errSecSuccess else {
-                throw PacketBuilderError.signingFailed("could not generate v6 signature salt")
+                throw PacketBuilderError.signingFailed(String(localized: "could not generate v6 signature salt"))
             }
             self.salt = s
         }
@@ -718,7 +795,7 @@ final class StreamingV6Signer: StreamingMessageSigner {
             throw PacketBuilderError.signingFailed((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
         }
         guard sigBytes.count == signer.signatureLength else {
-            throw PacketBuilderError.signingFailed("v6 signature must be \(signer.signatureLength) bytes, got \(sigBytes.count)")
+            throw PacketBuilderError.signingFailed(String(localized: "v6 signature must be \(String(describing: signer.signatureLength)) bytes, got \(sigBytes.count)"))
         }
 
         // Packet body: 6 | type | algo | 8 | hashedLen(4) | hashed | unhashedLen(4) |

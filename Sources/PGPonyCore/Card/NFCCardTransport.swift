@@ -70,7 +70,7 @@ final class NFCCardTransport: NSObject, CardTransport {
             if let message { session?.alertMessage = message }
             session?.invalidate()
         } else {
-            session?.invalidate(errorMessage: message ?? "Couldn't read the card.")
+            session?.invalidate(errorMessage: message ?? String(localized: "Couldn't read the card."))
         }
         session = nil
         tag = nil
@@ -147,7 +147,7 @@ extension NFCCardTransport: NFCTagReaderSessionDelegate {
         Task {
             guard let first = tags.first else { return }
             guard case let .iso7816(iso) = first else {
-                session.invalidate(errorMessage: "That isn't an OpenPGP smart card.")
+                session.invalidate(errorMessage: String(localized: "That isn't an OpenPGP smart card."))
                 resumeConnect(.failure(OpenPGPCardError.notISO7816))
                 return
             }

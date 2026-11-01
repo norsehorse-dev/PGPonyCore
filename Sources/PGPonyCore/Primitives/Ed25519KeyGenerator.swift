@@ -146,7 +146,7 @@ class Ed25519KeyGenerator {
             var seed = [UInt8](repeating: 0, count: 64)
             guard SecRandomCopyBytes(kSecRandomDefault, 64, &seed) == errSecSuccess else {
                 throw NSError(domain: "PGPony.Ed25519KeyGen", code: 3,
-                              userInfo: [NSLocalizedDescriptionKey: "Random generation failed"])
+                              userInfo: [NSLocalizedDescriptionKey: String(localized: "Random generation failed")])
             }
             let (pub, _) = try MLKEMService.generateKeyPair(seed: Data(seed),
                                                            level: pqcSuite.mlkemLevel)
@@ -156,6 +156,15 @@ class Ed25519KeyGenerator {
                 let x448Priv = try X448.generatePrivateKey()
                 pqcEccPublic = [UInt8](try X448.publicKey(for: x448Priv))
                 pqcEccPrivate = [UInt8](x448Priv)
+            } else if let curve = pqcSuite.brainpoolCurve {
+                // 8.4.0 build 7 wave 2 (plan K3, Android 4.6.0 item 13): gpg's
+                // ky768_bp256 (and the bp384 sibling). The scalar is stored at
+                // the field size, the public point uncompressed (65 octets for
+                // brainpoolP256r1); the key pair comes from the constant-time
+                // ladder (BrainpoolECDH).
+                let pair = try BrainpoolECDH.generateKeyPair(curve: curve)
+                pqcEccPublic = pair.point
+                pqcEccPrivate = pair.scalar
             }
         }
         
@@ -373,7 +382,10 @@ class Ed25519KeyGenerator {
             keyMat.append(0x01); keyMat.append(0x07)      // bit length 263
             keyMat.append(0x40)
             keyMat.append(contentsOf: x25519Public)
-        case .ky1024_cv448:
+        case .ky1024_cv448, .ky768_bp256, .ky1024_bp384:
+            // 8.4.0 build 7 wave 2 (plan K3): a brainpool point is the
+            // uncompressed 0x04 || X || Y, also as a minimal MPI (515 bits for
+            // brainpoolP256r1), as gpg and Android write it.
             keyMat.append(contentsOf: canonicalMPI(x25519Public))
         }
         // ML-KEM public key: 4-octet length prefix.
@@ -1157,7 +1169,7 @@ class Ed25519KeyGenerator {
         var errorDescription: String? {
             switch self {
             case .unexpectedAlgorithm:
-                return "The card returned an unexpected key type. Expected Ed25519 / Cv25519."
+                return String(localized: "The card returned an unexpected key type. Expected Ed25519 / Cv25519.")
             }
         }
     }

@@ -31,10 +31,10 @@ enum WKDError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .invalidEmail:        return "Invalid email address."
-        case .notFound:            return "No key found via WKD for this email."
-        case .networkError(let m): return "WKD network error: \(m)"
-        case .invalidResponse:     return "WKD server returned an invalid response."
+        case .invalidEmail:        return String(localized: "Invalid email address.")
+        case .notFound:            return String(localized: "No key found via WKD for this email.")
+        case .networkError(let m): return String(localized: "WKD network error: \(m)")
+        case .invalidResponse:     return String(localized: "WKD server returned an invalid response.")
         }
     }
 }

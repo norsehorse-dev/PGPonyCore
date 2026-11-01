@@ -41,21 +41,21 @@ enum SymmetricEncryptionError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .randomGenerationFailed:
-            return "Failed to generate secure random bytes."
+            return String(localized: "Failed to generate secure random bytes.")
         case .noSKESK:
-            return "This message is not passphrase-encrypted (no SKESK packet found)."
+            return String(localized: "This message is not passphrase-encrypted (no SKESK packet found).")
         case .noSEIPD:
-            return "No encrypted data packet (SEIPD) was found in the message."
+            return String(localized: "No encrypted data packet (SEIPD) was found in the message.")
         case .unsupportedSKESKVersion(let v):
-            return "Unsupported passphrase-packet version \(v)."
+            return String(localized: "Unsupported passphrase-packet version \(String(describing: v)).")
         case .unsupportedSEIPDVersion(let v):
-            return "Unsupported encrypted-data version \(v)."
+            return String(localized: "Unsupported encrypted-data version \(String(describing: v)).")
         case .unsupportedCipher(let c):
-            return "Unsupported cipher algorithm \(c)."
+            return String(localized: "Unsupported cipher algorithm \(String(describing: c)).")
         case .malformedSKESK(let m):
-            return "Malformed passphrase packet: \(m)."
+            return String(localized: "Malformed passphrase packet: \(m).")
         case .wrongPassphrase:
-            return "Incorrect passphrase."
+            return String(localized: "Incorrect passphrase.")
         }
     }
 }
@@ -254,12 +254,12 @@ enum SymmetricEncryption {
             salt = Array(body[off..<off + 8]); off += 8
             codedCount = body[off]; off += 1
         default:
-            throw SymmetricEncryptionError.malformedSKESK("unsupported S2K type \(s2kType)")
+            throw SymmetricEncryptionError.malformedSKESK(String(localized: "unsupported S2K type \(String(describing: s2kType))"))
         }
 
         // Classic gpg -c carries no encrypted session key; the S2K output is it.
         guard off == body.count else {
-            throw SymmetricEncryptionError.malformedSKESK("v4 SKESK with an encrypted session key is not supported")
+            throw SymmetricEncryptionError.malformedSKESK(String(localized: "v4 SKESK with an encrypted session key is not supported"))
         }
 
         let keySize = try cipherKeySize(cipherAlgo)
@@ -289,7 +289,7 @@ enum SymmetricEncryption {
         var off = 0
         func need(_ n: Int, _ what: String) throws {
             guard off + n <= body.count else {
-                throw SymmetricEncryptionError.malformedSKESK("truncated \(what)")
+                throw SymmetricEncryptionError.malformedSKESK(String(localized: "truncated \(String(describing: what))"))
             }
         }
 
@@ -339,12 +339,12 @@ enum SymmetricEncryption {
                 hashLength: keySize
             )
         default:
-            throw SymmetricEncryptionError.malformedSKESK("unsupported S2K type \(s2kType) in a v5 SKESK")
+            throw SymmetricEncryptionError.malformedSKESK(String(localized: "unsupported S2K type \(String(describing: s2kType)) in a v5 SKESK"))
         }
 
         let nonceLen = AEADService.nonceSize(for: aeadAlgo)
         guard nonceLen > 0 else {
-            throw SymmetricEncryptionError.malformedSKESK("unknown AEAD algorithm \(aeadAlgo)")
+            throw SymmetricEncryptionError.malformedSKESK(String(localized: "unknown AEAD algorithm \(String(describing: aeadAlgo))"))
         }
         try need(nonceLen, "nonce")
         let nonce = Array(body[off..<off + nonceLen]); off += nonceLen
@@ -378,7 +378,7 @@ enum SymmetricEncryption {
         var off = 0
         func need(_ n: Int, _ what: String) throws {
             guard off + n <= body.count else {
-                throw SymmetricEncryptionError.malformedSKESK("truncated \(what)")
+                throw SymmetricEncryptionError.malformedSKESK(String(localized: "truncated \(String(describing: what))"))
             }
         }
 
@@ -393,7 +393,7 @@ enum SymmetricEncryption {
         try need(s2kLen, "S2K")
         let s2k = Array(body[off..<off + s2kLen]); off += s2kLen
         guard s2k.count == 20, s2k[0] == 4 else {
-            throw SymmetricEncryptionError.malformedSKESK("expected a 20-byte Argon2 S2K")
+            throw SymmetricEncryptionError.malformedSKESK(String(localized: "expected a 20-byte Argon2 S2K"))
         }
         let salt = Array(s2k[1..<17])
         let t = Int(s2k[17])
@@ -406,7 +406,7 @@ enum SymmetricEncryption {
 
         let remaining = Array(body[off...])
         guard remaining.count > AEADService.tagSize else {
-            throw SymmetricEncryptionError.malformedSKESK("missing encrypted session key")
+            throw SymmetricEncryptionError.malformedSKESK(String(localized: "missing encrypted session key"))
         }
         let split = remaining.count - AEADService.tagSize
         let encKey = Array(remaining[0..<split])

@@ -58,11 +58,29 @@ struct CardAlgorithmAttributes {
         default:
             return CardAlgorithmAttributes(
                 rawAlgoID: algoID,
-                displayName: String(format: "Algorithm 0x%02X", algoID),
+                displayName: String(format: String(localized: "Algorithm 0x%02X"), algoID),
                 modulusBits: nil,
                 curveName: nil
             )
         }
+    }
+
+    /// 8.4.0 build 10 (plan 5m): the NIST curve named by ECC attributes
+    /// (algorithm ID 0x12 or 0x13, then the OID, then an optional format
+    /// octet), or nil for any other algorithm or curve. Matched by prefix like
+    /// `identifyCurve`; the three NIST OIDs differ before their last octet
+    /// ends, so a trailing format octet cannot make one read as another.
+    static func nistCurve(_ attr: [UInt8]) -> NISTCurve? {
+        guard let algoID = attr.first, algoID == algoECDH || algoID == algoECDSA else { return nil }
+        let rest = Array(attr.dropFirst())
+        let table: [([UInt8], NISTCurve)] = [(oidNistP256, .p256), (oidNistP384, .p384), (oidNistP521, .p521)]
+        for (oid, curve) in table {
+            guard rest.count >= oid.count, Array(rest.prefix(oid.count)) == oid else { continue }
+            // Exactly the OID, or the OID and one format octet.
+            guard rest.count <= oid.count + 1 else { continue }
+            return curve
+        }
+        return nil
     }
 
     private static func identifyCurve(_ oidPlusMaybeFormat: [UInt8]) -> String {
@@ -79,6 +97,6 @@ struct CardAlgorithmAttributes {
         if startsWith(oidBrainpoolP256) { return "brainpoolP256r1" }
         if startsWith(oidBrainpoolP384) { return "brainpoolP384r1" }
         if startsWith(oidBrainpoolP512) { return "brainpoolP512r1" }
-        return "EC (unrecognized curve)"
+        return String(localized: "EC (unrecognized curve)")
     }
 }

@@ -32,11 +32,11 @@ enum BZip2Error: Error, LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .invalidHeader: return "Not a valid BZip2 stream"
-        case .invalidBlockHeader: return "Invalid BZip2 block header"
-        case .randomizedBlockUnsupported: return "Deprecated randomized BZip2 blocks are not supported"
-        case .invalidHuffmanTable: return "Invalid BZip2 Huffman table"
-        case .truncatedStream: return "BZip2 stream ended unexpectedly"
+        case .invalidHeader: return String(localized: "Not a valid BZip2 stream")
+        case .invalidBlockHeader: return String(localized: "Invalid BZip2 block header")
+        case .randomizedBlockUnsupported: return String(localized: "Deprecated randomized BZip2 blocks are not supported")
+        case .invalidHuffmanTable: return String(localized: "Invalid BZip2 Huffman table")
+        case .truncatedStream: return String(localized: "BZip2 stream ended unexpectedly")
         }
     }
 }
@@ -82,7 +82,7 @@ enum BZip2Decompressor {
             let block = try decodeBlock(&bits, maxBlockBytes: maxBlockBytes)
             // 8.3.0 hardening: same ceiling as the zlib path.
             guard output.count + block.count <= limit else {
-                throw SecurityLimitError.exceeded("compressed data inflates past \(limit >> 20) MiB")
+                throw SecurityLimitError.exceeded(String(localized: "compressed data inflates past \(String(describing: limit >> 20)) MiB"))
             }
             output.append(contentsOf: block)
         }

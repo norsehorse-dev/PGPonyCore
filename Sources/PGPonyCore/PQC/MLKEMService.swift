@@ -89,11 +89,11 @@ enum MLKEMService {
         var errorDescription: String? {
             switch self {
             case .unavailable:
-                return "This ML-KEM parameter set is not available in this build of liboqs."
+                return String(localized: "This ML-KEM parameter set is not available in this build of liboqs.")
             case let .badInputSize(field, expected, got):
-                return "ML-KEM \(field) has wrong size: expected \(expected) bytes, got \(got)."
+                return String(localized: "ML-KEM \(field) has wrong size: expected \(String(describing: expected)) bytes, got \(String(describing: got)).")
             case let .operationFailed(op):
-                return "ML-KEM \(op) failed."
+                return String(localized: "ML-KEM \(String(describing: op)) failed.")
             }
         }
     }

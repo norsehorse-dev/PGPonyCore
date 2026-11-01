@@ -3,13 +3,14 @@
 
 // UncheckableBindingTests
 //
-// Bindings made by a primary this code cannot verify (DSA, brainpool) count
-// for encryption only for subkeys the caller lists in `pinnedSubkeys`, and
-// `newestVerifiedBinding` never returns one. A ring that does not parse, or
-// has no public primary key packet, is refused. Fixtures made with gpg
-// 2.4.4: a DSA primary with an ElGamal subkey, the same key with a second
-// ElGamal subkey whose binding has one byte of its signature changed, and a
-// brainpoolP256r1 primary with an ECDH subkey.
+// Bindings made by a primary this code cannot verify (a secp256k1 key; DSA
+// and brainpool verify since 8.4.0) count for encryption only for subkeys the
+// caller lists in `pinnedSubkeys`, and `newestVerifiedBinding` never returns
+// one. A ring that does not parse, or has no public primary key packet, is
+// refused. Fixtures made with gpg 2.4.4: a DSA primary with an ElGamal
+// subkey, the same key with a second ElGamal subkey whose binding has one
+// byte of its signature changed, and a brainpoolP256r1 primary with an ECDH
+// subkey; the secp256k1 keys are in UncheckableFixtures.swift.
 
 import XCTest
 @testable import PGPonyCore
@@ -36,19 +37,26 @@ final class UncheckableBindingTests: XCTestCase {
         CertificateValidator.pinnedSubkeys = { $0 == primary ? pinned : [] }
     }
 
+    private let k1Ring = UncheckableFixtures.contact
+
     func testUnpinnedUncheckableSubkeysAreNotEncryptionTargets() throws {
+        XCTAssertEqual(CertificateValidator.uncheckableSubkeys(in: k1Ring).subkeys.count, 1)
+        XCTAssertEqual(try subkeyCount(try CertificateValidator.boundComponents(k1Ring, purpose: .encrypt)), 0)
+        XCTAssertEqual(try subkeyCount(try CertificateValidator.boundComponents(k1Ring, purpose: .any)), 1)
+    }
+
+    func testDSAAndBrainpoolSubkeysVerifyAndNeedNoPin() throws {
+        // 8.4.0: the bindings verify, so nothing is uncheckable and the
+        // subkey is an encryption target with no pin.
         for ring in [dsaRing, brainpoolRing] {
-            XCTAssertEqual(CertificateValidator.uncheckableSubkeys(in: ring).subkeys.count, 1)
-            XCTAssertEqual(try subkeyCount(try CertificateValidator.boundComponents(ring, purpose: .encrypt)), 0)
-            XCTAssertEqual(try subkeyCount(try CertificateValidator.boundComponents(ring, purpose: .any)), 1)
+            XCTAssertTrue(CertificateValidator.uncheckableSubkeys(in: ring).subkeys.isEmpty)
+            XCTAssertEqual(try CertificateValidator.boundComponents(ring, purpose: .encrypt), ring)
         }
     }
 
     func testPinnedUncheckableSubkeysAreEncryptionTargets() throws {
-        for ring in [dsaRing, brainpoolRing] {
-            pin(ring)
-            XCTAssertEqual(try CertificateValidator.boundComponents(ring, purpose: .encrypt), ring)
-        }
+        pin(k1Ring)
+        XCTAssertEqual(try CertificateValidator.boundComponents(k1Ring, purpose: .encrypt), k1Ring)
     }
 
     func testAnAlteredBindingIsNotUsedAndNeverVerified() throws {

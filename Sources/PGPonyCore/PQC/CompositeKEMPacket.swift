@@ -64,11 +64,11 @@ enum CompositeKEMPacket {
         var errorDescription: String? {
             switch self {
             case .notComposite:
-                return "Not a composite ML-KEM (algorithm 35/36) packet."
+                return String(localized: "Not a composite ML-KEM (algorithm 35/36) packet.")
             case .protectedKeyUnsupported:
-                return "This composite secret key is passphrase-protected; unlock is handled elsewhere."
+                return String(localized: "This composite secret key is passphrase-protected; unlock is handled elsewhere.")
             case let .malformed(m):
-                return "Malformed composite key packet: \(m)."
+                return String(localized: "Malformed composite key packet: \(String(describing: m)).")
             }
         }
     }
@@ -85,28 +85,28 @@ enum CompositeKEMPacket {
     ///   | s2kUsage(1)=0
     ///   | ECCsecret ‖ mlkemSeed(64)          [no count, no checksum]
     static func parseUnprotectedSecretMaterial(secretBody body: [UInt8]) throws -> SecretMaterial {
-        guard body.count >= 10 else { throw Failure.malformed("secret key packet too short") }
-        guard body[0] == 6 else { throw Failure.malformed("not a v6 key packet") }
+        guard body.count >= 10 else { throw Failure.malformed(String(localized: "secret key packet too short")) }
+        guard body[0] == 6 else { throw Failure.malformed(String(localized: "not a v6 key packet")) }
         guard let suite = CompositeSuite.from(algId: body[5]) else { throw Failure.notComposite }
 
         let pubMatLen = Int(body[6]) << 24 | Int(body[7]) << 16 | Int(body[8]) << 8 | Int(body[9])
         guard pubMatLen == suite.compositePublicBytes else {
-            throw Failure.malformed("unexpected public material length \(pubMatLen)")
+            throw Failure.malformed(String(localized: "unexpected public material length \(String(describing: pubMatLen))"))
         }
         var off = 10
         guard off + pubMatLen <= body.count else {
-            throw Failure.malformed("public material truncated")
+            throw Failure.malformed(String(localized: "public material truncated"))
         }
         let ecdhPublic = Array(body[off..<(off + suite.eccKeyBytes)])   // R
         off += pubMatLen                                                // skip full pubMat
 
-        guard off < body.count else { throw Failure.malformed("missing S2K usage octet") }
+        guard off < body.count else { throw Failure.malformed(String(localized: "missing S2K usage octet")) }
         let usage = body[off]; off += 1
         guard usage == 0 else { throw Failure.protectedKeyUnsupported }
 
         let secretLen = suite.compositeSecretBytes                      // 96 @35, 120 @36
         guard off + secretLen <= body.count else {
-            throw Failure.malformed("secret material truncated")
+            throw Failure.malformed(String(localized: "secret material truncated"))
         }
         let ecdhSecret = Array(body[off..<(off + suite.eccKeyBytes)]); off += suite.eccKeyBytes
         let mlkemSeed  = Array(body[off..<(off + mlkemSeedBytes)])
@@ -127,15 +127,15 @@ enum CompositeKEMPacket {
         let suite = secret.suite
         guard pkesk.algorithm == suite.algId else { throw Failure.notComposite }
         guard pkesk.ephemeralPublicKey.count == suite.eccKeyBytes else {
-            throw Failure.malformed("ecdhCipherText (V) must be \(suite.eccKeyBytes) bytes")
+            throw Failure.malformed(String(localized: "ecdhCipherText (V) must be \(String(describing: suite.eccKeyBytes)) bytes"))
         }
         guard pkesk.mlkemCipherText.count == suite.mlkemCiphertextBytes else {
-            throw Failure.malformed("ML-KEM ciphertext must be \(suite.mlkemCiphertextBytes) bytes")
+            throw Failure.malformed(String(localized: "ML-KEM ciphertext must be \(String(describing: suite.mlkemCiphertextBytes)) bytes"))
         }
         guard secret.ecdhSecret.count == suite.eccKeyBytes,
               secret.mlkemSeed.count == 64,
               secret.ecdhPublic.count == suite.eccKeyBytes else {
-            throw Failure.malformed("bad secret material sizes")
+            throw Failure.malformed(String(localized: "bad secret material sizes"))
         }
 
         // Expand the 64-octet ML-KEM seed to the liboqs expanded secret key.

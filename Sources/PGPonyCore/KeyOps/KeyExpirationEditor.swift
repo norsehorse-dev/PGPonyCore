@@ -71,22 +71,38 @@ enum KeyExpirationEditor {
         case noPrimaryKeyPacket
         case expiryBeforeCreation
         case noLiveUserID
+        // 8.4.0 build 11 (plan 5n, Android 4.7.0 item 53): one subkey's expiry.
+        case subkeyNotFound
+        case subkeyRevoked
+        case noSubkeyBinding
+        case signingSubkeyNotHere
+        case cardSigningSubkey
         case underlying(Error)
 
         var errorDescription: String? {
             switch self {
             case .notAKeyPair:
-                return "Editing expiration requires the private key; this is a public-only key."
+                return String(localized: "Editing expiration requires the private key; this is a public-only key.")
             case .unsupportedAlgorithm:
-                return "Expiration editing supports Ed25519 keys and RSA or Ed25519 hardware keys. For a software RSA or v6 key, use GnuPG."
+                return String(localized: "Expiration editing supports Ed25519 keys and RSA or Ed25519 hardware keys. For a software RSA or v6 key, use GnuPG.")
             case .missingArmoredPublicKey:
-                return "The cached public key is missing, so the key material needed for re-signing can't be read."
+                return String(localized: "The cached public key is missing, so the key material needed for re-signing can't be read.")
             case .noPrimaryKeyPacket:
-                return "Could not locate the primary public-key packet in this key."
+                return String(localized: "Could not locate the primary public-key packet in this key.")
             case .expiryBeforeCreation:
-                return "The chosen expiration date is before the key was created."
+                return String(localized: "The chosen expiration date is before the key was created.")
             case .noLiveUserID:
                 return String(localized: "Every User ID on this key is revoked, so there is no identity to carry a new expiration date.")
+            case .subkeyNotFound:
+                return String(localized: "That subkey is not on this key.")
+            case .subkeyRevoked:
+                return String(localized: "This subkey is revoked, so its expiration can't be changed.")
+            case .noSubkeyBinding:
+                return String(localized: "This subkey has no binding signature from the primary key that could be checked, so nothing was changed.")
+            case .signingSubkeyNotHere:
+                return String(localized: "This signing subkey's secret is not on this device. A signing subkey signs its new binding too, so its expiration can't be changed here.")
+            case .cardSigningSubkey:
+                return String(localized: "A signing subkey's expiration can't be changed with the hardware key.")
             case .underlying(let e):
                 return e.localizedDescription
             }
@@ -108,16 +124,35 @@ enum KeyExpirationEditor {
     ///   - signingInfo: the extracted Ed25519 signing key (see `Ed25519SigningInfo`).
     ///   - secretRing: raw secret keyring bytes to re-splice, or nil to skip.
     ///   - expiresAt: the new absolute expiry, or nil for "never".
+    ///   - passphrase: the secret ring's passphrase. Needed only when
+    ///     `subkeyFingerprint` names a signing subkey, whose new binding
+    ///     carries a back-signature made with that subkey's own secret.
+    ///   - includeCurrentSubkeys: re-sign the bindings of the subkeys that are
+    ///     still valid now. Expired and revoked subkeys keep their old binding.
+    ///   - subkeyFingerprint: 8.4.0: set to change that one subkey's expiry and
+    ///     nothing else (the primary, its User IDs and the other subkeys keep
+    ///     their signatures byte for byte). `expiresAt` is then the subkey's
+    ///     new date, and so is the result's `expiresAt`; the key's own expiry
+    ///     does not change. An expired subkey can be given a new date.
     /// - Returns: fresh secret keyring bytes + armored public key + the expiry.
     static func buildEditedKey(
         armoredPublic: String,
         signingInfo: Ed25519SigningInfo,
         secretRing: Data?,
-        expiresAt: Date?
+        expiresAt: Date?,
+        passphrase: String? = nil,
+        includeCurrentSubkeys: Bool = true,
+        subkeyFingerprint: String? = nil
     ) async throws -> EditedKey {
         let primaryFP20 = signingInfo.fingerprint.count >= 20
             ? Array(signingInfo.fingerprint.suffix(20))
             : signingInfo.fingerprint
+
+        // 8.4.0 build 11 (plan 5n): a signing subkey's back-signature is made
+        // with its own secret, read from the same secret ring.
+        let target = subkeyFingerprint.map {
+            SubkeyTarget(fingerprintHex: $0, secretRing: secretRing, passphrase: passphrase)
+        }
 
         return try await buildEditedKeyCore(
             armoredPublic: armoredPublic,
@@ -126,6 +161,8 @@ enum KeyExpirationEditor {
             issuerKeyID: signingInfo.keyID,
             secretRing: secretRing,
             algorithm: .eddsa,
+            includeCurrentSubkeys: includeCurrentSubkeys,
+            subkeyTarget: target,
             sign: { digest in Array(try signingInfo.privateKey.signature(for: Data(digest))) }
         )
     }
@@ -139,17 +176,39 @@ enum KeyExpirationEditor {
     ///
     /// CORE SEAM: in the app this takes the SwiftData model and extracts the two
     /// signing keys itself (`PGPService.extractEd25519SigningKey`, once with
-    /// `preferSigningSubkey: false` and once with `true`) plus the Keychain
-    /// secret ring; the core takes the already-extracted materials. `signingSubkey`
-    /// is nil for an encryption-only v6 key (no Sign-capable subkey).
+    /// `preferSigningSubkey: false` and once with `true`, off the main thread)
+    /// plus the Keychain secret ring; the core takes the already-extracted
+    /// materials. `signingSubkey` is nil for an encryption-only v6 key (no
+    /// Sign-capable subkey). `passphrase` is needed only for a one-subkey edit
+    /// (`subkeyFingerprint`) of a signing subkey.
     static func buildEditedV6Key(
         armoredPublic: String,
         secretRing: Data,
         primary: Ed25519SigningInfo,
         signingSubkey: Ed25519SigningInfo?,
-        expiresAt: Date?
-    ) throws -> EditedKey {
+        expiresAt: Date?,
+        passphrase: String? = nil,
+        includeCurrentSubkeys: Bool = true,
+        subkeyFingerprint: String? = nil
+    ) async throws -> EditedKey {
         let pubData = Data(try dearmor(armoredPublic))
+        // 8.4.0: one subkey's binding and nothing else.
+        if let subkeyFingerprint {
+            let result = try await editV6SubkeyExpiration(
+                publicKeyData: pubData,
+                secretKeyData: secretRing,
+                primarySigner: V6SignatureKey(primary),
+                primaryFingerprint: Array(primary.fingerprint.suffix(32)),
+                subkeyFingerprintHex: subkeyFingerprint,
+                expiresAt: expiresAt,
+                passphrase: passphrase
+            )
+            return EditedKey(
+                secretKeyData: result.secretKeyData,
+                armoredPublicKey: armorPublicKeyBlock(Array(result.publicKeyData)),
+                expiresAt: expiresAt
+            )
+        }
         let signSub = signingSubkey
 
         do {
@@ -160,13 +219,65 @@ enum KeyExpirationEditor {
                 primaryFingerprint: Array(primary.fingerprint.suffix(32)),
                 signingSubkey: signSub?.privateKey,
                 signingSubkeyFingerprint: signSub.map { Array($0.fingerprint.suffix(32)) },
-                expiresAt: expiresAt
+                expiresAt: expiresAt,
+                includeCurrentSubkeys: includeCurrentSubkeys
             )
             return EditedKey(
                 secretKeyData: result.secretKeyData,
                 armoredPublicKey: armorPublicKeyBlock(Array(result.publicKeyData)),
                 expiresAt: expiresAt
             )
+        } catch {
+            throw EditError.underlying(error)
+        }
+    }
+
+    /// 8.4.0: Change Expiration for a key pair whose primary is Ed448
+    /// (LibrePGP v5 or RFC 9580 v6), through Ed448KeyEditor off the main
+    /// thread. Passphrase errors surface the way the other paths wrap them.
+    ///
+    /// CORE SEAM: in the app this takes the SwiftData model and loads the
+    /// secret ring from the Keychain; the core takes the armored public
+    /// keyring and the secret ring.
+    static func buildEditedEd448Key(
+        armoredPublic: String,
+        secretRing: Data,
+        expiresAt: Date?,
+        passphrase: String?,
+        includeCurrentSubkeys: Bool = true,
+        subkeyFingerprint: String? = nil
+    ) async throws -> EditedKey {
+        let pubData = Data(try dearmor(armoredPublic))
+        let secretData = secretRing
+        // 8.4.0 build 11 (plan 5n): one subkey's binding and nothing else.
+        if let subkeyFingerprint {
+            let result = try await runOffMainThread {
+                try editEd448SubkeyExpiration(publicKeyData: pubData, secretKeyData: secretData, passphrase: passphrase,
+                                              subkeyFingerprintHex: subkeyFingerprint, expiresAt: expiresAt)
+            }
+            return EditedKey(
+                secretKeyData: result.secretKeyData,
+                armoredPublicKey: armorPublicKeyBlock(Array(result.publicKeyData)),
+                expiresAt: expiresAt
+            )
+        }
+        do {
+            let result = try await runOffMainThread {
+                try Ed448KeyEditor.resign(publicKeyData: pubData, secretKeyData: secretData, passphrase: passphrase,
+                                          expiry: .set(expiresAt), includeCurrentSubkeys: includeCurrentSubkeys)
+            }
+            return EditedKey(
+                secretKeyData: result.secretKeyData,
+                armoredPublicKey: armorPublicKeyBlock(Array(result.publicKeyData)),
+                expiresAt: expiresAt
+            )
+        } catch let e as Ed448KeyEditor.EditError {
+            switch e {
+            case .expiryBeforeCreation: throw EditError.expiryBeforeCreation
+            case .noLiveUserID: throw EditError.noLiveUserID
+            case .noPrimaryKeyPacket: throw EditError.noPrimaryKeyPacket
+            default: throw EditError.underlying(e)
+            }
         } catch {
             throw EditError.underlying(error)
         }
@@ -184,7 +295,9 @@ enum KeyExpirationEditor {
         fingerprintHex: String,
         expiresAt: Date?,
         service: OpenPGPCardService,
-        pin: String
+        pin: String,
+        includeCurrentSubkeys: Bool = true,
+        subkeyFingerprint: String? = nil
     ) async throws -> EditedKey {
         guard let fp = bytesFromHex(fingerprintHex), fp.count == 20 else {
             throw EditError.noPrimaryKeyPacket
@@ -201,14 +314,14 @@ enum KeyExpirationEditor {
             issuerKeyID: Array(fp.suffix(8)),
             secretRing: nil,
             algorithm: algorithm,
+            includeCurrentSubkeys: includeCurrentSubkeys,
+            // 8.4.0 build 11 (plan 5n): no secret ring, so a signing subkey
+            // (which would sign its own back-signature) is refused.
+            subkeyTarget: subkeyFingerprint.map { SubkeyTarget(fingerprintHex: $0, secretRing: nil, passphrase: nil) },
             sign: { digest in
                 try await service.verify(pin: pin, mode: .signing)
-                switch algorithm {
-                case .eddsa:
-                    return try await service.sign(digest: digest)
-                case .rsa:
-                    return try await service.signRSA(digestInfo: CardSigner.sha256DigestInfo(digest))
-                }
+                // 8.4.0 build 10 (plan 5m): EdDSA, RSA and ECDSA through one helper.
+                return try await service.signDigest(digest, algorithm: algorithm)
             }
         )
     }
@@ -223,6 +336,8 @@ enum KeyExpirationEditor {
         issuerKeyID: [UInt8],
         secretRing: Data?,
         algorithm: CardSignatureAlgorithm,
+        includeCurrentSubkeys: Bool = true,
+        subkeyTarget: SubkeyTarget? = nil,
         sign: (_ digest: [UInt8]) async throws -> [UInt8]
     ) async throws -> EditedKey {
         let pubBytes = try dearmor(armoredPublic)
@@ -247,20 +362,29 @@ enum KeyExpirationEditor {
                 ctx = .uid
             case 14:
                 let info = try OpenPGPPacketParser.parsePublicKeyFields(body: pkt.body)
-                subs.append(SubEntry(body: pkt.body, creation: info.creationTime, bindingSubpackets: [], isSign: false))
+                subs.append(SubEntry(body: pkt.body, creation: info.creationTime, bindingSubpackets: [], isSign: false,
+                                     fingerprint: CertificateValidator.fingerprint(ofKeyBody: pkt.body)))
                 ctx = .subkey
             case 2:
                 let sig = try OpenPGPPacketParser.parseSignaturePacket(body: pkt.body)
                 // Only treat as a self-sig if the issuer is the primary key.
                 guard isSelfIssued(sig, primaryFP20: primaryFP20) else { break }
                 if sig.signatureType == 0x13, ctx == .uid, let i = uids.indices.last {
-                    uids[i].certSubpackets = sig.hashedSubpackets
+                    // 8.4.0 (plan 5d): the newest cert's subpackets are the ones carried.
                     let t = sig.creationTime ?? .distantPast
-                    if uids[i].latestCert.map({ t >= $0 }) ?? true { uids[i].latestCert = t }
+                    if uids[i].latestCert.map({ t >= $0 }) ?? true {
+                        uids[i].latestCert = t
+                        uids[i].certSubpackets = sig.hashedSubpackets
+                    }
                 } else if sig.signatureType == 0x30, ctx == .uid, let i = uids.indices.last {
                     let t = sig.creationTime ?? .distantPast
                     if uids[i].latestRevocation.map({ t >= $0 }) ?? true { uids[i].latestRevocation = t }
                 } else if sig.signatureType == 0x18, ctx == .subkey, let j = subs.indices.last {
+                    // 8.4.0 (plan 5d): the newest binding decides the subkey's
+                    // current expiry and is the one carried forward.
+                    let t = sig.creationTime ?? .distantPast
+                    guard subs[j].latestBinding.map({ t >= $0 }) ?? true else { break }
+                    subs[j].latestBinding = t
                     subs[j].bindingSubpackets = sig.hashedSubpackets
                     if let kf = sig.hashedSubpackets.first(where: { $0.type == 27 })?.data,
                        let firstFlag = kf.first, (firstFlag & 0x02) != 0 {
@@ -285,6 +409,54 @@ enum KeyExpirationEditor {
 
         let nowBytes = u32be(UInt32(Date().timeIntervalSince1970))
         let issuerFPData: [UInt8] = [4] + primaryFP20          // type-33 v4 form
+
+        // 8.4.0 build 11 (plan 5n, Android 4.7.0 item 53): one subkey's
+        // binding, signed again with its new date; the User IDs and every
+        // other subkey keep their signatures. An expired subkey may take a
+        // new date here (that is what this target is for); a revoked one
+        // never does. A signing subkey's binding embeds a fresh 0x19 made by
+        // the subkey, so its secret has to be in `secretRing`.
+        if let target = subkeyTarget {
+            let wanted = bytesFromHex(target.fingerprintHex.lowercased()) ?? []
+            guard let j = subs.firstIndex(where: { $0.fingerprint == wanted }) else { throw EditError.subkeyNotFound }
+            let s = subs[j]
+            guard !s.isRevoked else { throw EditError.subkeyRevoked }
+            guard let latest = s.latestBinding else { throw EditError.noSubkeyBinding }
+            // Newer than the binding it replaces, so every reader picks it.
+            let sigTime = max(UInt32(Date().timeIntervalSince1970), epochSeconds(latest) &+ 1)
+            let doc2 = [0x99] + u16be(UInt16(s.body.count)) + s.body
+            var embedded: [UInt8]? = nil
+            if s.isSign {
+                guard let ring = target.secretRing else { throw EditError.cardSigningSubkey }
+                embedded = try await v4BackSignature(primaryBody: primaryBody, subkeyBody: s.body, secretRing: ring,
+                                                     passphrase: target.passphrase, sigTime: sigTime)
+            }
+            let hashed = bindingSubpackets(
+                creationBytes: u32be(sigTime),
+                expiryBytes: try relativeExpiry(expiresAt: expiresAt, creation: s.creation),
+                preserved: s.bindingSubpackets,
+                issuerFPData: issuerFPData,
+                embeddedBackSignature: embedded
+            )
+            let packet = try await signKeyTargeted(
+                primaryBody: primaryBody, document2: doc2, sigType: 0x18,
+                algorithm: algorithm,
+                hashedSubpackets: hashed,
+                unhashedSubpackets: buildSubpacket(type: 16, data: issuerKeyID),
+                sign: sign
+            )
+            let newPublicRing = spliceRing(packets: pubPackets, newCerts: [:], newBindings: [j: packet],
+                                           primaryFP20: primaryFP20)
+            var secretOut = Data()
+            if let secretRing {
+                let secretData = secretRing
+                let secretPackets = try OpenPGPPacketParser.parsePackets(data: Array(secretData))
+                secretOut = Data(spliceRing(packets: secretPackets, newCerts: [:], newBindings: [j: packet],
+                                            primaryFP20: primaryFP20))
+            }
+            return EditedKey(secretKeyData: secretOut, armoredPublicKey: armorPublicKeyBlock(newPublicRing),
+                             expiresAt: expiresAt)
+        }
 
         // 4. Generate one fresh 0x13 cert per live user ID (relative to PRIMARY
         //    creation). Revoked user IDs keep their old cert and revocation.
@@ -315,8 +487,13 @@ enum KeyExpirationEditor {
         // 5. Generate one fresh 0x18 binding per (non-signing) subkey, relative to
         //    that SUBKEY's own creation time. Signing subkeys and revoked subkeys
         //    are skipped (left as-is).
+        //    8.4.0 (plan 5d, Android 4.7.0 item 53): only when the caller asks
+        //    for it, and only for subkeys still valid now. Before 8.4.0 every
+        //    subkey got the primary's new date, which brought expired subkeys
+        //    back; an expired subkey now keeps its old binding.
+        let now = Date()
         var newBindings: [Int: [UInt8]] = [:]
-        for (j, s) in subs.enumerated() where !s.isSign && !s.isRevoked {
+        for (j, s) in subs.enumerated() where includeCurrentSubkeys && !s.isSign && !s.isRevoked && !s.isExpired(at: now) {
             let expiryBytes = try relativeExpiry(expiresAt: expiresAt, creation: s.creation)
             let hashed = bindingSubpackets(
                 creationBytes: nowBytes,
@@ -360,6 +537,298 @@ enum KeyExpirationEditor {
         )
     }
 
+    // MARK: - One subkey's expiry (8.4.0 build 11, plan 5n, Android 4.7.0 item 53)
+
+    /// Which subkey a Change Expiration edits instead of the primary. The
+    /// secret ring is where a signing subkey's own secret is read for its
+    /// back-signature; nil on a hardware key, which cannot make one.
+    struct SubkeyTarget {
+        let fingerprintHex: String
+        let secretRing: Data?
+        let passphrase: String?
+    }
+
+    /// A v4 signing subkey's fresh 0x19 back-signature (the signature body,
+    /// for the binding's embedded-signature subpacket), made by the subkey
+    /// over primary || subkey. Only an Ed25519 subkey whose secret is in the
+    /// ring signs here; the result must verify against the subkey.
+    private static func v4BackSignature(primaryBody: [UInt8], subkeyBody: [UInt8], secretRing: Data,
+                                        passphrase: String?, sigTime: UInt32) async throws -> [UInt8] {
+        guard subkeyBody.count > 5, subkeyBody[0] == 4, subkeyBody[5] == 22 else { throw EditError.signingSubkeyNotHere }
+        let info = try await unlockSigningSubkey(secretRing: secretRing, subkeyBody: subkeyBody, passphrase: passphrase)
+        let subFP = CertificateValidator.fingerprint(ofKeyBody: subkeyBody)
+        guard Array(info.fingerprint.suffix(20)) == subFP else { throw EditError.signingSubkeyNotHere }
+        let key = info.privateKey
+        var hashed = buildSubpacket(type: 2, data: u32be(sigTime))
+        hashed += buildSubpacket(type: 33, data: [4] + subFP)
+        let packet = try await signKeyTargeted(
+            primaryBody: primaryBody,
+            document2: [0x99] + u16be(UInt16(subkeyBody.count)) + subkeyBody,
+            sigType: 0x19,
+            algorithm: .eddsa,
+            hashedSubpackets: hashed,
+            unhashedSubpackets: buildSubpacket(type: 16, data: Array(subFP.suffix(8))),
+            sign: { digest in Array(try key.signature(for: Data(digest))) }
+        )
+        guard let body = try? OpenPGPPacketParser.parsePackets(data: packet).first?.body else {
+            throw EditError.signingSubkeyNotHere
+        }
+        try checkSignature(body, signerBody: subkeyBody, primaryBody: primaryBody, subkeyBody: subkeyBody)
+        return body
+    }
+
+    /// Unlock one signing subkey's secret (v4 or v6 Ed25519) on its own,
+    /// whatever its validity: framed as a ring of that one secret-subkey
+    /// packet, the extractor has nothing else to choose. A GnuPG stub, or a
+    /// subkey whose secret is not in the ring, is not here.
+    private static func unlockSigningSubkey(secretRing: Data, subkeyBody: [UInt8],
+                                            passphrase: String?) async throws -> Ed25519SigningInfo {
+        let packets = try OpenPGPPacketParser.parsePackets(data: Array(secretRing))
+        guard let secret = packets.first(where: {
+            $0.tag == 7 && $0.body.count > subkeyBody.count && Array($0.body.prefix(subkeyBody.count)) == subkeyBody
+        }), OpenPGPPacketParser.gnuStub(secretBody: secret.body) == nil else {
+            throw EditError.signingSubkeyNotHere
+        }
+        let single = Data(OpenPGPPacketBuilder.buildNewFormatPacketBytes(tag: 7, body: secret.body))
+        do {
+            return try await runOffMainThread {
+                try PGPService.shared.extractEd25519SigningKey(fromSecretKeyData: single, passphrase: passphrase,
+                                                               preferSigningSubkey: true)
+            }
+        } catch let e as PGPServiceError {
+            switch e {
+            case .passphraseRequired, .invalidPassphrase: throw EditError.underlying(e)
+            default: throw EditError.signingSubkeyNotHere
+            }
+        }
+    }
+
+    /// Throws unless `body` (a signature) verifies by `signerBody` over the
+    /// (primary, subkey) binding document.
+    private static func checkSignature(_ body: [UInt8], signerBody: [UInt8], primaryBody: [UInt8],
+                                       subkeyBody: [UInt8]) throws {
+        guard let parsed = try? OpenPGPPacketParser.parseSignaturePacket(body: body) else {
+            throw EditError.noSubkeyBinding
+        }
+        let documents = CertificateValidator.bindingDocuments(primaryBody: primaryBody, subkeyBody: subkeyBody,
+                                                              signatureVersion: parsed.version)
+        let verdicts = documents.map { CertificateValidator.verify(parsed, signerBody: signerBody, document: $0) }
+        // .uncheckable (no verifier on this device) is not a failure.
+        guard verdicts.contains(where: { $0 != .invalid }) else {
+            throw parsed.signatureType == 0x19 ? EditError.signingSubkeyNotHere : EditError.noSubkeyBinding
+        }
+    }
+
+    /// One subkey of a public ring, with its position among the subkeys and
+    /// the signatures under it.
+    struct LocatedSubkey {
+        let order: Int
+        let body: [UInt8]
+        /// Signatures issued by the primary, parsed.
+        let selfSignatures: [OpenPGPPacketParser.ParsedSignature]
+        /// Every signature packet body under the subkey, as stored.
+        let signatureBodies: [[UInt8]]
+
+        var isRevoked: Bool { selfSignatures.contains { $0.signatureType == 0x28 } }
+
+        /// The newest binding by the primary.
+        var newestBinding: OpenPGPPacketParser.ParsedSignature? {
+            selfSignatures.filter { $0.signatureType == 0x18 }
+                .max { ($0.creationTime ?? .distantPast) < ($1.creationTime ?? .distantPast) }
+        }
+
+        /// True when the newest binding's Key Expiration Time has passed.
+        func isExpired(at date: Date) -> Bool {
+            guard body.count >= 5,
+                  let d = newestBinding?.hashedSubpackets.first(where: { $0.type == 9 })?.data, d.count == 4 else { return false }
+            let creation = UInt32(body[1]) << 24 | UInt32(body[2]) << 16 | UInt32(body[3]) << 8 | UInt32(body[4])
+            let seconds = UInt32(d[0]) << 24 | UInt32(d[1]) << 16 | UInt32(d[2]) << 8 | UInt32(d[3])
+            return seconds > 0 && Date(timeIntervalSince1970: TimeInterval(creation) + TimeInterval(seconds)) <= date
+        }
+    }
+
+    /// The public subkey (tag 14) whose fingerprint is `fingerprint`.
+    static func locateSubkey(_ packets: [ParsedPacket], primaryBody: [UInt8], fingerprint: [UInt8]) -> LocatedSubkey? {
+        var order = -1
+        var i = 0
+        while i < packets.count {
+            guard packets[i].tag == 14 else { i += 1; continue }
+            order += 1
+            var j = i + 1
+            var parsed: [OpenPGPPacketParser.ParsedSignature] = []
+            var raw: [[UInt8]] = []
+            while j < packets.count, packets[j].tag == 2 || packets[j].tag == 12 {
+                if packets[j].tag == 2 {
+                    raw.append(packets[j].body)
+                    if let sig = try? OpenPGPPacketParser.parseSignaturePacket(body: packets[j].body),
+                       CertificateValidator.issuedBy(primaryBody: primaryBody, sig) {
+                        parsed.append(sig)
+                    }
+                }
+                j += 1
+            }
+            if CertificateValidator.fingerprint(ofKeyBody: packets[i].body) == fingerprint {
+                return LocatedSubkey(order: order, body: packets[i].body, selfSignatures: parsed, signatureBodies: raw)
+            }
+            i = j
+        }
+        return nil
+    }
+
+    /// Re-emit a ring (public 6/14 or secret 5/7) with the subkey at
+    /// `order` bound by `fresh` (a signature body): written once in place
+    /// of its first binding by the primary, the older bindings dropped.
+    /// Everything else, revocations and other subkeys included, is kept.
+    static func replaceSubkeyBinding(_ packets: [ParsedPacket], order target: Int, with fresh: [UInt8],
+                                     primaryBody: [UInt8]) -> [UInt8] {
+        var out: [UInt8] = []
+        var order = -1
+        var inTarget = false
+        var wrote = false
+        for pkt in packets {
+            switch pkt.tag {
+            case 14, 7:
+                order += 1
+                inTarget = order == target
+                out += buildNewFormatPacket(tag: pkt.tag, body: pkt.body)
+            case 2 where inTarget:
+                if let sig = try? OpenPGPPacketParser.parseSignaturePacket(body: pkt.body),
+                   sig.signatureType == 0x18, CertificateValidator.issuedBy(primaryBody: primaryBody, sig) {
+                    if !wrote { out += buildNewFormatPacket(tag: 2, body: fresh) }
+                    wrote = true
+                } else {
+                    out += buildNewFormatPacket(tag: pkt.tag, body: pkt.body)
+                }
+            case 2, 12:
+                out += buildNewFormatPacket(tag: pkt.tag, body: pkt.body)
+            default:
+                inTarget = false
+                out += buildNewFormatPacket(tag: pkt.tag, body: pkt.body)
+            }
+        }
+        return out
+    }
+
+    /// A v6 key (Ed25519 or composite primary): one subkey's binding signed
+    /// again with the new date, the way V6KeyGenerator.editV6Expiration signs
+    /// it (every hashed subpacket of the old binding carried, a fresh 0x19
+    /// for a signing subkey), and nothing else touched: the direct-key
+    /// signature, the User IDs and the other subkeys stay byte for byte.
+    static func editV6SubkeyExpiration(
+        publicKeyData: Data,
+        secretKeyData: Data,
+        primarySigner: V6SignatureKey,
+        primaryFingerprint: [UInt8],
+        subkeyFingerprintHex: String,
+        expiresAt: Date?,
+        passphrase: String?,
+        now: Date = Date()
+    ) async throws -> (publicKeyData: Data, secretKeyData: Data) {
+        let pubPackets = try OpenPGPPacketParser.parsePackets(data: Array(publicKeyData))
+        guard let primaryBody = pubPackets.first(where: { $0.tag == 6 })?.body else { throw EditError.noPrimaryKeyPacket }
+        let wanted = bytesFromHex(subkeyFingerprintHex.lowercased()) ?? []
+        guard let sub = locateSubkey(pubPackets, primaryBody: primaryBody, fingerprint: wanted) else {
+            throw EditError.subkeyNotFound
+        }
+        guard !sub.isRevoked else { throw EditError.subkeyRevoked }
+        guard let old = sub.newestBinding else { throw EditError.noSubkeyBinding }
+        let subCreation = try OpenPGPPacketParser.parsePublicKeyFields(body: sub.body).creationTime
+        let expiry = try relativeExpiry(expiresAt: expiresAt, creation: subCreation)
+        let sigTime = max(UInt32(now.timeIntervalSince1970), epochSeconds(old.creationTime ?? .distantPast) &+ 1)
+        let document = CertificateValidator.frameKey(primaryBody, signatureVersion: 6)
+            + CertificateValidator.frameKey(sub.body, signatureVersion: 6)
+
+        var backSignature: [UInt8]? = nil
+        let flags = old.hashedSubpackets.first(where: { $0.type == 27 })?.data.first ?? 0
+        if flags & 0x02 != 0 {
+            let info = try await unlockSigningSubkey(secretRing: secretKeyData, subkeyBody: sub.body, passphrase: passphrase)
+            let subFP = CertificateValidator.fingerprint(ofKeyBody: sub.body)
+            guard Array(info.fingerprint.suffix(32)) == subFP else { throw EditError.signingSubkeyNotHere }
+            var backHashed = buildSubpacket(type: 2 | 0x80, data: u32be(sigTime))
+            backHashed += buildSubpacket(type: 33, data: [6] + subFP)
+            let back = try V6KeyGenerator.assembleV6Signature(
+                signer: V6SignatureKey(info), sigType: 0x19, documentHashChunks: document,
+                hashedSubpackets: backHashed, unhashedSubpackets: [])
+            try checkSignature(back, signerBody: sub.body, primaryBody: primaryBody, subkeyBody: sub.body)
+            backSignature = back
+        }
+
+        var hashed = buildSubpacket(type: 2 | 0x80, data: u32be(sigTime))
+        if let expiry { hashed += buildSubpacket(type: 9 | 0x80, data: expiry) }
+        for sp in old.hashedSubpackets where ![2, 9, 16, 32, 33].contains(sp.type) {
+            hashed += buildSubpacket(type: sp.isCritical ? (sp.type | 0x80) : sp.type, data: sp.data)
+        }
+        if let backSignature { hashed += buildSubpacket(type: 32 | 0x80, data: backSignature) }
+        hashed += buildSubpacket(type: 33, data: [6] + primaryFingerprint)
+        let binding = try V6KeyGenerator.assembleV6Signature(
+            signer: primarySigner, sigType: 0x18, documentHashChunks: document,
+            hashedSubpackets: hashed, unhashedSubpackets: [])
+        try checkSignature(binding, signerBody: primaryBody, primaryBody: primaryBody, subkeyBody: sub.body)
+
+        let secretPackets = try OpenPGPPacketParser.parsePackets(data: Array(secretKeyData))
+        return (Data(replaceSubkeyBinding(pubPackets, order: sub.order, with: binding, primaryBody: primaryBody)),
+                Data(replaceSubkeyBinding(secretPackets, order: sub.order, with: binding, primaryBody: primaryBody)))
+    }
+
+    /// An Ed448 key (LibrePGP v5 or RFC 9580 v6): Ed448KeyEditor signs the
+    /// new binding (its v5 or v6 shape, its back-signature for a signing
+    /// subkey), and only that one binding is taken into the stored rings.
+    /// The editor passes over an expired subkey, so for one it is run as of
+    /// the subkey's creation, when it was not expired; it then dates its
+    /// signatures one second after the newest self-signature, which still
+    /// makes the new binding the newest. Synchronous, for runOffMainThread.
+    static func editEd448SubkeyExpiration(
+        publicKeyData: Data,
+        secretKeyData: Data,
+        passphrase: String?,
+        subkeyFingerprintHex: String,
+        expiresAt: Date?,
+        now: Date = Date()
+    ) throws -> (publicKeyData: Data, secretKeyData: Data) {
+        let pubPackets = try OpenPGPPacketParser.parsePackets(data: Array(publicKeyData))
+        guard let primaryBody = pubPackets.first(where: { $0.tag == 6 })?.body else { throw EditError.noPrimaryKeyPacket }
+        let wanted = bytesFromHex(subkeyFingerprintHex.lowercased()) ?? []
+        guard let sub = locateSubkey(pubPackets, primaryBody: primaryBody, fingerprint: wanted) else {
+            throw EditError.subkeyNotFound
+        }
+        guard !sub.isRevoked else { throw EditError.subkeyRevoked }
+        guard sub.newestBinding != nil, sub.body.count >= 5 else { throw EditError.noSubkeyBinding }
+        let subCreation = UInt32(sub.body[1]) << 24 | UInt32(sub.body[2]) << 16 | UInt32(sub.body[3]) << 8 | UInt32(sub.body[4])
+        _ = try relativeExpiry(expiresAt: expiresAt, creation: subCreation)
+        let runAt = sub.isExpired(at: now) ? Date(timeIntervalSince1970: TimeInterval(subCreation)) : now
+
+        let result: Ed448KeyEditor.Result
+        do {
+            result = try Ed448KeyEditor.resign(publicKeyData: publicKeyData, secretKeyData: secretKeyData,
+                                               passphrase: passphrase, expiry: .set(expiresAt),
+                                               includeCurrentSubkeys: true, now: runAt)
+        } catch let e as Ed448KeyEditor.EditError {
+            switch e {
+            case .expiryBeforeCreation: throw EditError.expiryBeforeCreation
+            case .noPrimaryKeyPacket: throw EditError.noPrimaryKeyPacket
+            case .nothingToSign: throw EditError.noSubkeyBinding
+            default: throw EditError.underlying(e)
+            }
+        }
+        let outPackets = try OpenPGPPacketParser.parsePackets(data: Array(result.publicKeyData))
+        guard let outSub = locateSubkey(outPackets, primaryBody: primaryBody, fingerprint: wanted),
+              let fresh = outSub.signatureBodies.first(where: { body in
+                  !sub.signatureBodies.contains(body)
+                      && (try? OpenPGPPacketParser.parseSignaturePacket(body: body))?.signatureType == 0x18
+              }) else {
+            let hex = wanted.map { String(format: "%02x", $0) }.joined()
+            throw result.passedOver.contains(hex) ? EditError.signingSubkeyNotHere : EditError.noSubkeyBinding
+        }
+        let secretPackets = try OpenPGPPacketParser.parsePackets(data: Array(secretKeyData))
+        return (Data(replaceSubkeyBinding(pubPackets, order: sub.order, with: fresh, primaryBody: primaryBody)),
+                Data(replaceSubkeyBinding(secretPackets, order: sub.order, with: fresh, primaryBody: primaryBody)))
+    }
+
+    private static func epochSeconds(_ date: Date) -> UInt32 {
+        let t = date.timeIntervalSince1970
+        return t <= 0 ? 0 : UInt32(min(t, Double(UInt32.max - 1)))
+    }
+
     // MARK: - Pre-scan helpers
 
     private enum Context { case none, uid, subkey }
@@ -388,6 +857,17 @@ enum KeyExpirationEditor {
         var isSign: Bool
         /// 8.3.0 (4.6): carries a self-issued 0x28; its binding is left as is.
         var isRevoked = false
+        /// 8.4.0 (plan 5d): creation time of the newest self-issued binding.
+        var latestBinding: Date? = nil
+        /// 8.4.0 build 11 (plan 5n): the subkey's fingerprint, to find a target.
+        var fingerprint: [UInt8] = []
+
+        /// True when the newest binding's Key Expiration Time has passed.
+        func isExpired(at date: Date) -> Bool {
+            guard let d = bindingSubpackets.first(where: { $0.type == 9 })?.data, d.count == 4 else { return false }
+            let seconds = UInt32(d[0]) << 24 | UInt32(d[1]) << 16 | UInt32(d[2]) << 8 | UInt32(d[3])
+            return seconds > 0 && Date(timeIntervalSince1970: TimeInterval(creation) + TimeInterval(seconds)) <= date
+        }
     }
 
     /// True if a signature's issuer is the primary key (so it's a self-signature
@@ -429,8 +909,22 @@ enum KeyExpirationEditor {
         creationBytes: [UInt8],
         expiryBytes: [UInt8]?,
         preserved: [OpenPGPPacketParser.ParsedSubpacket],
-        issuerFPData: [UInt8]
+        issuerFPData: [UInt8],
+        embeddedBackSignature: [UInt8]? = nil
     ) -> [UInt8] {
+        // 8.4.0 build 11 (plan 5n): a signing subkey's binding carries its
+        // fresh 0x19 (hashed, as GnuPG writes it) in place of the old one.
+        if let back = embeddedBackSignature {
+            var out: [UInt8] = []
+            out += buildSubpacket(type: 2, data: creationBytes)
+            for sp in preserved where !regeneratedTypes.contains(sp.type) && sp.type != 32 {
+                out += buildSubpacket(type: sp.isCritical ? (sp.type | 0x80) : sp.type, data: sp.data)
+            }
+            if let expiryBytes { out += buildSubpacket(type: 9, data: expiryBytes) }
+            out += buildSubpacket(type: 32, data: back)
+            out += buildSubpacket(type: 33, data: issuerFPData)
+            return out
+        }
         // Identical shape to a cert's; in practice a binding usually only carries
         // a key-flags subpacket (type 27) to preserve.
         return certSubpackets(
@@ -471,7 +965,9 @@ enum KeyExpirationEditor {
         sign: (_ digest: [UInt8]) async throws -> [UInt8]
     ) async throws -> [UInt8] {
         let pubAlgo = algorithm.packetAlgorithmID
-        let hashSHA256: UInt8 = 8
+        // 8.4.0 build 10 (plan 5m): SHA-256 for EdDSA and RSA, the curve's
+        // hash for a card ECDSA key.
+        let hashID: UInt8 = algorithm.hashAlgorithmID
 
         // Hash input: 0x99 || len || primary body || document2 || trailer || final.
         var hashInput = Data()
@@ -480,7 +976,7 @@ enum KeyExpirationEditor {
         hashInput.append(contentsOf: primaryBody)
         hashInput.append(contentsOf: document2)
 
-        var trailer: [UInt8] = [4, sigType, pubAlgo, hashSHA256]
+        var trailer: [UInt8] = [4, sigType, pubAlgo, hashID]
         trailer += u16be(UInt16(hashedSubpackets.count))
         trailer += hashedSubpackets
         hashInput.append(contentsOf: trailer)
@@ -490,7 +986,7 @@ enum KeyExpirationEditor {
         hashInput.append(0xFF)
         hashInput.append(contentsOf: u32be(UInt32(trailer.count)))
 
-        let digest = Array(SHA256.hash(data: hashInput))
+        let digest = algorithm.digest(hashInput)
         let sigBytes = try await sign(digest)
 
         // Algorithm-specific signature MPI list.
@@ -499,19 +995,22 @@ enum KeyExpirationEditor {
         case .eddsa:
             guard sigBytes.count == 64 else { throw EditError.underlying(NSError(
                 domain: "PGPony.Expiration", code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "Unexpected Ed25519 signature length \(sigBytes.count)."])) }
+                userInfo: [NSLocalizedDescriptionKey: String(localized: "Unexpected Ed25519 signature length \(sigBytes.count).")])) }
             signatureMPIs = [Array(sigBytes[0..<32]), Array(sigBytes[32..<64])]
         case .rsa:
             guard !sigBytes.isEmpty else { throw EditError.underlying(NSError(
                 domain: "PGPony.Expiration", code: 2,
-                userInfo: [NSLocalizedDescriptionKey: "Empty RSA signature from card."])) }
+                userInfo: [NSLocalizedDescriptionKey: String(localized: "Empty RSA signature from card.")])) }
             var sig = sigBytes
             while sig.first == 0x00 && sig.count > 1 { sig.removeFirst() }
             signatureMPIs = [sig]
+        case .ecdsa:
+            // 8.4.0 build 10 (plan 5m): the card's r || s, two MPIs.
+            signatureMPIs = try algorithm.signatureMPIs(fromCardOutput: sigBytes)
         }
 
         // Assemble the tag-2 body.
-        var body: [UInt8] = [4, sigType, pubAlgo, hashSHA256]
+        var body: [UInt8] = [4, sigType, pubAlgo, hashID]
         body += u16be(UInt16(hashedSubpackets.count))
         body += hashedSubpackets
         body += u16be(UInt16(unhashedSubpackets.count))

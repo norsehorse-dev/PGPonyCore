@@ -12,7 +12,10 @@ let package = Package(
         .iOS("17.6") // string form (not .v17=17.0): matches the PGPony app deployment floor
     ],
     products: [
-        .library(name: "PGPonyCore", targets: ["PGPonyCore"])
+        .library(name: "PGPonyCore", targets: ["PGPonyCore"]),
+        // The pairing protocol v1 (PGPony to PGPony on the local network).
+        // Its own module: it shares no code with the OpenPGP core.
+        .library(name: "PGPonyPair", targets: ["PGPonyPair"])
     ],
     targets: [
         // Pinned liboqs build (ML-KEM) — the PQC sources import its COQS module.
@@ -26,6 +29,18 @@ let package = Package(
             name: "PGPonyCore",
             dependencies: ["liboqs"],
             path: "Sources/PGPonyCore"
+        ),
+        .target(
+            name: "PGPonyPair",
+            path: "Sources/PGPonyPair"
+        ),
+        .testTarget(
+            name: "PGPonyPairTests",
+            dependencies: ["PGPonyPair"],
+            path: "Tests/PGPonyPairTests",
+            // Copies of the shared vector files the Android and desktop
+            // implementation replays too; refreshed from there, never edited here.
+            resources: [.copy("Vectors")]
         ),
         .testTarget(
             name: "PGPonyCoreTests",

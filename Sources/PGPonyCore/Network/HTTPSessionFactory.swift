@@ -42,10 +42,12 @@ enum HTTPSessionFactory {
         let p = UserDefaults.standard.integer(forKey: Keys.proxyPort)
         return p > 0 ? p : 9050   // Tor/Orbot SOCKS default
     }
-    /// Default ON: if you've gone to the trouble of routing through a proxy,
-    /// prefer the onion mirror for a server that has one.
+    /// Default OFF since 8.4.0 build 6: the onion mirror for a server that has
+    /// one is used under a proxy only when the user chose it.
     static var onionUnderProxy: Bool {
-        UserDefaults.standard.object(forKey: Keys.onionUnderProxy) as? Bool ?? true
+        // 8.4.0 build 6 (Android 4.7.0 item 12a): off unless chosen. A choice
+        // the user already made is kept.
+        UserDefaults.standard.object(forKey: Keys.onionUnderProxy) as? Bool ?? false
     }
 
     /// True when a usable proxy is configured. All proxied requests fail closed.

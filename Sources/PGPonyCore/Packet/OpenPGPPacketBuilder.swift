@@ -174,10 +174,10 @@ enum PacketBuilderError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .noRecipients: return "No recipients specified"
-        case .encryptionFailed(let msg): return "Packet encryption failed: \(msg)"
-        case .invalidKeyData(let msg): return "Invalid key data: \(msg)"
-        case .sessionKeyGenerationFailed: return "Failed to generate random session key"
+        case .noRecipients: return String(localized: "No recipients specified")
+        case .encryptionFailed(let msg): return String(localized: "Packet encryption failed: \(msg)")
+        case .invalidKeyData(let msg): return String(localized: "Invalid key data: \(msg)")
+        case .sessionKeyGenerationFailed: return String(localized: "Failed to generate random session key")
         case .signingFailed(let msg): return String(localized: "Signing failed: \(msg)")
         }
     }
@@ -195,6 +195,12 @@ struct Cv25519Recipient {
     /// 8.3.0 (NIST C): algorithm 18 alone cannot tell Cv25519 from a NIST
     /// curve; the recipient carries which, and the PKESK builder routes on it.
     var curve: ECCurve = .cv25519
+    /// 8.4.0 build 9 (plan 5l): the subkey's key version. A LibrePGP v5 X448
+    /// subkey keeps the leftmost 20 fingerprint octets in `subkeyFingerprint`
+    /// (what its KDF binds, so it is addressed like a v4 ECDH key) and its
+    /// whole 32-octet fingerprint here, for a v6 PKESK naming it.
+    var keyVersion: UInt8 = 4
+    var fullFingerprint: [UInt8]? = nil
 }
 
 /// An RSA recipient (the encryption-capable (sub)key) for a v3 PKESK. The session
@@ -229,6 +235,12 @@ struct Ed25519SigningInfo {
     /// `V6SignatureKey(info)`, so the callers that thread an
     /// Ed25519SigningInfo through encrypt-and-sign need no change.
     var composite: CompositeSigningInfo? = nil
+    /// 8.4.0 build 9 (plan 5l): set for an Ed448 signing key (LibrePGP v5 or
+    /// RFC 9580 v6). `privateKey` is then a throwaway nothing reads: the
+    /// message builders check this first, and only
+    /// `PGPService.extractDocumentSigningKey` ever sets it, so the key editing
+    /// paths (which sign through `privateKey` or V6SignatureKey) never see one.
+    var ed448: Ed448SigningKey? = nil
 }
 
 // MARK: - RSA Signing Info
@@ -417,6 +429,12 @@ class OpenPGPPacketBuilder {
         sessionAlgorithmID: UInt8,
         recipient: Cv25519Recipient
     ) throws -> Data {
+        // 8.4.0 build 9 (plan 5l): an RFC 9580 X448 key (algorithm 26) has no
+        // ECDH form; it takes its own v3 packet next to v4 recipients.
+        if recipient.curve == .x448, recipient.subkeyFingerprint.count == 32 {
+            return try buildV3X25519PKESKPacket(sessionKey: sessionKey, sessionAlgorithmID: sessionAlgorithmID,
+                                                recipient: recipient)
+        }
 
         let ecdhResult = try Cv25519ECDHService.encryptSessionKey(
             sessionKey: sessionKey,
@@ -478,7 +496,7 @@ class OpenPGPPacketBuilder {
         let pubKey = try makeRSAPublicSecKey(modulus: recipient.modulus, exponent: recipient.exponent)
         var err: Unmanaged<CFError>?
         guard let cipher = SecKeyCreateEncryptedData(pubKey, .rsaEncryptionPKCS1, Data(block) as CFData, &err) as Data? else {
-            let msg = (err?.takeRetainedValue()).map { CFErrorCopyDescription($0) as String } ?? "RSA encryption failed"
+            let msg = (err?.takeRetainedValue()).map { CFErrorCopyDescription($0) as String } ?? String(localized: "RSA encryption failed")
             throw PacketBuilderError.encryptionFailed(msg)
         }
         let ct = [UInt8](cipher)
@@ -501,7 +519,7 @@ class OpenPGPPacketBuilder {
         let pubKey = try makeRSAPublicSecKey(modulus: modulus, exponent: exponent)
         var err: Unmanaged<CFError>?
         guard let cipher = SecKeyCreateEncryptedData(pubKey, .rsaEncryptionPKCS1, Data(plaintext) as CFData, &err) as Data? else {
-            let msg = (err?.takeRetainedValue()).map { CFErrorCopyDescription($0) as String } ?? "RSA encryption failed"
+            let msg = (err?.takeRetainedValue()).map { CFErrorCopyDescription($0) as String } ?? String(localized: "RSA encryption failed")
             throw PacketBuilderError.encryptionFailed(msg)
         }
         return [UInt8](cipher)
@@ -517,7 +535,7 @@ class OpenPGPPacketBuilder {
         ]
         var err: Unmanaged<CFError>?
         guard let key = SecKeyCreateWithData(Data(der) as CFData, attrs as CFDictionary, &err) else {
-            let msg = (err?.takeRetainedValue()).map { CFErrorCopyDescription($0) as String } ?? "Invalid RSA public key"
+            let msg = (err?.takeRetainedValue()).map { CFErrorCopyDescription($0) as String } ?? String(localized: "Invalid RSA public key")
             throw PacketBuilderError.invalidKeyData(msg)
         }
         return key
@@ -588,7 +606,11 @@ class OpenPGPPacketBuilder {
             // Signed: OnePassSig || LiteralData || Signature
             // Phase V6-D: a v6 signing key must emit v6 inline framing even when
             // the envelope is SEIPDv1 (e.g. mixed v4 recipients).
-            if signer.fingerprint.count == 32 {
+            if let ed448 = signer.ed448 {
+                // 8.4.0 build 9 (plan 5l): an Ed448 key signs in its own
+                // version (v5 hashes this literal packet's metadata).
+                innerPackets = try OpenPGP448.inlineSigned(key: ed448, literalPacket: literalPacket, data: plaintext)
+            } else if signer.fingerprint.count == 32 {
                 var sigSalt = [UInt8](repeating: 0, count: 16)
                 guard SecRandomCopyBytes(kSecRandomDefault, sigSalt.count, &sigSalt) == errSecSuccess else {
                     throw PacketBuilderError.sessionKeyGenerationFailed
@@ -699,7 +721,7 @@ class OpenPGPPacketBuilder {
         recipientX25519PublicKey: [UInt8]
     ) throws -> (ephemeral: [UInt8], wrapped: [UInt8]) {
         guard recipientX25519PublicKey.count == 32 else {
-            throw PacketBuilderError.invalidKeyData("v6 X25519 recipient key must be 32 bytes")
+            throw PacketBuilderError.invalidKeyData(String(localized: "v6 X25519 recipient key must be 32 bytes"))
         }
         let ephemeral = Curve25519.KeyAgreement.PrivateKey()
         let ephemeralPub = Array(ephemeral.publicKey.rawRepresentation)
@@ -733,19 +755,24 @@ class OpenPGPPacketBuilder {
         recipient: Cv25519Recipient
     ) throws -> Data {
         guard recipient.subkeyFingerprint.count == 32 else {
-            throw PacketBuilderError.invalidKeyData("v6 PKESK needs a 32-byte fingerprint")
+            throw PacketBuilderError.invalidKeyData(String(localized: "v6 PKESK needs a 32-byte fingerprint"))
         }
-        let (ephemeral, wrapped) = try encryptV6X25519SessionKey(
-            sessionKey: sessionKey,
-            recipientX25519PublicKey: recipient.subkeyPublicKey
-        )
+        // 8.4.0 build 9 (plan 5l): X448 (algorithm 26, RFC 9580 5.1.7):
+        // 56-octet ephemeral, HKDF-SHA512, AES-256 key wrap.
+        let isX448 = recipient.curve == .x448
+        let (ephemeral, wrapped) = try isX448
+            ? OpenPGP448.nativeWrap(sessionKey: sessionKey, recipientPublic: recipient.subkeyPublicKey)
+            : encryptV6X25519SessionKey(
+                sessionKey: sessionKey,
+                recipientX25519PublicKey: recipient.subkeyPublicKey
+            )
 
         var body: [UInt8] = []
         body.append(6)                                        // PKESK version 6
         body.append(33)                                       // size of (keyVersion + fingerprint)
         body.append(6)                                        // target key version
         body.append(contentsOf: recipient.subkeyFingerprint)  // 32-byte v6 fingerprint
-        body.append(25)                                       // public-key algorithm: X25519
+        body.append(isX448 ? 26 : 25)                         // public-key algorithm: X448 or X25519
         body.append(contentsOf: ephemeral)                    // 32-byte ephemeral public key
         body.append(UInt8(wrapped.count))                     // size of following fields (no algo id in v6)
         body.append(contentsOf: wrapped)                      // wrapped session key
@@ -768,7 +795,16 @@ class OpenPGPPacketBuilder {
         recipient: Cv25519Recipient
     ) throws -> Data {
         guard recipient.subkeyFingerprint.count == 20 else {
-            throw PacketBuilderError.invalidKeyData("v6 ECDH PKESK needs a 20-byte v4 fingerprint")
+            throw PacketBuilderError.invalidKeyData(String(localized: "v6 ECDH PKESK needs a 20-byte v4 fingerprint"))
+        }
+        // 8.4.0 build 9 (plan 5l): a LibrePGP v5 X448 subkey is named by its
+        // key version (5) and whole fingerprint; the KDF still binds the
+        // leftmost 20 octets, which `subkeyFingerprint` holds.
+        let named: [UInt8]
+        if let full = recipient.fullFingerprint, full.count == 32, recipient.keyVersion == 5 {
+            named = [33, 5] + full
+        } else {
+            named = [21, 4] + recipient.subkeyFingerprint
         }
         let ecdhResult = try Cv25519ECDHService.encryptSessionKey(
             sessionKey: sessionKey,
@@ -780,8 +816,8 @@ class OpenPGPPacketBuilder {
             includesAlgorithmID: false,
             curve: recipient.curve
         )
-        var body: [UInt8] = [6, 21, 4]
-        body.append(contentsOf: recipient.subkeyFingerprint)
+        var body: [UInt8] = [6]
+        body.append(contentsOf: named)
         body.append(18)
         let ephBits = UInt16(ecdhResult.ephemeralPublicKey.count * 8 - countLeadingZeroBits(ecdhResult.ephemeralPublicKey))
         body.append(UInt8((ephBits >> 8) & 0xFF))
@@ -802,7 +838,7 @@ class OpenPGPPacketBuilder {
         recipient: RSARecipient
     ) throws -> Data {
         guard recipient.fingerprint.count == 20 else {
-            throw PacketBuilderError.invalidKeyData("v6 PKESK for an RSA key needs its 20-byte fingerprint")
+            throw PacketBuilderError.invalidKeyData(String(localized: "v6 PKESK for an RSA key needs its 20-byte fingerprint"))
         }
         var block: [UInt8] = sessionKey
         var sum = 0
@@ -833,15 +869,19 @@ class OpenPGPPacketBuilder {
         recipient: Cv25519Recipient
     ) throws -> Data {
         guard recipient.subkeyFingerprint.count == 32 else {
-            throw PacketBuilderError.invalidKeyData("v3 X25519 PKESK is for a v6 key (32-byte fingerprint)")
+            throw PacketBuilderError.invalidKeyData(String(localized: "v3 X25519 PKESK is for a v6 key (32-byte fingerprint)"))
         }
-        let (ephemeral, wrapped) = try encryptV6X25519SessionKey(
-            sessionKey: sessionKey,
-            recipientX25519PublicKey: recipient.subkeyPublicKey
-        )
+        // 8.4.0 build 9 (plan 5l): the same for X448 (algorithm 26).
+        let isX448 = recipient.curve == .x448
+        let (ephemeral, wrapped) = try isX448
+            ? OpenPGP448.nativeWrap(sessionKey: sessionKey, recipientPublic: recipient.subkeyPublicKey)
+            : encryptV6X25519SessionKey(
+                sessionKey: sessionKey,
+                recipientX25519PublicKey: recipient.subkeyPublicKey
+            )
         var body: [UInt8] = [3]
         body.append(contentsOf: recipient.subkeyID)
-        body.append(25)
+        body.append(isX448 ? 26 : 25)
         body.append(contentsOf: ephemeral)
         body.append(UInt8(wrapped.count + 1))
         body.append(sessionAlgorithmID)
@@ -918,7 +958,7 @@ class OpenPGPPacketBuilder {
         // 6 with a 32-octet fingerprint, or 4 with the 20-octet SHA-1 of a v4
         // algorithm 35 subkey (RFC 9580 5.1). Android reads both.
         guard recipient.subkeyFingerprint.count == 32 || recipient.subkeyFingerprint.count == 20 else {
-            throw PacketBuilderError.invalidKeyData("composite PKESK needs a 32-byte v6 or 20-byte v4 fingerprint")
+            throw PacketBuilderError.invalidKeyData(String(localized: "composite PKESK needs a 32-byte v6 or 20-byte v4 fingerprint"))
         }
         let targetKeyVersion: UInt8 = recipient.subkeyFingerprint.count == 32 ? 6 : 4
         // Composite KEM to a 32-octet KEK, then RFC 3394 key-wrap the session key.
@@ -1074,7 +1114,10 @@ class OpenPGPPacketBuilder {
         if let signer = signingInfo {
             // Phase V6-D: emit v6 inline framing (OPS v6 + v6 sig, shared salt) for
             // v6 signing keys; keep v4 framing for v4 keys.
-            if signer.fingerprint.count == 32 {
+            if let ed448 = signer.ed448 {
+                // 8.4.0 build 9 (plan 5l): Ed448, v5 or v6 framing.
+                innerPackets = try OpenPGP448.inlineSigned(key: ed448, literalPacket: literalPacket, data: plaintext)
+            } else if signer.fingerprint.count == 32 {
                 var sigSalt = [UInt8](repeating: 0, count: 16)
                 guard SecRandomCopyBytes(kSecRandomDefault, sigSalt.count, &sigSalt) == errSecSuccess else {
                     throw PacketBuilderError.sessionKeyGenerationFailed
@@ -1403,7 +1446,7 @@ class OpenPGPPacketBuilder {
             throw PacketBuilderError.signingFailed((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
         }
         guard sigBytes.count == signer.signatureLength else {
-            throw PacketBuilderError.signingFailed("v6 signature must be \(signer.signatureLength) bytes, got \(sigBytes.count)")
+            throw PacketBuilderError.signingFailed(String(localized: "v6 signature must be \(String(describing: signer.signatureLength)) bytes, got \(sigBytes.count)"))
         }
 
         // Packet body: 6 | sigType | algo | 8 | hashedLen(4) | hashed | unhashedLen(4) |
@@ -1568,7 +1611,7 @@ class OpenPGPPacketBuilder {
             &outLen
         )
         guard status == kCCSuccess else {
-            throw PacketBuilderError.encryptionFailed("AES-ECB encrypt failed: status \(status)")
+            throw PacketBuilderError.encryptionFailed(String(localized: "AES-ECB encrypt failed: status \(String(describing: status))"))
         }
         return Array(output[0..<16])
     }
@@ -1576,7 +1619,7 @@ class OpenPGPPacketBuilder {
     static func cipherBlockSize(for algorithmID: UInt8) throws -> Int {
         switch algorithmID {
         case 7, 8, 9: return 16  // AES-128/192/256 all use 128-bit blocks
-        default: throw PacketBuilderError.encryptionFailed("Unsupported cipher: \(algorithmID)")
+        default: throw PacketBuilderError.encryptionFailed(String(localized: "Unsupported cipher: \(String(describing: algorithmID))"))
         }
     }
 

@@ -12,7 +12,8 @@
 // key was not recognized at all and fell back to "RSA 4096". This maps the OID
 // so an imported key is identified and labeled correctly.
 //
-// Recognition only: PGPony does not sign, verify, or encrypt with these curves.
+// Recognition only: PGPony does not sign or encrypt with these curves. Since
+// 8.4.0 build 7 (plan K3, K4) it verifies brainpool ECDSA signatures.
 // The point is that a key that carries one imports and displays with the right
 // name instead of being dropped or mislabeled.
 //
@@ -48,10 +49,14 @@ enum ECCurve: Equatable {
         }
     }
 
-    /// True for the curves PGPony can only recognize, not operate on: the
-    /// brainpool family (CryptoKit has no brainpool). The Curve25519/448
-    /// OIDs are the ones PGPony generates, and since 8.3.0 (NIST A to E) the
-    /// three NIST prime curves decrypt, encrypt, verify and sign on CryptoKit.
+    /// True for the curves PGPony cannot sign with or use for classic ECDH
+    /// (algorithm 18): the brainpool family. Since 8.4.0 build 7 PGPony
+    /// verifies brainpool ECDSA signatures (BrainpoolECDSA) and handles the
+    /// LibrePGP ML-KEM + brainpool composite (its own LibrePGPSuite cases),
+    /// but a brainpool key itself still imports under the generic EC label.
+    /// The Curve25519/448 OIDs are the ones PGPony generates, and since 8.3.0
+    /// (NIST A to E) the three NIST prime curves decrypt, encrypt, verify and
+    /// sign on CryptoKit.
     var isRecognitionOnly: Bool {
         switch self {
         case .ed25519Legacy, .cv25519, .ed25519, .x25519, .ed448, .x448,
@@ -64,6 +69,19 @@ enum ECCurve: Equatable {
 
     /// 8.3.0: the NIST curve this is, when it is one.
     var nistCurve: NISTCurve? { NISTCurve(self) }
+
+    /// 8.4.0 build 7 (plan K3, K4): the brainpool curve arithmetic for this
+    /// curve, when it is one. Brainpool ECDSA signatures verify with it
+    /// (`BrainpoolECDSA`); decryption and signing stay out until the ECDH
+    /// wave, so `isRecognitionOnly` is still true for these.
+    var brainpoolCurve: BrainpoolCurve? {
+        switch self {
+        case .brainpoolP256r1: return .p256r1
+        case .brainpoolP384r1: return .p384r1
+        case .brainpoolP512r1: return .p512r1
+        default: return nil
+        }
+    }
 
     private static let table: [(oid: [UInt8], curve: ECCurve)] = [
         ([0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07], .nistP256),

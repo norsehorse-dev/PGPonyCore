@@ -107,7 +107,7 @@ struct CardKDF: Equatable {
     /// diagnosable in the field instead of presenting as "wrong PIN".
     var displayDescription: String {
         guard isEnabled else { return String(localized: "Off") }
-        return "\(hashAlgorithm.displayName), \(iterationCount) iterations"
+        return String(localized: "\(hashAlgorithm.displayName), \(iterationCount) iterations")
     }
 
     // MARK: - Parsing

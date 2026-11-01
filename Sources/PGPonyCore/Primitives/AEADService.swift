@@ -35,11 +35,11 @@ enum AEADError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .unsupportedAlgorithm(let a): return "Unsupported AEAD algorithm: \(a)"
-        case .decryptionFailed(let msg): return "AEAD decryption failed: \(msg)"
-        case .authenticationFailed: return "AEAD authentication tag verification failed"
-        case .invalidNonce(let msg): return "Invalid AEAD nonce: \(msg)"
-        case .invalidKeySize(let s): return "Invalid AES key size: \(s) bytes"
+        case .unsupportedAlgorithm(let a): return String(localized: "Unsupported AEAD algorithm: \(String(describing: a))")
+        case .decryptionFailed(let msg): return String(localized: "AEAD decryption failed: \(msg)")
+        case .authenticationFailed: return String(localized: "AEAD authentication tag verification failed")
+        case .invalidNonce(let msg): return String(localized: "Invalid AEAD nonce: \(msg)")
+        case .invalidKeySize(let s): return String(localized: "Invalid AES key size: \(s) bytes")
         }
     }
 }
@@ -120,7 +120,7 @@ class AEADService {
         associatedData: [UInt8] = []
     ) throws -> [UInt8] {
         guard data.count >= tagSize else {
-            throw AEADError.decryptionFailed("Data too short for AEAD tag (\(data.count) bytes)")
+            throw AEADError.decryptionFailed(String(localized: "Data too short for AEAD tag (\(data.count) bytes)"))
         }
 
         let ciphertext = Array(data[0..<(data.count - tagSize)])
@@ -207,7 +207,7 @@ class AEADService {
             )
             return (Array(sealed.ciphertext), Array(sealed.tag))
         } catch {
-            throw AEADError.decryptionFailed("AES-GCM seal failed: \(error)")
+            throw AEADError.decryptionFailed(String(localized: "AES-GCM seal failed: \(String(describing: error))"))
         }
     }
 
@@ -221,7 +221,7 @@ class AEADService {
         associatedData: [UInt8]
     ) throws -> [UInt8] {
         guard nonce.count == 12 else {
-            throw AEADError.invalidNonce("GCM nonce must be 12 bytes, got \(nonce.count)")
+            throw AEADError.invalidNonce(String(localized: "GCM nonce must be 12 bytes, got \(nonce.count)"))
         }
 
         let symmetricKey: SymmetricKey
@@ -246,7 +246,7 @@ class AEADService {
             )
             return Array(decrypted)
         } catch {
-            throw AEADError.decryptionFailed("AES-GCM: \(error.localizedDescription)")
+            throw AEADError.decryptionFailed(String(localized: "AES-GCM: \(error.localizedDescription)"))
         }
     }
 
@@ -268,7 +268,7 @@ class AEADService {
         associatedData: [UInt8]
     ) throws -> (ciphertext: [UInt8], tag: [UInt8]) {
         guard nonce.count == 15 else {
-            throw AEADError.invalidNonce("OCB nonce must be 15 bytes, got \(nonce.count)")
+            throw AEADError.invalidNonce(String(localized: "OCB nonce must be 15 bytes, got \(nonce.count)"))
         }
         guard key.count == 16 || key.count == 24 || key.count == 32 else {
             throw AEADError.invalidKeySize(key.count)
@@ -354,10 +354,10 @@ class AEADService {
         associatedData: [UInt8]
     ) throws -> [UInt8] {
         guard nonce.count == 15 else {
-            throw AEADError.invalidNonce("OCB nonce must be 15 bytes, got \(nonce.count)")
+            throw AEADError.invalidNonce(String(localized: "OCB nonce must be 15 bytes, got \(nonce.count)"))
         }
         guard tag.count == 16 else {
-            throw AEADError.decryptionFailed("OCB tag must be 16 bytes, got \(tag.count)")
+            throw AEADError.decryptionFailed(String(localized: "OCB tag must be 16 bytes, got \(tag.count)"))
         }
         guard key.count == 16 || key.count == 24 || key.count == 32 else {
             throw AEADError.invalidKeySize(key.count)
@@ -580,7 +580,7 @@ class AEADService {
             &outLen
         )
         guard status == kCCSuccess else {
-            throw AEADError.decryptionFailed("AES-ECB encrypt failed: \(status)")
+            throw AEADError.decryptionFailed(String(localized: "AES-ECB encrypt failed: \(String(describing: status))"))
         }
         return Array(output[0..<16])
     }
@@ -601,7 +601,7 @@ class AEADService {
             &outLen
         )
         guard status == kCCSuccess else {
-            throw AEADError.decryptionFailed("AES-ECB decrypt failed: \(status)")
+            throw AEADError.decryptionFailed(String(localized: "AES-ECB decrypt failed: \(String(describing: status))"))
         }
         return Array(output[0..<16])
     }

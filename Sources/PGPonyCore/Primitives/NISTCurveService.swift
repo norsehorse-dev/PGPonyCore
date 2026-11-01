@@ -8,7 +8,8 @@
 // P-256 / P-384 / P-521 keys instead of only recognizing them. ECDH decrypt
 // and encrypt (RFC 6637), ECDSA verify and sign (software), all on CryptoKit,
 // which has all three curves for both key agreement and signing. No new
-// dependency. brainpool stays recognition-only (CryptoKit has no brainpool).
+// dependency. brainpool is not on CryptoKit: since 8.4.0 build 7 its ECDSA
+// verify and the LibrePGP composite's ECDH run on BrainpoolCurve instead.
 //
 // The trap this file exists for: a NIST ECDH subkey is algorithm 18, the same
 // octet as Cv25519, and a NIST ECDSA key is algorithm 19. Before 8.3.0 an
@@ -162,9 +163,9 @@ enum NISTECDHService {
 
         var errorDescription: String? {
             switch self {
-            case .invalidPoint: return "The NIST public key point is malformed."
-            case .invalidScalar: return "The NIST private key is malformed."
-            case .agreementFailed(let why): return "NIST key agreement failed: \(why)"
+            case .invalidPoint: return String(localized: "The NIST public key point is malformed.")
+            case .invalidScalar: return String(localized: "The NIST private key is malformed.")
+            case .agreementFailed(let why): return String(localized: "NIST key agreement failed: \(why)")
             }
         }
     }
@@ -240,10 +241,10 @@ enum NISTECDSAService {
 
         var errorDescription: String? {
             switch self {
-            case .unsupportedHash(let id): return "ECDSA over hash algorithm \(id) is not supported."
-            case .invalidPoint: return "The ECDSA public key point is malformed."
-            case .invalidScalar: return "The ECDSA private key is malformed."
-            case .signingFailed(let why): return "ECDSA signing failed: \(why)"
+            case .unsupportedHash(let id): return String(localized: "ECDSA over hash algorithm \(String(describing: id)) is not supported.")
+            case .invalidPoint: return String(localized: "The ECDSA public key point is malformed.")
+            case .invalidScalar: return String(localized: "The ECDSA private key is malformed.")
+            case .signingFailed(let why): return String(localized: "ECDSA signing failed: \(why)")
             }
         }
     }
@@ -304,7 +305,7 @@ enum NISTECDSAService {
             throw Failure.signingFailed(error.localizedDescription)
         }
         let bytes = Array(raw)
-        guard bytes.count == 2 * curve.fieldSize else { throw Failure.signingFailed("unexpected signature length \(bytes.count)") }
+        guard bytes.count == 2 * curve.fieldSize else { throw Failure.signingFailed(String(localized: "unexpected signature length \(bytes.count)")) }
         return (Array(bytes[0..<curve.fieldSize]), Array(bytes[curve.fieldSize...]))
     }
 

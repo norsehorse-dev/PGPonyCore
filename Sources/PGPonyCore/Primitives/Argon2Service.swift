@@ -28,9 +28,9 @@ enum Argon2Error: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .invalidParameters(let msg): return "Argon2 invalid parameters: \(msg)"
-        case .memoryAllocationFailed: return "Argon2 could not allocate memory"
-        case .hashLengthTooShort: return "Argon2 hash length must be at least 4 bytes"
+        case .invalidParameters(let msg): return String(localized: "Argon2 invalid parameters: \(msg)")
+        case .memoryAllocationFailed: return String(localized: "Argon2 could not allocate memory")
+        case .hashLengthTooShort: return String(localized: "Argon2 hash length must be at least 4 bytes")
         }
     }
 }
@@ -72,11 +72,11 @@ class Argon2Service {
         let password = Array(passphrase.utf8)
         let memorySizeKiB = 1 << m  // 2^m KiB
 
-        guard t >= 1 else { throw Argon2Error.invalidParameters("iterations must be >= 1") }
-        guard p >= 1 else { throw Argon2Error.invalidParameters("parallelism must be >= 1") }
-        guard m >= 3 else { throw Argon2Error.invalidParameters("memory exponent must be >= 3 (8 KiB)") }
+        guard t >= 1 else { throw Argon2Error.invalidParameters(String(localized: "iterations must be >= 1")) }
+        guard p >= 1 else { throw Argon2Error.invalidParameters(String(localized: "parallelism must be >= 1")) }
+        guard m >= 3 else { throw Argon2Error.invalidParameters(String(localized: "memory exponent must be >= 3 (8 KiB)")) }
         guard hashLength >= 4 else { throw Argon2Error.hashLengthTooShort }
-        guard salt.count == 16 else { throw Argon2Error.invalidParameters("salt must be 16 bytes") }
+        guard salt.count == 16 else { throw Argon2Error.invalidParameters(String(localized: "salt must be 16 bytes")) }
         // 8.3.0 hardening: the parameters come off the wire and
         // are honored before the passphrase is checked, so the memory ask is
         // bounded here, at the one seam every SKESK and secret-key unlock
